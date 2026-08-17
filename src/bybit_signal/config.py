@@ -58,7 +58,9 @@ class CmiConfig(StrictModel):
     python_executable: Path | None = None
     executable_path: Path | None = None
     timeout_seconds: int = Field(default=75, ge=10, le=600)
-    live_seconds: int = Field(default=30, ge=5, le=60)
+    live_seconds: int = Field(default=30, ge=5, le=45)
+    max_snapshot_age_seconds: int = Field(default=180, ge=30, le=900)
+    max_snapshot_bytes: int = Field(default=32 * 1024 * 1024, ge=1024, le=128 * 1024 * 1024)
 
     @model_validator(mode="after")
     def validate_mode(self) -> CmiConfig:
@@ -70,6 +72,8 @@ class CmiConfig(StrictModel):
             raise ValueError("CMI source mode requires source_root and python_executable")
         if self.enabled and self.mode == "executable" and self.executable_path is None:
             raise ValueError("CMI executable mode requires executable_path")
+        if self.enabled and self.timeout_seconds < self.live_seconds + 10:
+            raise ValueError("CMI timeout_seconds must be at least live_seconds + 10")
         return self
 
 

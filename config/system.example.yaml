@@ -34,10 +34,12 @@ cmi:
   enabled: true
   mode: source
   source_root: E:/quantify/sol_realtime_snapshot
-  python_executable: D:/rely/python/data/python.exe
+  python_executable: E:/quantify/sol_realtime_snapshot/.venv/Scripts/python.exe
   executable_path: null
   timeout_seconds: 75
   live_seconds: 30
+  max_snapshot_age_seconds: 180
+  max_snapshot_bytes: 33554432
 
 monitoring:
   event_coalesce_seconds: 60
