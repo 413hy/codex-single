@@ -98,6 +98,8 @@ class TelegramConfig(StrictModel):
     token: str = Field(default="", repr=False)
     allowed_chat_ids: frozenset[int] = frozenset()
     allowed_user_ids: frozenset[int] = frozenset()
+    api_base_url: str = "https://api.telegram.org"
+    polling_timeout_seconds: int = Field(default=25, ge=1, le=50)
 
     @model_validator(mode="after")
     def validate_enabled(self) -> TelegramConfig:

@@ -59,3 +59,5 @@ telegram:
   enabled: false
   allowed_chat_ids: []
   allowed_user_ids: []
+  api_base_url: https://api.telegram.org
+  polling_timeout_seconds: 25
