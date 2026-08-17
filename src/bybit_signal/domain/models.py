@@ -194,6 +194,25 @@ class CandidateAssessment(ContractModel):
         return self
 
 
+class ModelAnalysisResponse(ContractModel):
+    schema_version: Literal[1] = 1
+    analysis_id: Annotated[str, StringConstraints(pattern=r"^[a-zA-Z0-9_-]{8,96}$")]
+    cycle_summary: str = Field(min_length=4, max_length=2000)
+    assessments: tuple[CandidateAssessment, ...] = Field(min_length=1, max_length=10)
+
+    @model_validator(mode="after")
+    def validate_response(self) -> ModelAnalysisResponse:
+        symbols = [assessment.symbol for assessment in self.assessments]
+        if len(symbols) != len(set(symbols)):
+            raise ValueError("model response contains duplicate symbols")
+        strong_count = sum(
+            assessment.strength is SignalStrength.STRONG for assessment in self.assessments
+        )
+        if strong_count > 2:
+            raise ValueError("model response contains more than two strong signals")
+        return self
+
+
 class SignalConclusion(ContractModel):
     analysis_id: Annotated[str, StringConstraints(pattern=r"^[a-zA-Z0-9_-]{8,96}$")]
     generated_at: datetime

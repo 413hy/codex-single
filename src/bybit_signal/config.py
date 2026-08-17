@@ -26,6 +26,8 @@ class AnalysisConfig(StrictModel):
     model: str = "gpt-5.6-sol"
     reasoning_effort: Literal["high"] = "high"
     timeout_seconds: int = Field(default=300, ge=60, le=900)
+    max_attempts: int = Field(default=2, ge=1, le=3)
+    max_target_distance_percent: float = Field(default=8.0, gt=0, le=50)
 
 
 class BybitConfig(StrictModel):
