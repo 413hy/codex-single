@@ -22,6 +22,7 @@ class CandidateFeatures(BaseModel):
     maximum_absolute_return_percent: float = Field(ge=0)
     direction_efficiency: float = Field(ge=0, le=1)
     recent_turnover_ratio: float = Field(ge=0)
+    recent_30m_turnover_usdt: float = Field(ge=0)
     spread_bps: float = Field(ge=0)
     turnover_24h_usdt: float = Field(ge=0)
     completed_candles: int = Field(ge=0)
@@ -155,12 +156,15 @@ class BybitUniverseScanner:
         recent_turnover = sum(float(candle.turnover) for candle in candles[-6:])
         previous_turnover = sum(float(candle.turnover) for candle in candles[-12:-6])
         turnover_ratio = recent_turnover / previous_turnover if previous_turnover > 0 else 0.0
+        if recent_turnover < self._config.minimum_recent_30m_turnover_usdt:
+            return None
         features = CandidateFeatures(
             median_range_percent=median_range,
             realized_volatility_percent=realized,
             maximum_absolute_return_percent=maximum_return,
             direction_efficiency=min(1.0, efficiency),
             recent_turnover_ratio=max(0.0, turnover_ratio),
+            recent_30m_turnover_usdt=max(0.0, recent_turnover),
             spread_bps=float(ticker.spread_bps),
             turnover_24h_usdt=float(ticker.turnover_24h),
             completed_candles=len(candles),
@@ -178,6 +182,7 @@ class BybitUniverseScanner:
             f"5m实现波动 {realized:.3f}%",
             f"最大单根变动 {maximum_return:.3f}%",
             f"近30m成交额比 {turnover_ratio:.2f}x",
+            f"近30m成交额 {recent_turnover:,.0f} USDT",
             f"买卖价差 {float(ticker.spread_bps):.2f} bps",
         )
         return _UnrankedCandidate(

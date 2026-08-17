@@ -137,6 +137,10 @@ def test_builder_preserves_prices_and_derives_completed_candle_features() -> Non
     assert price_action.values["completed_candles"] == 240
     assert float(price_action.values["rolling_high_20"]) < 1_000
     assert price_action.values["ema_50"] is not None
+    assert price_action.values["return_1_percent"] is not None
+    assert float(price_action.values["recent_30m_turnover_usdt"]) > 0
+    assert float(price_action.values["drawdown_from_rolling_high_atr"]) >= 0
+    assert float(price_action.values["rebound_from_rolling_low_atr"]) >= 0
     core = next(
         tool for tool in bundle.tool_assessments if tool.tool == "BYBIT_NATIVE_MARKET_DATA"
     )
@@ -171,3 +175,6 @@ def test_confirmed_pivots_use_only_right_side_completed_bars() -> None:
     for key in ("pivot_high_confirmed_at", "pivot_low_confirmed_at"):
         confirmed = price_action.values[key]
         assert confirmed is None or datetime.fromisoformat(str(confirmed)) <= latest
+    for key in ("pivot_high_age_bars", "pivot_low_age_bars"):
+        age = price_action.values[key]
+        assert age is None or int(age) >= 0

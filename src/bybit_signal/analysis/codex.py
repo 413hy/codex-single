@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import math
 import os
 import shutil
 import tempfile
@@ -348,8 +349,99 @@ class CodexAnalyzer:
             if not referenced <= known:
                 unknown = sorted(referenced - known)
                 raise ValueError(f"{assessment.symbol} references unknown evidence: {unknown}")
+            self._validate_direction_consistency(assessment, bundle)
             if assessment.strength is SignalStrength.STRONG:
                 self._validate_strong_price_geometry(assessment, bundle)
+
+    def _validate_direction_consistency(
+        self,
+        assessment: CandidateAssessment,
+        bundle: EvidenceBundle,
+    ) -> None:
+        direction = assessment.direction
+        if direction is None:
+            return
+        five = _evidence_values(bundle, ".PA.5M")
+        fifteen = _evidence_values(bundle, ".PA.15M")
+        if five is None or fifteen is None:
+            return
+
+        five_return = _number(five, "return_3_percent")
+        fifteen_return = _number(fifteen, "return_3_percent")
+        fifteen_atr_percent = _number(fifteen, "atr_14_percent")
+        if five_return is None or fifteen_return is None or fifteen_atr_percent is None:
+            return
+
+        impulse_threshold = max(12.0, 3 * fifteen_atr_percent)
+        drawdown = _atr_distance(five, high=True)
+        rebound = _atr_distance(five, high=False)
+        pivot_high_age = _pivot_age_bars(five, high=True, timeframe_minutes=5)
+        pivot_low_age = _pivot_age_bars(five, high=False, timeframe_minutes=5)
+
+        upward_exhaustion = (
+            fifteen_return >= impulse_threshold
+            and five_return <= 0
+            and drawdown is not None
+            and drawdown >= 1.5
+            and pivot_high_age is not None
+            and pivot_high_age <= 3
+        )
+        downward_exhaustion = (
+            fifteen_return <= -impulse_threshold
+            and five_return >= 0
+            and rebound is not None
+            and rebound >= 1.5
+            and pivot_low_age is not None
+            and pivot_low_age <= 3
+        )
+        if direction is Direction.LONG_BIAS and upward_exhaustion:
+            raise ValueError(
+                f"{assessment.symbol} LONG_BIAS conflicts with completed-candle "
+                "upward exhaustion: 15m impulse, confirmed 5m pivot high, "
+                "negative 5m return and >=1.5 ATR drawdown"
+            )
+        if direction is Direction.SHORT_BIAS and downward_exhaustion:
+            raise ValueError(
+                f"{assessment.symbol} SHORT_BIAS conflicts with completed-candle "
+                "downward exhaustion: 15m impulse, confirmed 5m pivot low, "
+                "positive 5m return and >=1.5 ATR rebound"
+            )
+
+        fifteen_close = _number(fifteen, "latest_close")
+        fifteen_mid = _number(fifteen, "range_mid_20")
+        five_macd = _number(five, "macd_histogram_12_26_9")
+        five_efficiency = _number(five, "directional_efficiency_12")
+        if (
+            fifteen_close is None
+            or fifteen_mid is None
+            or five_macd is None
+            or five_efficiency is None
+        ):
+            return
+        confirmed_downswing = (
+            not downward_exhaustion
+            and fifteen_return <= -1.5 * fifteen_atr_percent
+            and fifteen_close < fifteen_mid
+            and five_macd < 0
+            and five_efficiency < 0
+        )
+        confirmed_upswing = (
+            not upward_exhaustion
+            and fifteen_return >= 1.5 * fifteen_atr_percent
+            and fifteen_close > fifteen_mid
+            and five_macd > 0
+            and five_efficiency > 0
+        )
+        if direction is Direction.LONG_BIAS and confirmed_downswing:
+            raise ValueError(
+                f"{assessment.symbol} LONG_BIAS conflicts with a confirmed near-term "
+                "downswing across completed 15m structure and 5m momentum"
+            )
+        if direction is Direction.SHORT_BIAS and confirmed_upswing:
+            raise ValueError(
+                f"{assessment.symbol} SHORT_BIAS conflicts with a confirmed near-term "
+                "upswing across completed 15m structure and 5m momentum"
+            )
 
     def _validate_strong_price_geometry(
         self,
@@ -451,3 +543,64 @@ def _strict_output_schema(value: object) -> None:
     elif isinstance(value, list):
         for child in value:
             _strict_output_schema(child)
+
+
+def _evidence_values(
+    bundle: EvidenceBundle,
+    suffix: str,
+) -> Mapping[str, Any] | None:
+    item = next(
+        (item for item in bundle.evidence_items if item.evidence_id.endswith(suffix)),
+        None,
+    )
+    return item.values if item is not None else None
+
+
+def _number(values: Mapping[str, Any], key: str) -> float | None:
+    value = values.get(key)
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    result = float(value)
+    return result if math.isfinite(result) else None
+
+
+def _atr_distance(values: Mapping[str, Any], *, high: bool) -> float | None:
+    explicit_key = (
+        "drawdown_from_rolling_high_atr"
+        if high
+        else "rebound_from_rolling_low_atr"
+    )
+    explicit = _number(values, explicit_key)
+    if explicit is not None:
+        return explicit
+    close = _number(values, "latest_close")
+    atr = _number(values, "atr_14")
+    boundary = _number(values, "rolling_high_20" if high else "rolling_low_20")
+    if close is None or atr is None or atr <= 0 or boundary is None:
+        return None
+    return max(0.0, (boundary - close) / atr if high else (close - boundary) / atr)
+
+
+def _pivot_age_bars(
+    values: Mapping[str, Any],
+    *,
+    high: bool,
+    timeframe_minutes: int,
+) -> int | None:
+    prefix = "pivot_high" if high else "pivot_low"
+    explicit = _number(values, f"{prefix}_age_bars")
+    if explicit is not None and explicit >= 0:
+        return round(explicit)
+    confirmed = values.get(f"{prefix}_confirmed_at")
+    latest = values.get("latest_completed_close_time")
+    if not isinstance(confirmed, str) or not isinstance(latest, str):
+        return None
+    try:
+        confirmed_at = datetime.fromisoformat(confirmed)
+        latest_at = datetime.fromisoformat(latest)
+    except ValueError:
+        return None
+    seconds = (latest_at - confirmed_at).total_seconds()
+    if seconds < 0:
+        return None
+    return round(seconds / (timeframe_minutes * 60))

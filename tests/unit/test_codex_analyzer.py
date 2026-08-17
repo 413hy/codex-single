@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Sequence
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
@@ -60,6 +60,33 @@ def _bundle() -> EvidenceBundle:
             ),
         ),
     )
+
+
+def _regime_bundle(
+    five_values: dict[str, Any],
+    fifteen_values: dict[str, Any],
+) -> EvidenceBundle:
+    bundle = _bundle()
+    now = bundle.generated_at
+    items = (
+        EvidenceItem(
+            evidence_id="CYSUSDT.PA.5M",
+            category="price_action",
+            source="TEST",
+            observed_at=now,
+            summary="completed 5m regime evidence",
+            values=five_values,
+        ),
+        EvidenceItem(
+            evidence_id="CYSUSDT.PA.15M",
+            category="price_action",
+            source="TEST",
+            observed_at=now,
+            summary="completed 15m regime evidence",
+            values=fifteen_values,
+        ),
+    )
+    return bundle.model_copy(update={"evidence_items": items})
 
 
 def _assessment(
@@ -210,6 +237,120 @@ async def test_analyzer_rejects_invalid_strong_signal_price_geometry(
 
     assert captured.value.code == "INVALID_MODEL_OUTPUT"
     assert len(runner.commands) == 2
+
+
+async def test_analyzer_retries_fhe_style_upward_exhaustion_direction(
+    tmp_path: Path,
+) -> None:
+    bundle = _regime_bundle(
+        {
+            "latest_completed_close_time": "2026-08-17T16:20:00+00:00",
+            "latest_close": 0.03088,
+            "return_3_percent": -0.19,
+            "atr_14": 0.001007,
+            "drawdown_from_rolling_high_atr": 3.10,
+            "pivot_high_confirmed_at": "2026-08-17T16:20:00+00:00",
+            "pivot_high_age_bars": 0,
+            "macd_histogram_12_26_9": 0.00076,
+            "directional_efficiency_12": 0.51,
+            "range_mid_20": 0.02957,
+        },
+        {
+            "latest_close": 0.0321,
+            "return_3_percent": 27.23,
+            "atr_14_percent": 2.57,
+            "range_mid_20": 0.02957,
+        },
+    )
+    invalid = _response(_assessment(strength="WATCH", direction="LONG_BIAS"))
+    valid = _response(_assessment(direction="SHORT_BIAS"))
+    runner = FakeCodexRunner([invalid, valid])
+
+    result = await _analyzer(tmp_path, runner).analyze(
+        analysis_id="analysis_01",
+        bundles=[bundle],
+    )
+
+    assert result.attempts == 2
+    assert result.response.assessments[0].direction is not None
+    assert result.response.assessments[0].direction.value == "SHORT_BIAS"
+    assert "upward exhaustion" in runner.prompts[1]
+
+
+async def test_analyzer_accepts_tut_style_positive_near_term_momentum(
+    tmp_path: Path,
+) -> None:
+    bundle = _regime_bundle(
+        {
+            "latest_completed_close_time": "2026-08-17T16:20:00+00:00",
+            "latest_close": 100.0,
+            "return_3_percent": 8.44,
+            "atr_14": 3.0,
+            "drawdown_from_rolling_high_atr": 1.1,
+            "pivot_high_age_bars": 0,
+            "macd_histogram_12_26_9": 0.9,
+            "directional_efficiency_12": 0.60,
+            "range_mid_20": 95.0,
+        },
+        {
+            "latest_close": 100.0,
+            "return_3_percent": 16.08,
+            "atr_14_percent": 3.0,
+            "range_mid_20": 95.0,
+        },
+    )
+    strong = _assessment(
+        strength="STRONG",
+        direction="LONG_BIAS",
+        target=103,
+        invalidation=97,
+    )
+    window_start = datetime.now(UTC).replace(minute=0, second=0, microsecond=0)
+    strong["forming_1h"]["window_start"] = window_start.isoformat()
+    strong["forming_1h"]["window_end"] = (window_start + timedelta(hours=1)).isoformat()
+    runner = FakeCodexRunner([_response(strong)])
+
+    result = await _analyzer(tmp_path, runner).analyze(
+        analysis_id="analysis_01",
+        bundles=[bundle],
+    )
+
+    assert result.attempts == 1
+    assert result.response.assessments[0].strength is SignalStrength.STRONG
+
+
+async def test_analyzer_retries_fhe_style_confirmed_near_term_downswing(
+    tmp_path: Path,
+) -> None:
+    bundle = _regime_bundle(
+        {
+            "latest_close": 0.02936,
+            "return_3_percent": -0.24,
+            "atr_14": 0.00092,
+            "macd_histogram_12_26_9": -0.00013,
+            "directional_efficiency_12": -0.21,
+            "range_mid_20": 0.02957,
+        },
+        {
+            "latest_close": 0.02936,
+            "return_3_percent": -8.54,
+            "atr_14_percent": 3.36,
+            "range_mid_20": 0.02957,
+        },
+    )
+    invalid = _response(_assessment(strength="WATCH", direction="LONG_BIAS"))
+    valid = _response(_assessment(direction="SHORT_BIAS"))
+    runner = FakeCodexRunner([invalid, valid])
+
+    result = await _analyzer(tmp_path, runner).analyze(
+        analysis_id="analysis_01",
+        bundles=[bundle],
+    )
+
+    assert result.attempts == 2
+    assert result.response.assessments[0].direction is not None
+    assert result.response.assessments[0].direction.value == "SHORT_BIAS"
+    assert "confirmed near-term downswing" in runner.prompts[1]
 
 
 @pytest.mark.parametrize(

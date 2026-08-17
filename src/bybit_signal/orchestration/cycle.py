@@ -142,12 +142,11 @@ class SignalCycleService:
         started_at = datetime.now(UTC)
         analysis_id = f"cycle_{started_at:%Y%m%dT%H%M%SZ}_{uuid4().hex[:8]}"
         await self._store.initialize()
-        tracked_symbols = await self._store.previous_strong_symbols()
+        previous_strong = await self._store.previous_scheduled_strong_conclusions()
         previous = {
-            symbol: conclusion
-            for symbol in tracked_symbols
-            if (conclusion := await self._store.latest_conclusion(symbol)) is not None
+            conclusion.assessment.symbol: conclusion for conclusion in previous_strong
         }
+        tracked_symbols = tuple(previous)
         scan = await self._scanner.scan(limit=self._settings.analysis.top_candidates)
         candidate_symbols = tuple(candidate.symbol for candidate in scan.candidates)
         symbols = tuple(dict.fromkeys((*candidate_symbols, *tracked_symbols)))

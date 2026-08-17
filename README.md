@@ -6,12 +6,12 @@
 
 ## 已实现
 
-- Bybit 全量 USDT 线性永续动态币池与 5m 波动/流动性筛选；
+- Bybit 全量 USDT 线性永续动态币池与 5m 波动/流动性筛选；默认要求 24h 成交额不低于 150 万 USDT、最近完成 30m 成交额不低于 5 万 USDT、spread 不高于 25 bps；
 - 自建 Bybit 公共数据深采：完成 5m/15m/1h/4h K 线、last/mark、盘口快照、近期成交、OI 和资金费率；
 - Binance USD-M 与 OKX Swap 可选 ticker 一致性旁证，不混合价格；
 - 多周期价格行为、结构、波动、成交和数据质量证据包；
 - 严格 JSON Schema、证据 ID、时间截止线、最多 2 个强信号和模型输出重试；
-- 上一轮强信号自动复核，转弱或失效仍发送完整结论；
+- 上一轮定时强信号自动复核，紧急轮次不会覆盖追踪基准，转弱或失效仍发送完整结论；
 - Telegram ReplyKeyboard 主导航、InlineKeyboard 分析详情、白名单和幂等投递；
 - Bybit 公共 WebSocket 动态阈值、迟滞、60 秒合并、10 分钟单币冷却和每小时软上限；
 - SQLite 审计、只读 stdio MCP、轮转日志和服务单实例锁。

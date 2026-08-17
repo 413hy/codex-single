@@ -11,6 +11,9 @@ def test_example_configuration_loads() -> None:
     assert settings.analysis.interval_minutes == 30
     assert settings.analysis.model == "gpt-5.6-sol"
     assert settings.analysis.reasoning_effort == "high"
+    assert settings.scanner.minimum_24h_turnover_usdt == 1_500_000
+    assert settings.scanner.minimum_recent_30m_turnover_usdt == 50_000
+    assert settings.scanner.maximum_spread_bps == 25
     assert settings.telegram.enabled is False
 
 

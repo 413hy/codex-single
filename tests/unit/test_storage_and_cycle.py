@@ -139,8 +139,25 @@ def _cycle(conclusion: SignalConclusion) -> AnalysisCycleResult:
         completed_at=now,
         candidate_symbols=(conclusion.assessment.symbol,),
         conclusions=(conclusion,),
-        strong_signal_count=1,
+        strong_signal_count=int(conclusion.assessment.strength is SignalStrength.STRONG),
         context_sha256="c" * 64,
+    )
+
+
+def _watch_conclusion(
+    analysis_id: str,
+    symbol: str = "CYSUSDT",
+) -> SignalConclusion:
+    strong = _strong_conclusion(analysis_id, symbol)
+    assessment = strong.assessment.model_copy(
+        update={"strength": SignalStrength.WATCH}
+    )
+    return strong.model_copy(
+        update={
+            "analysis_id": analysis_id,
+            "assessment": assessment,
+            "tracking_status": TrackingStatus.WEAKENED,
+        }
     )
 
 
@@ -156,6 +173,7 @@ async def test_store_round_trip_and_previous_strong_symbols(tmp_path: Path) -> N
     assert await store.latest_cycle() == cycle
     assert await store.conclusion("analysis_01", "CYSUSDT") == conclusion
     assert await store.previous_strong_symbols() == ("CYSUSDT",)
+    assert await store.previous_scheduled_strong_conclusions() == (conclusion,)
     assert await store.latest_bundle("CYSUSDT") == bundle
     health = await store.health_summary()
     assert health["strong_signal_count"] == 1
@@ -177,6 +195,7 @@ class FakeScanner:
                 maximum_absolute_return_percent=2,
                 direction_efficiency=0.5,
                 recent_turnover_ratio=2,
+                recent_30m_turnover_usdt=100_000,
                 spread_bps=3,
                 turnover_24h_usdt=1_000_000,
                 completed_candles=60,
@@ -252,8 +271,10 @@ async def test_cycle_always_reanalyzes_and_marks_previous_strong_signal_weakened
 ) -> None:
     store = SignalStore(tmp_path / "signals.db")
     await store.initialize()
-    prior = _strong_conclusion("analysis_00")
+    prior = _strong_conclusion("cycle_analysis_00")
     await store.save_cycle(_cycle(prior), (_bundle("CYSUSDT"),))
+    emergency = _watch_conclusion("urgent_analysis_01")
+    await store.save_cycle(_cycle(emergency), (_bundle("CYSUSDT"),))
     market_collector = FakeMarketCollector()
     service = SignalCycleService(
         AppSettings(),

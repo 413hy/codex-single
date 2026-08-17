@@ -199,21 +199,31 @@ class SignalStore:
         return tuple(SignalConclusion.model_validate_json(row[0]) for row in rows)
 
     async def previous_strong_symbols(self) -> tuple[str, ...]:
+        conclusions = await self.previous_scheduled_strong_conclusions()
+        return tuple(conclusion.assessment.symbol for conclusion in conclusions)
+
+    async def previous_scheduled_strong_conclusions(
+        self,
+    ) -> tuple[SignalConclusion, ...]:
         row = await self._fetchone(
-            "SELECT analysis_id FROM cycles ORDER BY completed_at DESC LIMIT 1",
+            """
+            SELECT analysis_id FROM cycles
+            WHERE analysis_id NOT LIKE 'urgent_%'
+            ORDER BY completed_at DESC LIMIT 1
+            """,
             (),
         )
         if row is None:
             return ()
         rows = await self._fetchall(
             """
-            SELECT symbol FROM conclusions
+            SELECT payload_json FROM conclusions
             WHERE analysis_id = ? AND strength = 'STRONG'
             ORDER BY symbol
             """,
             (row[0],),
         )
-        return tuple(str(item[0]) for item in rows)
+        return tuple(SignalConclusion.model_validate_json(item[0]) for item in rows)
 
     async def latest_bundle(self, symbol: str) -> EvidenceBundle | None:
         row = await self._fetchone(

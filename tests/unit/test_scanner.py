@@ -60,7 +60,14 @@ def _ticker(symbol: str, now: datetime, *, last: str, high: str, low: str) -> By
     )
 
 
-def _candles(symbol: str, now: datetime, moves: list[Decimal]) -> tuple[Candle, ...]:
+def _candles(
+    symbol: str,
+    now: datetime,
+    moves: list[Decimal],
+    *,
+    turnover_start: Decimal = Decimal("10000"),
+    turnover_step: Decimal = Decimal("200"),
+) -> tuple[Candle, ...]:
     rows = []
     price = Decimal("1")
     start = now - timedelta(minutes=5 * len(moves))
@@ -79,7 +86,7 @@ def _candles(symbol: str, now: datetime, moves: list[Decimal]) -> tuple[Candle, 
                 low=low,
                 close=close,
                 volume=Decimal("1000"),
-                turnover=Decimal(1000 + index * 20),
+                turnover=turnover_start + Decimal(index) * turnover_step,
                 completed=True,
                 source="BYBIT",
             )
@@ -123,6 +130,37 @@ async def test_scanner_ranks_completed_5m_volatility_without_trade_sizing() -> N
         for candidate in result.candidates
         for reason in candidate.reasons
     )
+    assert result.candidates[0].features.recent_30m_turnover_usdt >= 50_000
+
+
+@pytest.mark.asyncio
+async def test_scanner_filters_low_absolute_recent_turnover() -> None:
+    now = datetime(2026, 8, 17, 8, tzinfo=UTC)
+    moves = [Decimal("0.01") if index % 2 == 0 else Decimal("-0.008") for index in range(60)]
+    fake = FakeBybitClient(
+        (_instrument("ACTIVEUSDT", now), _instrument("COLDUSDT", now)),
+        {
+            "ACTIVEUSDT": _ticker("ACTIVEUSDT", now, last="1", high="1.4", low="0.7"),
+            "COLDUSDT": _ticker("COLDUSDT", now, last="1", high="1.4", low="0.7"),
+        },
+        {
+            "ACTIVEUSDT": _candles("ACTIVEUSDT", now, moves),
+            "COLDUSDT": _candles(
+                "COLDUSDT",
+                now,
+                moves,
+                turnover_start=Decimal("100"),
+                turnover_step=Decimal("1"),
+            ),
+        },
+    )
+
+    result = await BybitUniverseScanner(
+        cast(BybitPublicClient, fake),
+        ScannerConfig(preselect_limit=10),
+    ).scan(limit=5)
+
+    assert [candidate.symbol for candidate in result.candidates] == ["ACTIVEUSDT"]
 
 
 @pytest.mark.asyncio

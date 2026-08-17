@@ -195,14 +195,21 @@ class EvidenceBuilder:
         macd_series = [fast - slow for fast, slow in zip(ema12_series, ema26_series, strict=True)]
         signal_series = _ema_series(macd_series, 9)
         lookback = min(12, len(values))
-        pivot_high, pivot_high_at, pivot_high_confirmed = _last_pivot(values, high=True)
-        pivot_low, pivot_low_at, pivot_low_confirmed = _last_pivot(values, high=False)
+        pivot_high, pivot_high_at, pivot_high_confirmed, pivot_high_age = _last_pivot(
+            values, high=True
+        )
+        pivot_low, pivot_low_at, pivot_low_confirmed, pivot_low_age = _last_pivot(
+            values, high=False
+        )
         recent_turnover = sum(turnovers[-6:])
         prior_turnover = sum(turnovers[-12:-6]) if len(turnovers) >= 12 else 0.0
+        rolling_high = max(highs[-20:])
+        rolling_low = min(lows[-20:])
         evidence_values: dict[str, str | int | float | bool | None] = {
             "completed_candles": len(values),
             "latest_completed_close_time": values[-1].close_time.isoformat(),
             "latest_close": closes[-1],
+            "return_1_percent": _return_percent(closes[-2], closes[-1]),
             "return_3_percent": _return_percent(closes[-4], closes[-1]),
             "return_12_percent": _return_percent(closes[-13], closes[-1]),
             "atr_14": atr14,
@@ -212,9 +219,15 @@ class EvidenceBuilder:
             "ema_50": _ema_series(closes, 50)[-1],
             "rsi_14": _rsi(closes, 14),
             "macd_histogram_12_26_9": macd_series[-1] - signal_series[-1],
-            "rolling_high_20": max(highs[-20:]),
-            "rolling_low_20": min(lows[-20:]),
-            "range_mid_20": (max(highs[-20:]) + min(lows[-20:])) / 2,
+            "rolling_high_20": rolling_high,
+            "rolling_low_20": rolling_low,
+            "range_mid_20": (rolling_high + rolling_low) / 2,
+            "drawdown_from_rolling_high_atr": max(
+                0.0, (rolling_high - closes[-1]) / atr14
+            ),
+            "rebound_from_rolling_low_atr": max(
+                0.0, (closes[-1] - rolling_low) / atr14
+            ),
             "directional_efficiency_12": _directional_efficiency(closes[-lookback:]),
             "overlap_ratio_12": _overlap_ratio(highs[-lookback:], lows[-lookback:]),
             "bull_body_ratio_12": sum(
@@ -227,12 +240,15 @@ class EvidenceBuilder:
             "turnover_ratio_6_vs_6": (
                 recent_turnover / prior_turnover if prior_turnover > 0 else None
             ),
+            "recent_30m_turnover_usdt": recent_turnover,
             "confirmed_pivot_high": pivot_high,
             "pivot_high_open_time": pivot_high_at,
             "pivot_high_confirmed_at": pivot_high_confirmed,
+            "pivot_high_age_bars": pivot_high_age,
             "confirmed_pivot_low": pivot_low,
             "pivot_low_open_time": pivot_low_at,
             "pivot_low_confirmed_at": pivot_low_confirmed,
+            "pivot_low_age_bars": pivot_low_age,
         }
         return EvidenceItem(
             evidence_id=f"{symbol}.PA.{timeframe.upper()}",
@@ -457,18 +473,22 @@ def _overlap_ratio(highs: Sequence[float], lows: Sequence[float]) -> float:
 
 def _last_pivot(
     candles: Sequence[Candle], *, high: bool
-) -> tuple[float | None, str | None, str | None]:
+) -> tuple[float | None, str | None, str | None, int | None]:
     field = "high" if high else "low"
     for index in range(len(candles) - 3, 1, -1):
         value = getattr(candles[index], field)
-        neighbors = [getattr(candles[position], field) for position in range(index - 2, index + 3)]
+        neighbors = [
+            getattr(candles[position], field)
+            for position in range(index - 2, index + 3)
+        ]
         if (high and value == max(neighbors)) or (not high and value == min(neighbors)):
             return (
                 float(value),
                 candles[index].open_time.isoformat(),
                 candles[index + 2].close_time.isoformat(),
+                len(candles) - index - 3,
             )
-    return None, None, None
+    return None, None, None, None
 
 
 def _notional(levels: Sequence[BybitBookLevel]) -> float:

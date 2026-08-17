@@ -30,8 +30,9 @@ scanner:
   preselect_limit: 60
   candle_limit: 72
   request_concurrency: 8
-  minimum_24h_turnover_usdt: 250000
-  maximum_spread_bps: 50
+  minimum_24h_turnover_usdt: 1500000
+  minimum_recent_30m_turnover_usdt: 50000
+  maximum_spread_bps: 25
   minimum_completed_candles: 48
   maximum_missing_intervals: 2
   minimum_median_range_percent: 0.15
