@@ -1,4 +1,4 @@
-from datetime import UTC, datetime, timedelta
+from datetime import datetime
 from decimal import Decimal
 
 import pytest
@@ -7,14 +7,11 @@ from pydantic import ValidationError
 from bybit_signal.domain.enums import (
     Direction,
     MarketType,
-    ResearchScope,
     SignalStrength,
-    ToolStatus,
 )
 from bybit_signal.domain.models import (
     CandidateAssessment,
     Candle,
-    ExternalResearchSnapshot,
 )
 
 
@@ -58,42 +55,6 @@ def test_non_strong_assessment_does_not_invent_trade_levels() -> None:
     )
     assert assessment.direction is None
     assert assessment.take_profit is None
-
-
-def test_external_research_is_advisory_and_scope_bound() -> None:
-    now = datetime(2026, 8, 17, 8, tzinfo=UTC)
-    snapshot = ExternalResearchSnapshot(
-        tool="TRADING_AGENTS",
-        tool_version="a33fd4c",
-        license_status="APACHE-2.0_REVIEWED",
-        scope=ResearchScope.GLOBAL_MARKET_CONTEXT,
-        as_of_candle_end=now,
-        generated_at=now + timedelta(minutes=1),
-        expires_at=now + timedelta(hours=4),
-        dataset_sha256="a" * 64,
-        status=ToolStatus.AVAILABLE,
-        findings={"btc_regime": "RISK_OFF"},
-    )
-    assert snapshot.disposition == "ADVISORY_ONLY"
-    assert snapshot.symbol is None
-
-
-def test_global_research_cannot_claim_altcoin_identity() -> None:
-    now = datetime(2026, 8, 17, 8, tzinfo=UTC)
-    with pytest.raises(ValidationError, match="global research"):
-        ExternalResearchSnapshot(
-            tool="TRADING_AGENTS",
-            tool_version="a33fd4c",
-            license_status="APACHE-2.0_REVIEWED",
-            scope=ResearchScope.GLOBAL_MARKET_CONTEXT,
-            symbol="CYSUSDT",
-            as_of_candle_end=now,
-            generated_at=now,
-            expires_at=now + timedelta(hours=4),
-            dataset_sha256="a" * 64,
-            status=ToolStatus.AVAILABLE,
-            findings={},
-        )
 
 
 def test_market_type_contract_has_no_account_semantics() -> None:

@@ -164,6 +164,40 @@ class SignalStore:
         )
         return SignalConclusion.model_validate_json(row[0]) if row else None
 
+    async def latest_conclusions(self) -> tuple[SignalConclusion, ...]:
+        rows = await self._fetchall(
+            """
+            SELECT payload_json FROM (
+                SELECT payload_json, symbol,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY symbol ORDER BY generated_at DESC
+                       ) AS row_number
+                FROM conclusions
+            )
+            WHERE row_number = 1
+            ORDER BY symbol
+            """,
+            (),
+        )
+        return tuple(SignalConclusion.model_validate_json(row[0]) for row in rows)
+
+    async def signal_history(
+        self,
+        symbol: str,
+        *,
+        limit: int = 20,
+    ) -> tuple[SignalConclusion, ...]:
+        bounded_limit = max(1, min(limit, 100))
+        rows = await self._fetchall(
+            """
+            SELECT payload_json FROM conclusions
+            WHERE symbol = ?
+            ORDER BY generated_at DESC LIMIT ?
+            """,
+            (symbol, bounded_limit),
+        )
+        return tuple(SignalConclusion.model_validate_json(row[0]) for row in rows)
+
     async def previous_strong_symbols(self) -> tuple[str, ...]:
         row = await self._fetchone(
             "SELECT analysis_id FROM cycles ORDER BY completed_at DESC LIMIT 1",

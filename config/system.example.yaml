@@ -5,7 +5,7 @@ runtime:
   data_root: runtime/data
   log_root: runtime/logs
   database_path: runtime/state/signal.db
-  max_parallel_cmi: 3
+  market_request_concurrency: 8
 
 analysis:
   interval_minutes: 30
@@ -21,6 +21,11 @@ bybit:
   rest_base_url: https://api.bybit.com
   public_linear_ws_url: wss://stream.bybit.com/v5/public/linear
 
+public_sources:
+  cross_exchange_enabled: true
+  binance_futures_base_url: https://fapi.binance.com
+  okx_base_url: https://www.okx.com
+
 scanner:
   preselect_limit: 60
   candle_limit: 72
@@ -32,28 +37,13 @@ scanner:
   minimum_median_range_percent: 0.15
   minimum_max_return_percent: 0.35
 
-cmi:
-  enabled: true
-  mode: source
-  source_root: E:/quantify/sol_realtime_snapshot
-  python_executable: E:/quantify/sol_realtime_snapshot/.venv/Scripts/python.exe
-  executable_path: null
-  timeout_seconds: 75
-  live_seconds: 30
-  max_snapshot_age_seconds: 180
-  max_snapshot_bytes: 33554432
-
 monitoring:
+  enabled: true
   event_coalesce_seconds: 60
   symbol_cooldown_seconds: 600
   soft_model_wakes_per_hour: 10
-
-tools:
-  kronos_mode: auto
-  kronos_repository: null
-  trading_agents_mode: snapshot_only
-  openbb_mode: snapshot_only
-  external_research_root: runtime/research
+  directive_refresh_seconds: 30
+  reconnect_delay_seconds: 5
 
 telegram:
   enabled: false

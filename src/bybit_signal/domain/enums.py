@@ -60,12 +60,3 @@ class MonitoringMetric(StrEnum):
     OPEN_INTEREST = "OPEN_INTEREST"
     FUNDING_RATE = "FUNDING_RATE"
     LIQUIDATION_NOTIONAL_1M = "LIQUIDATION_NOTIONAL_1M"
-
-
-class ResearchScope(StrEnum):
-    INSTRUMENT = "INSTRUMENT"
-    GLOBAL_MARKET_CONTEXT = "GLOBAL_MARKET_CONTEXT"
-
-
-class ResearchDisposition(StrEnum):
-    ADVISORY_ONLY = "ADVISORY_ONLY"

@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import json
 import os
+import shutil
 import tempfile
 import time
 from collections.abc import Mapping, Sequence
@@ -15,7 +16,7 @@ from typing import Any, Protocol
 from pydantic import ValidationError
 
 from bybit_signal.config import AnalysisConfig
-from bybit_signal.domain.enums import Direction, SignalStrength
+from bybit_signal.domain.enums import Direction, MonitoringMetric, SignalStrength
 from bybit_signal.domain.models import (
     CandidateAssessment,
     EvidenceBundle,
@@ -66,14 +67,28 @@ async def run_codex_process(
     if os.name == "nt":
         creationflags = 0x08000000  # CREATE_NO_WINDOW
     started = time.monotonic()
-    process = await asyncio.create_subprocess_exec(
-        *command,
-        cwd=str(cwd),
-        stdin=asyncio.subprocess.PIPE,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-        creationflags=creationflags,
-    )
+    process: asyncio.subprocess.Process | None = None
+    last_start_error: OSError | None = None
+    for attempt in range(1, 4):
+        try:
+            process = await asyncio.create_subprocess_exec(
+                *command,
+                cwd=str(cwd),
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                creationflags=creationflags,
+            )
+            break
+        except OSError as error:
+            last_start_error = error
+            if attempt < 3:
+                await asyncio.sleep(0.5 * attempt)
+    if process is None:
+        raise CodexAnalysisError(
+            "CODEX_START_FAILED",
+            "Codex process could not be started after three attempts",
+        ) from last_start_error
     try:
         stdout, stderr = await asyncio.wait_for(
             process.communicate(stdin.encode("utf-8")),
@@ -110,7 +125,7 @@ class CodexAnalyzer:
         self._runtime_root = runtime_root.resolve()
         self._prompt_path = prompt_path.resolve()
         self._process_runner = process_runner
-        self._codex_executable = codex_executable
+        self._codex_command_prefix = _codex_command_prefix(codex_executable)
 
     async def analyze(
         self,
@@ -129,10 +144,16 @@ class CodexAnalyzer:
         symbols = [bundle.symbol for bundle in bundles]
         if len(symbols) != len(set(symbols)):
             raise CodexAnalysisError("DUPLICATE_SYMBOL", "analysis bundles contain duplicates")
+        requested_at = datetime.now(UTC)
+        forming_window_start = requested_at.replace(minute=0, second=0, microsecond=0)
+        forming_window_end = forming_window_start + timedelta(hours=1)
         context = self._context(
             analysis_id=analysis_id,
             bundles=bundles,
             tracked_symbols=tracked_symbols,
+            max_strong_signals=2,
+            max_target_distance_percent=self._config.max_target_distance_percent,
+            requested_at=requested_at,
         )
         context_json = json.dumps(
             context, ensure_ascii=False, sort_keys=True, separators=(",", ":")
@@ -154,8 +175,10 @@ class CodexAnalyzer:
                 temporary_root = Path(temporary)
                 schema_path = temporary_root / "response.schema.json"
                 output_path = temporary_root / "last-message.json"
+                schema = ModelAnalysisResponse.model_json_schema()
+                _strict_output_schema(schema)
                 schema_path.write_text(
-                    json.dumps(ModelAnalysisResponse.model_json_schema(), ensure_ascii=False),
+                    json.dumps(schema, ensure_ascii=False),
                     encoding="utf-8",
                 )
                 command = self._command(schema_path, output_path)
@@ -187,6 +210,8 @@ class CodexAnalyzer:
                         response=response,
                         analysis_id=analysis_id,
                         bundles=bundles,
+                        forming_window_start=forming_window_start,
+                        forming_window_end=forming_window_end,
                     )
                 except (OSError, UnicodeError, ValidationError, ValueError) as error:
                     last_error = self._concise_error(error)
@@ -206,7 +231,7 @@ class CodexAnalyzer:
 
     def _command(self, schema_path: Path, output_path: Path) -> tuple[str, ...]:
         return (
-            self._codex_executable,
+            *self._codex_command_prefix,
             "exec",
             "--json",
             "--ephemeral",
@@ -232,16 +257,28 @@ class CodexAnalyzer:
         analysis_id: str,
         bundles: Sequence[EvidenceBundle],
         tracked_symbols: Sequence[str],
+        max_strong_signals: int,
+        max_target_distance_percent: float,
+        requested_at: datetime,
     ) -> dict[str, Any]:
-        now = datetime.now(UTC)
-        window_start = now.replace(minute=0, second=0, microsecond=0)
+        window_start = requested_at.replace(minute=0, second=0, microsecond=0)
+        cutoffs = [bundle.generated_at for bundle in bundles]
         return {
             "schema_version": 1,
             "analysis_id": analysis_id,
-            "requested_at": now.isoformat(),
+            "requested_at": requested_at.isoformat(),
+            "batch_evidence_cutoff_utc": max(cutoffs).isoformat(),
+            "bundle_cutoff_skew_seconds": (
+                max(cutoffs) - min(cutoffs)
+            ).total_seconds(),
             "forming_1h_window_utc": {
                 "start": window_start.isoformat(),
                 "end": (window_start + timedelta(hours=1)).isoformat(),
+            },
+            "analysis_policy": {
+                "max_strong_signals": max_strong_signals,
+                "max_target_distance_percent": max_target_distance_percent,
+                "monitoring_valid_for_seconds": {"minimum": 1800, "maximum": 3600},
             },
             "tracked_symbols_without_prior_direction": sorted(set(tracked_symbols)),
             "evidence_bundles": [bundle.model_dump(mode="json") for bundle in bundles],
@@ -253,6 +290,8 @@ class CodexAnalyzer:
         response: ModelAnalysisResponse,
         analysis_id: str,
         bundles: Sequence[EvidenceBundle],
+        forming_window_start: datetime,
+        forming_window_end: datetime,
     ) -> None:
         if response.analysis_id != analysis_id:
             raise ValueError("analysis_id does not match the request")
@@ -267,12 +306,45 @@ class CodexAnalyzer:
             bundle = bundle_by_symbol[assessment.symbol]
             known = {item.evidence_id for item in bundle.evidence_items}
             referenced = set(assessment.evidence_ids)
+            if assessment.forming_1h is not None and (
+                assessment.forming_1h.window_start != forming_window_start
+                or assessment.forming_1h.window_end != forming_window_end
+            ):
+                raise ValueError(
+                    f"{assessment.symbol} forming 1h window differs from the requested window"
+                )
             if assessment.take_profit is not None:
                 referenced.update(assessment.take_profit.evidence_ids)
             if assessment.invalidation is not None:
                 referenced.update(assessment.invalidation.evidence_ids)
+            family_ids: set[str] = set()
             for directive in assessment.monitoring_directives:
                 referenced.update(directive.evidence_ids)
+                if directive.family_id in family_ids:
+                    raise ValueError(
+                        f"{assessment.symbol} contains duplicate monitoring family "
+                        f"{directive.family_id}"
+                    )
+                family_ids.add(directive.family_id)
+                if not 1800 <= directive.valid_for_seconds <= 3600:
+                    raise ValueError(
+                        f"{assessment.symbol} monitoring directive validity must be "
+                        "between 1800 and 3600 seconds"
+                    )
+                if directive.metric not in {
+                    MonitoringMetric.LAST_PRICE,
+                    MonitoringMetric.MARK_PRICE,
+                    MonitoringMetric.COMPLETED_5M_CLOSE,
+                    MonitoringMetric.COMPLETED_15M_CLOSE,
+                    MonitoringMetric.COMPLETED_1H_CLOSE,
+                    MonitoringMetric.SPREAD_BPS,
+                    MonitoringMetric.OPEN_INTEREST,
+                    MonitoringMetric.FUNDING_RATE,
+                }:
+                    raise ValueError(
+                        f"{assessment.symbol} requested unsupported realtime metric "
+                        f"{directive.metric.value}"
+                    )
             if not referenced <= known:
                 unknown = sorted(referenced - known)
                 raise ValueError(f"{assessment.symbol} references unknown evidence: {unknown}")
@@ -297,9 +369,7 @@ class CodexAnalyzer:
         elif assessment.direction is Direction.SHORT_BIAS and (
             target >= current or invalidation <= current
         ):
-            raise ValueError(
-                f"{assessment.symbol} short target/invalidation geometry is invalid"
-            )
+            raise ValueError(f"{assessment.symbol} short target/invalidation geometry is invalid")
         distance_percent = abs(target / current - 1) * 100
         if distance_percent > self._config.max_target_distance_percent:
             raise ValueError(
@@ -339,12 +409,45 @@ class CodexAnalyzer:
 
     @staticmethod
     def _process_failure(result: CodexProcessResult) -> str:
-        detail = (result.stderr or result.stdout).strip().replace("\r", " ").replace("\n", " ")
-        if len(detail) > 800:
-            detail = detail[:797] + "..."
+        stderr = result.stderr.strip().replace("\r", " ").replace("\n", " ")
+        stdout = result.stdout.strip().replace("\r", " ").replace("\n", " ")
+        detail = f"stderr={stderr or 'none'}; stdout={stdout or 'none'}"
+        if len(detail) > 1600:
+            detail = detail[-1597:] + "..."
         return f"Codex exited {result.return_code}: {detail or 'no diagnostics'}"
 
     @staticmethod
     def _concise_error(error: Exception) -> str:
         detail = str(error).replace("\r", " ").replace("\n", " ")
         return detail[:1000]
+
+
+def _codex_command_prefix(codex_executable: str) -> tuple[str, ...]:
+    if os.name != "nt" or codex_executable.lower() not in {"codex", "codex.cmd"}:
+        return (codex_executable,)
+    command_wrapper = shutil.which("codex.cmd")
+    node_executable = shutil.which("node.exe")
+    if command_wrapper is not None and node_executable is not None:
+        codex_script = (
+            Path(command_wrapper).parent / "node_modules" / "@openai" / "codex" / "bin" / "codex.js"
+        )
+        if codex_script.is_file():
+            return node_executable, str(codex_script.resolve())
+    return (codex_executable,)
+
+
+def _strict_output_schema(value: object) -> None:
+    if isinstance(value, dict):
+        value.pop("default", None)
+        pattern = value.get("pattern")
+        if isinstance(pattern, str) and "(?" in pattern:
+            value.pop("pattern", None)
+        properties = value.get("properties")
+        if isinstance(properties, dict):
+            value["required"] = list(properties)
+            value["additionalProperties"] = False
+        for child in value.values():
+            _strict_output_schema(child)
+    elif isinstance(value, list):
+        for child in value:
+            _strict_output_schema(child)

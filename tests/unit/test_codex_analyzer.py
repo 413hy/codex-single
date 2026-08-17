@@ -170,6 +170,8 @@ async def test_analyzer_uses_ephemeral_read_only_strict_model_invocation(
     assert result.response.assessments[0].strength is SignalStrength.NO_STRONG_SIGNAL
     assert result.usage == {"input_tokens": 100, "output_tokens": 20}
     assert "tracked_symbols_without_prior_direction" in runner.prompts[0]
+    assert '"max_target_distance_percent":8.0' in runner.prompts[0]
+    assert '"monitoring_valid_for_seconds":{"maximum":3600,"minimum":1800}' in runner.prompts[0]
 
 
 async def test_analyzer_retries_invalid_evidence_reference(tmp_path: Path) -> None:
@@ -208,3 +210,40 @@ async def test_analyzer_rejects_invalid_strong_signal_price_geometry(
 
     assert captured.value.code == "INVALID_MODEL_OUTPUT"
     assert len(runner.commands) == 2
+
+
+@pytest.mark.parametrize(
+    ("metric", "valid_for_seconds", "expected_error"),
+    [
+        ("LAST_PRICE", 60, "between 1800 and 3600 seconds"),
+        ("CVD_5M", 3600, "unsupported realtime metric"),
+    ],
+)
+async def test_analyzer_retries_invalid_monitoring_directive(
+    tmp_path: Path,
+    metric: str,
+    valid_for_seconds: int,
+    expected_error: str,
+) -> None:
+    invalid_assessment = _assessment()
+    invalid_assessment["monitoring_directives"] = [
+        {
+            "family_id": "cysusdt.structure.5m",
+            "metric": metric,
+            "comparator": "GREATER_THAN",
+            "threshold": 101,
+            "hysteresis": 0.1,
+            "valid_for_seconds": valid_for_seconds,
+            "reason": "结构突破后重新分析",
+            "evidence_ids": ["CYSUSDT.PA.5M"],
+        }
+    ]
+    runner = FakeCodexRunner([_response(invalid_assessment), _response(_assessment())])
+
+    result = await _analyzer(tmp_path, runner).analyze(
+        analysis_id="analysis_01",
+        bundles=[_bundle()],
+    )
+
+    assert result.attempts == 2
+    assert expected_error in runner.prompts[1]

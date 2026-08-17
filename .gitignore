@@ -10,9 +10,9 @@ build/
 dist/
 *.egg-info/
 .env
+config/system.local.yaml
 runtime/
 data/
 logs/
 *.db
 *.sqlite3
-

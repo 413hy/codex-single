@@ -1,86 +1,88 @@
 from __future__ import annotations
 
-from collections.abc import Mapping
-from datetime import UTC, datetime
-from decimal import Decimal
-from typing import Any, cast
+import statistics
+from collections.abc import Sequence
+from datetime import timedelta
+from itertools import pairwise
 
-from bybit_signal.cmi.models import CmiSnapshot
 from bybit_signal.domain.enums import PriceType, ToolStatus
 from bybit_signal.domain.models import (
+    Candle,
     CanonicalPrice,
     EvidenceBundle,
     EvidenceItem,
     ToolAssessment,
 )
+from bybit_signal.providers.bybit import BybitBookLevel, BybitOpenInterest
+from bybit_signal.providers.deep_market import DeepTimeframe, NativeMarketSnapshot
 
 
 class EvidenceBuilder:
-    """Extract neutral, auditable facts without deciding a trade direction."""
+    """Derive neutral, reproducible facts from this project's public data snapshot."""
 
-    _TIMEFRAMES = ("5m", "15m", "1h", "4h")
+    _TIMEFRAMES: tuple[DeepTimeframe, ...] = ("5m", "15m", "1h", "4h")
 
-    def build(self, snapshot: CmiSnapshot) -> EvidenceBundle:
-        payload = snapshot.payload
-        ticker = self._mapping(self._mapping(payload.get("perpetual_tickers")).get("bybit"))
-        last = self._canonical_price(snapshot.symbol, ticker, PriceType.LAST)
-        mark = self._canonical_price(snapshot.symbol, ticker, PriceType.MARK)
-        items: list[EvidenceItem] = []
+    def build(self, snapshot: NativeMarketSnapshot) -> EvidenceBundle:
+        ticker = snapshot.ticker
+        if ticker.mark_price is None:
+            raise ValueError("canonical Bybit mark price is unavailable")
+        last = CanonicalPrice(
+            symbol=snapshot.symbol,
+            price_type=PriceType.LAST,
+            value=ticker.last_price,
+            timestamp=ticker.observed_at,
+        )
+        mark = CanonicalPrice(
+            symbol=snapshot.symbol,
+            price_type=PriceType.MARK,
+            value=ticker.mark_price,
+            timestamp=ticker.observed_at,
+        )
+        items = [self._quality(snapshot), self._ticker(snapshot)]
         tools: list[ToolAssessment] = []
-
-        health_id = f"{snapshot.symbol}.CMI.HEALTH"
-        price_id = f"{snapshot.symbol}.CMI.PRICE"
-        items.extend(
-            (
-                self._health_evidence(snapshot, health_id),
-                self._price_evidence(snapshot, ticker, price_id),
-            )
-        )
-        tools.append(
-            ToolAssessment(
-                tool="CMI",
-                status=snapshot.status,
-                version=snapshot.application_version,
-                reason=(
-                    f"validated schema {snapshot.schema_version}; "
-                    f"{len(snapshot.available_perpetual_exchanges)} perpetual source(s); "
-                    f"{snapshot.limitation_count} declared limitation(s)"
-                ),
-                evidence_ids=(health_id, price_id),
-            )
-        )
 
         price_action_ids: list[str] = []
         for timeframe in self._TIMEFRAMES:
-            evidence = self._price_action(snapshot, timeframe)
-            if evidence is not None:
-                items.append(evidence)
-                price_action_ids.append(evidence.evidence_id)
+            candles = snapshot.candles.get(timeframe)
+            if candles:
+                item = self._price_action(snapshot.symbol, timeframe, candles)
+                items.append(item)
+                price_action_ids.append(item.evidence_id)
+        core_status = (
+            ToolStatus.AVAILABLE
+            if len(price_action_ids) == len(self._TIMEFRAMES)
+            else ToolStatus.PARTIAL
+        )
+        core_ids = (
+            f"{snapshot.symbol}.NATIVE.QUALITY",
+            f"{snapshot.symbol}.BYBIT.TICKER",
+            *price_action_ids,
+        )
         tools.append(
             ToolAssessment(
-                tool="LOUIE_NATIVE_PRICE_ACTION",
-                status=ToolStatus.AVAILABLE
-                if len(price_action_ids) == len(self._TIMEFRAMES)
-                else ToolStatus.PARTIAL,
+                tool="BYBIT_NATIVE_MARKET_DATA",
+                status=core_status,
                 version="native-v1",
                 reason=(
-                    "completed-candle-only multi-timeframe structure; "
-                    "confirmed pivots use a right-side "
-                    "confirmation window and never inspect forming candles"
+                    "self-contained public REST collector; last and mark remain separate; "
+                    f"{len(price_action_ids)}/4 completed-candle timeframes qualified"
                 ),
-                evidence_ids=tuple(price_action_ids),
+                evidence_ids=core_ids,
             )
         )
 
-        order_flow_items, order_flow_status, order_flow_reason = self._order_flow(snapshot)
-        items.extend(order_flow_items)
+        microstructure_items = self._microstructure(snapshot)
+        items.extend(microstructure_items)
         tools.append(
             ToolAssessment(
-                tool="PYTA_NATIVE_ORDER_FLOW",
-                status=order_flow_status,
+                tool="BYBIT_NATIVE_MICROSTRUCTURE",
+                status=(ToolStatus.AVAILABLE if microstructure_items else ToolStatus.UNAVAILABLE),
                 version="native-v1",
-                reason=order_flow_reason,
-                evidence_ids=tuple(item.evidence_id for item in order_flow_items),
+                reason=(
+                    "REST orderbook is point-in-time advisory evidence; public-trade delta "
+                    "is directional only when the requested window is fully covered"
+                ),
+                evidence_ids=tuple(item.evidence_id for item in microstructure_items),
             )
         )
 
@@ -88,17 +90,27 @@ class EvidenceBuilder:
         items.extend(derivatives)
         tools.append(
             ToolAssessment(
-                tool="CMI_DERIVATIVES",
+                tool="BYBIT_NATIVE_DERIVATIVES",
                 status=ToolStatus.AVAILABLE if derivatives else ToolStatus.UNAVAILABLE,
-                version=snapshot.application_version,
-                reason=(
-                    "funding, open interest and liquidation windows "
-                    "retain their source quality flags"
-                ),
+                version="native-v1",
+                reason="current funding/open interest and validated 5m OI history are advisory",
                 evidence_ids=tuple(item.evidence_id for item in derivatives),
             )
         )
-
+        references = self._reference_markets(snapshot)
+        items.extend(references)
+        tools.append(
+            ToolAssessment(
+                tool="NATIVE_CROSS_EXCHANGE_REFERENCE",
+                status=ToolStatus.AVAILABLE if references else ToolStatus.UNAVAILABLE,
+                version="native-v1",
+                reason=(
+                    "Binance Futures and OKX Swap are optional consistency checks; "
+                    "their prices are never averaged into the canonical Bybit price"
+                ),
+                evidence_ids=tuple(item.evidence_id for item in references),
+            )
+        )
         return EvidenceBundle(
             symbol=snapshot.symbol,
             generated_at=snapshot.generated_at,
@@ -109,378 +121,368 @@ class EvidenceBuilder:
             tool_assessments=tuple(tools),
         )
 
-    def _health_evidence(self, snapshot: CmiSnapshot, evidence_id: str) -> EvidenceItem:
+    @staticmethod
+    def _quality(snapshot: NativeMarketSnapshot) -> EvidenceItem:
+        missing = sorted(snapshot.collection_failures)
         return EvidenceItem(
-            evidence_id=evidence_id,
+            evidence_id=f"{snapshot.symbol}.NATIVE.QUALITY",
             category="data_quality",
-            source="CMI",
+            source="BYBIT_NATIVE_COLLECTOR",
             observed_at=snapshot.generated_at,
             summary=(
-                f"CMI {snapshot.status}: {snapshot.completeness_status}, "
-                f"health {snapshot.health_status}; absent fields remain unknown"
+                "All required public fields are identity checked; missing optional or "
+                "under-warmed sources remain unknown rather than zero"
             ),
             values={
-                "snapshot_status": snapshot.snapshot_status,
-                "completeness_status": snapshot.completeness_status,
-                "health_status": snapshot.health_status,
-                "limitation_count": snapshot.limitation_count,
-                "perpetual_exchanges": ",".join(snapshot.available_perpetual_exchanges),
+                "qualified_timeframe_count": len(snapshot.candles),
+                "collection_duration_ms": round(
+                    (snapshot.generated_at - snapshot.collection_started_at).total_seconds()
+                    * 1000
+                ),
+                "evidence_cutoff_utc": snapshot.generated_at.isoformat(),
+                "missing_source_count": len(missing),
+                "missing_sources": ",".join(missing) if missing else "none",
+                "orderbook_available": snapshot.orderbook is not None,
+                "public_trade_count": len(snapshot.recent_trades),
+                "open_interest_points": len(snapshot.open_interest),
             },
         )
 
-    def _price_evidence(
-        self,
-        snapshot: CmiSnapshot,
-        ticker: Mapping[str, Any],
-        evidence_id: str,
-    ) -> EvidenceItem:
+    @staticmethod
+    def _ticker(snapshot: NativeMarketSnapshot) -> EvidenceItem:
+        ticker = snapshot.ticker
         return EvidenceItem(
-            evidence_id=evidence_id,
+            evidence_id=f"{snapshot.symbol}.BYBIT.TICKER",
             category="canonical_price",
-            source="CMI_BYBIT_PERPETUAL",
-            observed_at=snapshot.generated_at,
-            summary=(
-                "Bybit perpetual last and mark are preserved separately; "
-                "no exchange averaging is used"
-            ),
+            source="BYBIT_LINEAR_PERPETUAL",
+            observed_at=ticker.observed_at,
+            summary="Bybit linear-perpetual last, mark and index are preserved separately",
             values={
-                "last_price": self._number(ticker.get("last_price")),
-                "mark_price": self._number(ticker.get("mark_price")),
-                "index_price": self._number(ticker.get("index_price")),
-                "bid_price": self._number(ticker.get("bid_price")),
-                "ask_price": self._number(ticker.get("ask_price")),
-                "funding_rate": self._number(ticker.get("funding_rate")),
-                "turnover_24h": self._number(ticker.get("turnover_24h")),
+                "last_price": float(ticker.last_price),
+                "mark_price": float(ticker.mark_price) if ticker.mark_price is not None else None,
+                "index_price": (
+                    float(ticker.index_price) if ticker.index_price is not None else None
+                ),
+                "last_mark_basis_bps": (
+                    float((ticker.last_price - ticker.mark_price) / ticker.mark_price * 10_000)
+                    if ticker.mark_price is not None
+                    else None
+                ),
+                "bid_price": float(ticker.bid_price),
+                "ask_price": float(ticker.ask_price),
+                "spread_bps": float(ticker.spread_bps),
+                "range_24h_percent": float(ticker.range_24h_percent),
+                "price_change_24h_percent": float(ticker.price_change_24h * 100),
+                "turnover_24h": float(ticker.turnover_24h),
             },
         )
 
-    def _price_action(self, snapshot: CmiSnapshot, timeframe: str) -> EvidenceItem | None:
-        candles_root = self._mapping(snapshot.payload.get("candles"))
-        bybit = self._mapping(candles_root.get("bybit"))
-        window = self._mapping(bybit.get(timeframe))
-        completed_value = window.get("completed")
-        if not isinstance(completed_value, list):
-            return None
-        candles = [
-            cast(Mapping[str, Any], candle)
-            for candle in completed_value
-            if isinstance(candle, Mapping)
-            and candle.get("complete") is True
-            and candle.get("normalized_symbol") == snapshot.symbol
-            and candle.get("interval") == timeframe
-            and candle.get("gap_detected") is not True
-            and candle.get("is_stale") is not True
-        ]
-        candles.sort(key=lambda candle: int(self._number(candle.get("open_time_ms")) or 0))
-        if len(candles) < 20:
-            return None
-        recent = candles[-60:]
-        closes = [self._required_number(candle.get("close")) for candle in recent]
-        highs = [self._required_number(candle.get("high")) for candle in recent]
-        lows = [self._required_number(candle.get("low")) for candle in recent]
-        opens = [self._required_number(candle.get("open")) for candle in recent]
-        ranges = [max(high - low, 0.0) for high, low in zip(highs, lows, strict=True)]
-        atr14 = sum(ranges[-14:]) / 14
-        rolling_high = max(highs[-20:])
-        rolling_low = min(lows[-20:])
-        net_move = closes[-1] - closes[-13]
-        travelled = sum(
-            abs(closes[index] - closes[index - 1]) for index in range(len(closes) - 11, len(closes))
-        )
-        efficiency = net_move / travelled if travelled else 0.0
-        overlap = self._overlap_ratio(highs[-12:], lows[-12:])
-        swing_high, swing_high_confirmed = self._last_confirmed_pivot(recent, "high")
-        swing_low, swing_low_confirmed = self._last_confirmed_pivot(recent, "low")
-        indicators = self._mapping(
-            self._mapping(
-                self._mapping(snapshot.payload.get("technical_indicators")).get("bybit")
-            ).get("perp")
-        )
-        technical = self._mapping(indicators.get(timeframe))
-        values: dict[str, str | int | float | bool | None] = {
-            "completed_candles": len(candles),
-            "latest_completed_open_time_ms": int(
-                self._required_number(recent[-1].get("open_time_ms"))
-            ),
+    def _price_action(
+        self,
+        symbol: str,
+        timeframe: str,
+        candles: Sequence[Candle],
+    ) -> EvidenceItem:
+        values = tuple(candles[-240:])
+        closes = [float(candle.close) for candle in values]
+        opens = [float(candle.open) for candle in values]
+        highs = [float(candle.high) for candle in values]
+        lows = [float(candle.low) for candle in values]
+        turnovers = [float(candle.turnover) for candle in values]
+        atr14 = _atr(highs, lows, closes, 14)
+        ema12_series = _ema_series(closes, 12)
+        ema26_series = _ema_series(closes, 26)
+        macd_series = [fast - slow for fast, slow in zip(ema12_series, ema26_series, strict=True)]
+        signal_series = _ema_series(macd_series, 9)
+        lookback = min(12, len(values))
+        pivot_high, pivot_high_at, pivot_high_confirmed = _last_pivot(values, high=True)
+        pivot_low, pivot_low_at, pivot_low_confirmed = _last_pivot(values, high=False)
+        recent_turnover = sum(turnovers[-6:])
+        prior_turnover = sum(turnovers[-12:-6]) if len(turnovers) >= 12 else 0.0
+        evidence_values: dict[str, str | int | float | bool | None] = {
+            "completed_candles": len(values),
+            "latest_completed_close_time": values[-1].close_time.isoformat(),
             "latest_close": closes[-1],
-            "return_3_percent": self._return_percent(closes[-4], closes[-1]),
-            "return_12_percent": self._return_percent(closes[-13], closes[-1]),
-            "atr14": atr14,
-            "atr14_percent": atr14 / closes[-1] * 100,
-            "rolling_high_20": rolling_high,
-            "rolling_low_20": rolling_low,
-            "range_mid_20": (rolling_high + rolling_low) / 2,
-            "directional_efficiency_12": efficiency,
-            "overlap_ratio_12": overlap,
+            "return_3_percent": _return_percent(closes[-4], closes[-1]),
+            "return_12_percent": _return_percent(closes[-13], closes[-1]),
+            "atr_14": atr14,
+            "atr_14_percent": atr14 / closes[-1] * 100,
+            "ema_9": _ema_series(closes, 9)[-1],
+            "ema_20": _ema_series(closes, 20)[-1],
+            "ema_50": _ema_series(closes, 50)[-1],
+            "rsi_14": _rsi(closes, 14),
+            "macd_histogram_12_26_9": macd_series[-1] - signal_series[-1],
+            "rolling_high_20": max(highs[-20:]),
+            "rolling_low_20": min(lows[-20:]),
+            "range_mid_20": (max(highs[-20:]) + min(lows[-20:])) / 2,
+            "directional_efficiency_12": _directional_efficiency(closes[-lookback:]),
+            "overlap_ratio_12": _overlap_ratio(highs[-lookback:], lows[-lookback:]),
             "bull_body_ratio_12": sum(
-                close > open_ for close, open_ in zip(closes[-12:], opens[-12:], strict=True)
+                close > open_
+                for close, open_ in zip(
+                    closes[-lookback:], opens[-lookback:], strict=True
+                )
             )
-            / 12,
-            "confirmed_swing_high": swing_high,
-            "swing_high_confirmed_at_ms": swing_high_confirmed,
-            "confirmed_swing_low": swing_low,
-            "swing_low_confirmed_at_ms": swing_low_confirmed,
-            "ema_9": self._indicator_value(technical, "ema_9"),
-            "ema_20": self._indicator_value(technical, "ema_20"),
-            "ema_50": self._indicator_value(technical, "ema_50"),
-            "rsi_14": self._indicator_value(technical, "rsi_14"),
-            "macd_histogram": self._indicator_value(technical, "macd_histogram"),
+            / lookback,
+            "turnover_ratio_6_vs_6": (
+                recent_turnover / prior_turnover if prior_turnover > 0 else None
+            ),
+            "confirmed_pivot_high": pivot_high,
+            "pivot_high_open_time": pivot_high_at,
+            "pivot_high_confirmed_at": pivot_high_confirmed,
+            "confirmed_pivot_low": pivot_low,
+            "pivot_low_open_time": pivot_low_at,
+            "pivot_low_confirmed_at": pivot_low_confirmed,
         }
         return EvidenceItem(
-            evidence_id=f"{snapshot.symbol}.PA.{timeframe.upper()}",
+            evidence_id=f"{symbol}.PA.{timeframe.upper()}",
             category="price_action",
-            source="CMI_BYBIT_COMPLETED_CANDLES",
-            observed_at=snapshot.generated_at,
+            source="BYBIT_NATIVE_COMPLETED_CANDLES",
+            observed_at=values[-1].close_time,
             summary=(
-                f"{timeframe} completed-candle structure: close {closes[-1]:g}, "
-                f"20-bar range {rolling_low:g}-{rolling_high:g}; forming candle excluded"
+                f"{timeframe}: {len(values)} completed candles; latest close "
+                f"{closes[-1]:g}; ATR14 {atr14:g}; forming candle excluded"
             ),
-            values=values,
+            values=evidence_values,
         )
 
-    def _order_flow(self, snapshot: CmiSnapshot) -> tuple[list[EvidenceItem], ToolStatus, str]:
+    def _microstructure(self, snapshot: NativeMarketSnapshot) -> list[EvidenceItem]:
         items: list[EvidenceItem] = []
-        qualified_count = 0
-        order_flow = self._mapping(snapshot.payload.get("order_flow"))
-        bybit = self._mapping(self._mapping(order_flow.get("bybit")).get("perp"))
-        for window_name in ("1m", "5m", "15m"):
-            window = self._mapping(bybit.get(window_name))
-            qualified = self._flow_qualified(window)
-            values: dict[str, str | int | float | bool | None] = {
-                "qualified": qualified,
-                "quality_status": str(window.get("quality_status") or "UNKNOWN"),
-                "coverage_ratio": self._number(window.get("coverage_ratio")),
-                "sample_count": int(self._number(window.get("sample_count")) or 0),
-                "stream_gap_detected": window.get("stream_gap_detected") is True,
-                "truncated_by_api_limit": window.get("truncated_by_api_limit") is True,
-            }
-            if qualified:
-                buy = self._required_number(window.get("window_buy_notional"))
-                sell = self._required_number(window.get("window_sell_notional"))
-                total = buy + sell
-                values.update(
-                    {
-                        "window_delta": self._number(window.get("window_delta")),
-                        "normalized_delta": (buy - sell) / total if total else None,
-                        "buy_sell_ratio": self._number(window.get("buy_sell_ratio")),
-                        "large_trade_count": int(
-                            self._number(window.get("large_trade_count")) or 0
-                        ),
-                    }
-                )
-                qualified_count += 1
+        book = snapshot.orderbook
+        if book is not None:
+            bid5 = _notional(book.bids[:5])
+            ask5 = _notional(book.asks[:5])
+            bid20 = _notional(book.bids[:20])
+            ask20 = _notional(book.asks[:20])
+            midpoint = (book.bids[0].price + book.asks[0].price) / 2
             items.append(
                 EvidenceItem(
-                    evidence_id=f"{snapshot.symbol}.OF.{window_name.upper()}",
-                    category="order_flow",
-                    source="CMI_BYBIT_PUBLIC_TRADES",
-                    observed_at=snapshot.generated_at,
+                    evidence_id=f"{snapshot.symbol}.MICRO.BOOK",
+                    category="orderbook",
+                    source="BYBIT_PUBLIC_REST_ORDERBOOK",
+                    observed_at=book.observed_at,
                     summary=(
-                        f"{window_name} order flow is qualified"
-                        if qualified
-                        else (
-                            f"{window_name} order flow is excluded from directional use "
-                            "because coverage is incomplete"
-                        )
+                        "Point-in-time REST book; imbalance is advisory and does not claim "
+                        "WebSocket sequence continuity"
                     ),
-                    values=values,
+                    values={
+                        "spread_bps": float(
+                            (book.asks[0].price - book.bids[0].price) / midpoint * 10_000
+                        ),
+                        "imbalance_top5": _imbalance(bid5, ask5),
+                        "imbalance_top20": _imbalance(bid20, ask20),
+                        "bid_notional_top20": bid20,
+                        "ask_notional_top20": ask20,
+                        "update_id": book.update_id,
+                        "sequence": book.sequence,
+                    },
                 )
             )
+        if snapshot.recent_trades:
+            for minutes in (1, 5):
+                items.append(self._trade_window(snapshot, minutes))
+        return items
 
-        book = self._mapping(self._mapping(snapshot.payload.get("orderbook")).get("bybit:perp"))
-        book_qualified = all(
-            (
-                book.get("available") is True,
-                book.get("partial") is not True,
-                book.get("quality_status") == "QUALIFIED",
-                book.get("sequence_healthy") is True,
-                book.get("snapshot_healthy") is True,
-                book.get("stream_healthy") is True,
-            )
+    @staticmethod
+    def _trade_window(snapshot: NativeMarketSnapshot, minutes: int) -> EvidenceItem:
+        cutoff = snapshot.generated_at - timedelta(minutes=minutes)
+        trades = [trade for trade in snapshot.recent_trades if trade.timestamp >= cutoff]
+        oldest = snapshot.recent_trades[0].timestamp
+        newest = snapshot.recent_trades[-1].timestamp
+        qualified = oldest <= cutoff and newest >= snapshot.generated_at - timedelta(seconds=30)
+        buy = sum(float(trade.notional) for trade in trades if trade.side == "Buy")
+        sell = sum(float(trade.notional) for trade in trades if trade.side == "Sell")
+        total = buy + sell
+        return EvidenceItem(
+            evidence_id=f"{snapshot.symbol}.MICRO.TRADES.{minutes}M",
+            category="order_flow",
+            source="BYBIT_PUBLIC_RECENT_TRADES",
+            observed_at=newest,
+            summary=(
+                f"{minutes}m trade window is fully covered"
+                if qualified
+                else f"{minutes}m trade window coverage is incomplete; delta excluded"
+            ),
+            values={
+                "qualified": qualified,
+                "sample_count": len(trades),
+                "oldest_trade_time": oldest.isoformat(),
+                "newest_trade_time": newest.isoformat(),
+                "buy_notional": buy if qualified else None,
+                "sell_notional": sell if qualified else None,
+                "normalized_delta": (buy - sell) / total if qualified and total else None,
+                "buy_sell_ratio": buy / sell if qualified and sell > 0 else None,
+            },
         )
-        book_values: dict[str, str | int | float | bool | None] = {
-            "qualified": book_qualified,
-            "spread_bps": self._number(book.get("spread_bps")),
-            "resync_count": int(self._number(book.get("resync_count")) or 0),
-            "sequence_gap_count": int(self._number(book.get("sequence_gap_count")) or 0),
-        }
-        if book_qualified:
-            level_imbalance = self._mapping(book.get("level_imbalance"))
-            depth = self._mapping(book.get("depth"))
-            book_values.update(
-                {
-                    "imbalance_top5": self._number(level_imbalance.get("top5")),
-                    "imbalance_top20": self._number(level_imbalance.get("top20")),
-                    "depth_10bps_bid_notional": self._nested_number(depth, "10bps", "bid_notional"),
-                    "depth_10bps_ask_notional": self._nested_number(depth, "10bps", "ask_notional"),
-                }
-            )
-        items.append(
-            EvidenceItem(
-                evidence_id=f"{snapshot.symbol}.OF.BOOK",
-                category="orderbook",
-                source="CMI_BYBIT_L2",
-                observed_at=snapshot.generated_at,
-                summary=(
-                    "Bybit L2 book is sequence/snapshot/stream qualified"
-                    if book_qualified
-                    else (
-                        "Bybit L2 book is fail-closed because its reconstruction "
-                        "health is incomplete"
-                    )
-                ),
-                values=book_values,
-            )
-        )
-        if book_qualified:
-            qualified_count += 1
-        status = ToolStatus.AVAILABLE if qualified_count == 4 else ToolStatus.PARTIAL
-        reason = (
-            f"{qualified_count}/4 order-flow components qualified; aggregate data does not support "
-            "inventing order identity, sweep or absorption labels"
-        )
-        return items, status, reason
 
-    def _derivatives(self, snapshot: CmiSnapshot) -> list[EvidenceItem]:
-        ticker = self._mapping(
-            self._mapping(snapshot.payload.get("perpetual_tickers")).get("bybit")
-        )
-        values: dict[str, str | int | float | bool | None] = {
-            "funding_rate": self._number(ticker.get("funding_rate")),
-            "open_interest_value": self._number(ticker.get("open_interest_value")),
-        }
-        open_interest = self._mapping(
-            self._mapping(snapshot.payload.get("open_interest")).get("bybit")
-        )
-        for window_name in ("15m", "1h", "4h"):
-            window = self._mapping(open_interest.get(window_name))
-            qualified = (
-                window.get("available") is True
-                and window.get("coverage_complete") is True
-                and window.get("quality_status") == "QUALIFIED"
-            )
-            values[f"oi_{window_name}_qualified"] = qualified
-            if qualified:
-                values[f"oi_{window_name}_change_percent"] = self._number(
-                    window.get("percent_change")
-                )
-
-        liquidations = self._mapping(snapshot.payload.get("liquidations"))
-        liquidation_5m = self._mapping(liquidations.get("5m"))
-        liquidation_qualified = (
-            liquidation_5m.get("available") is True
-            and liquidation_5m.get("coverage_complete") is True
-            and liquidation_5m.get("partial") is not True
-        )
-        values["liquidations_5m_qualified"] = liquidation_qualified
-        if liquidation_qualified:
-            values["long_liquidation_notional_5m"] = self._number(
-                liquidation_5m.get("long_liquidation_notional")
-            )
-            values["short_liquidation_notional_5m"] = self._number(
-                liquidation_5m.get("short_liquidation_notional")
-            )
+    @staticmethod
+    def _derivatives(snapshot: NativeMarketSnapshot) -> list[EvidenceItem]:
+        ticker = snapshot.ticker
+        if (
+            ticker.funding_rate is None
+            and ticker.open_interest is None
+            and not snapshot.open_interest
+        ):
+            return []
+        points = snapshot.open_interest
         return [
             EvidenceItem(
                 evidence_id=f"{snapshot.symbol}.DERIVATIVES",
                 category="derivatives",
-                source="CMI_PUBLIC_DERIVATIVES",
-                observed_at=snapshot.generated_at,
-                summary=(
-                    "Funding and quality-qualified OI/liquidation windows; "
-                    "partial windows expose no directional value"
-                ),
-                values=values,
+                source="BYBIT_PUBLIC_DERIVATIVES",
+                observed_at=ticker.observed_at,
+                summary="Funding and open interest are context, never a standalone direction",
+                values={
+                    "funding_rate": (
+                        float(ticker.funding_rate) if ticker.funding_rate is not None else None
+                    ),
+                    "current_open_interest": (
+                        float(ticker.open_interest)
+                        if ticker.open_interest is not None
+                        else None
+                    ),
+                    "current_open_interest_value": (
+                        float(ticker.open_interest_value)
+                        if ticker.open_interest_value is not None
+                        else None
+                    ),
+                    "oi_history_points": len(points),
+                    "oi_change_15m_percent": _oi_change(points, 3),
+                    "oi_change_1h_percent": _oi_change(points, 12),
+                    "next_funding_time": (
+                        ticker.next_funding_time.isoformat()
+                        if ticker.next_funding_time is not None
+                        else None
+                    ),
+                },
             )
         ]
 
     @staticmethod
-    def _canonical_price(
-        symbol: str,
-        ticker: Mapping[str, Any],
-        price_type: PriceType,
-    ) -> CanonicalPrice:
-        field = "last_price" if price_type is PriceType.LAST else "mark_price"
-        time_field = "last_price_time_ms" if price_type is PriceType.LAST else "mark_price_time_ms"
-        timestamp_ms = EvidenceBuilder._required_number(ticker.get(time_field))
-        return CanonicalPrice(
-            symbol=symbol,
-            price_type=price_type,
-            value=Decimal(str(EvidenceBuilder._required_number(ticker.get(field)))),
-            timestamp=datetime.fromtimestamp(timestamp_ms / 1000, tz=UTC),
-        )
-
-    @staticmethod
-    def _flow_qualified(window: Mapping[str, Any]) -> bool:
-        return all(
-            (
-                window.get("available") is True,
-                window.get("coverage_complete") is True,
-                window.get("partial") is not True,
-                window.get("quality_status") == "QUALIFIED",
-                window.get("status") == "COMPLETE",
-                window.get("stream_gap_detected") is not True,
-                window.get("truncated_by_api_limit") is not True,
-                (EvidenceBuilder._number(window.get("sample_count")) or 0) > 0,
-            )
-        )
-
-    @staticmethod
-    def _last_confirmed_pivot(
-        candles: list[Mapping[str, Any]], side: str
-    ) -> tuple[float | None, int | None]:
-        field = "high" if side == "high" else "low"
-        values = [EvidenceBuilder._required_number(candle.get(field)) for candle in candles]
-        comparison = max if side == "high" else min
-        found: tuple[float | None, int | None] = (None, None)
-        for index in range(2, len(values) - 2):
-            window = values[index - 2 : index + 3]
-            if values[index] == comparison(window) and window.count(values[index]) == 1:
-                confirmed_at = int(
-                    EvidenceBuilder._required_number(candles[index + 2].get("open_time_ms"))
+    def _reference_markets(snapshot: NativeMarketSnapshot) -> list[EvidenceItem]:
+        bybit_last = snapshot.ticker.last_price
+        items: list[EvidenceItem] = []
+        for ticker in snapshot.reference_tickers:
+            items.append(
+                EvidenceItem(
+                    evidence_id=f"{snapshot.symbol}.REFERENCE.{ticker.exchange}",
+                    category="cross_exchange_reference",
+                    source=f"{ticker.exchange}_PUBLIC_PERPETUAL",
+                    observed_at=ticker.observed_at,
+                    summary=(
+                        f"{ticker.exchange} is an optional price-consistency reference; "
+                        "Bybit remains canonical"
+                    ),
+                    values={
+                        "instrument": ticker.instrument,
+                        "last_price": float(ticker.last_price),
+                        "bid_price": float(ticker.bid_price),
+                        "ask_price": float(ticker.ask_price),
+                        "spread_bps": float(ticker.spread_bps),
+                        "last_divergence_vs_bybit_bps": float(
+                            (ticker.last_price - bybit_last) / bybit_last * 10_000
+                        ),
+                    },
                 )
-                found = values[index], confirmed_at
-        return found
-
-    @staticmethod
-    def _overlap_ratio(highs: list[float], lows: list[float]) -> float:
-        overlaps: list[float] = []
-        for index in range(1, len(highs)):
-            union = max(highs[index], highs[index - 1]) - min(lows[index], lows[index - 1])
-            overlap = max(
-                0.0, min(highs[index], highs[index - 1]) - max(lows[index], lows[index - 1])
             )
-            overlaps.append(overlap / union if union else 0.0)
-        return sum(overlaps) / len(overlaps) if overlaps else 0.0
+        return items
 
-    @staticmethod
-    def _indicator_value(technical: Mapping[str, Any], name: str) -> float | None:
-        indicator = EvidenceBuilder._mapping(technical.get(name))
-        if indicator.get("available") is not True:
-            return None
-        return EvidenceBuilder._number(indicator.get("value"))
 
-    @staticmethod
-    def _nested_number(value: Mapping[str, Any], first: str, second: str) -> float | None:
-        return EvidenceBuilder._number(EvidenceBuilder._mapping(value.get(first)).get(second))
+def _ema_series(values: Sequence[float], period: int) -> list[float]:
+    if len(values) < period:
+        raise ValueError(f"EMA{period} needs at least {period} values")
+    alpha = 2 / (period + 1)
+    result = [values[0]]
+    for value in values[1:]:
+        result.append(alpha * value + (1 - alpha) * result[-1])
+    return result
 
-    @staticmethod
-    def _return_percent(start: float, end: float) -> float:
-        return (end / start - 1) * 100 if start else 0.0
 
-    @staticmethod
-    def _mapping(value: object) -> Mapping[str, Any]:
-        return cast(Mapping[str, Any], value) if isinstance(value, Mapping) else {}
+def _atr(
+    highs: Sequence[float],
+    lows: Sequence[float],
+    closes: Sequence[float],
+    period: int,
+) -> float:
+    if len(closes) <= period:
+        raise ValueError("ATR window is too short")
+    true_ranges = [highs[0] - lows[0]]
+    for index in range(1, len(closes)):
+        true_ranges.append(
+            max(
+                highs[index] - lows[index],
+                abs(highs[index] - closes[index - 1]),
+                abs(lows[index] - closes[index - 1]),
+            )
+        )
+    atr = statistics.fmean(true_ranges[1 : period + 1])
+    for value in true_ranges[period + 1 :]:
+        atr = (atr * (period - 1) + value) / period
+    return atr
 
-    @staticmethod
-    def _number(value: object) -> float | None:
-        if isinstance(value, bool) or not isinstance(value, int | float):
-            return None
-        return float(value)
 
-    @staticmethod
-    def _required_number(value: object) -> float:
-        result = EvidenceBuilder._number(value)
-        if result is None:
-            raise ValueError("required numeric market field is missing")
-        return result
+def _rsi(closes: Sequence[float], period: int) -> float:
+    changes = [current - previous for previous, current in pairwise(closes)]
+    if len(changes) < period:
+        raise ValueError("RSI window is too short")
+    gain = statistics.fmean(max(change, 0) for change in changes[:period])
+    loss = statistics.fmean(max(-change, 0) for change in changes[:period])
+    for change in changes[period:]:
+        gain = (gain * (period - 1) + max(change, 0)) / period
+        loss = (loss * (period - 1) + max(-change, 0)) / period
+    if loss == 0:
+        return 100.0
+    return 100 - 100 / (1 + gain / loss)
+
+
+def _return_percent(start: float, end: float) -> float:
+    return (end / start - 1) * 100
+
+
+def _directional_efficiency(closes: Sequence[float]) -> float:
+    path = sum(abs(current - previous) for previous, current in pairwise(closes))
+    return (closes[-1] - closes[0]) / path if path else 0.0
+
+
+def _overlap_ratio(highs: Sequence[float], lows: Sequence[float]) -> float:
+    overlaps: list[float] = []
+    for index in range(1, len(highs)):
+        prior_high, prior_low = highs[index - 1], lows[index - 1]
+        high, low = highs[index], lows[index]
+        union = max(prior_high, high) - min(prior_low, low)
+        overlap = max(0.0, min(prior_high, high) - max(prior_low, low))
+        overlaps.append(overlap / union if union else 0.0)
+    return statistics.fmean(overlaps) if overlaps else 0.0
+
+
+def _last_pivot(
+    candles: Sequence[Candle], *, high: bool
+) -> tuple[float | None, str | None, str | None]:
+    field = "high" if high else "low"
+    for index in range(len(candles) - 3, 1, -1):
+        value = getattr(candles[index], field)
+        neighbors = [getattr(candles[position], field) for position in range(index - 2, index + 3)]
+        if (high and value == max(neighbors)) or (not high and value == min(neighbors)):
+            return (
+                float(value),
+                candles[index].open_time.isoformat(),
+                candles[index + 2].close_time.isoformat(),
+            )
+    return None, None, None
+
+
+def _notional(levels: Sequence[BybitBookLevel]) -> float:
+    return sum(float(level.notional) for level in levels)
+
+
+def _imbalance(bid: float, ask: float) -> float | None:
+    total = bid + ask
+    return (bid - ask) / total if total else None
+
+
+def _oi_change(points: Sequence[BybitOpenInterest], periods: int) -> float | None:
+    if len(points) <= periods:
+        return None
+    current = float(points[-1].open_interest)
+    previous = float(points[-1 - periods].open_interest)
+    return (current / previous - 1) * 100 if previous > 0 else None

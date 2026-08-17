@@ -12,8 +12,6 @@ from bybit_signal.domain.enums import (
     MarketType,
     MonitoringMetric,
     PriceType,
-    ResearchDisposition,
-    ResearchScope,
     SignalStrength,
     ToolStatus,
     TrackingStatus,
@@ -230,39 +228,6 @@ class SignalConclusion(ContractModel):
         known = {evidence_id for tool in self.tool_assessments for evidence_id in tool.evidence_ids}
         if not set(self.assessment.evidence_ids) <= known:
             raise ValueError("assessment references unknown evidence")
-        return self
-
-
-class ExternalResearchSnapshot(ContractModel):
-    schema_version: Literal[1] = 1
-    tool: Literal["FREQTRADE", "VECTORBT", "OPENBB", "TRADING_AGENTS"]
-    tool_version: str = Field(min_length=2, max_length=120)
-    license_status: str = Field(min_length=2, max_length=120)
-    scope: ResearchScope
-    symbol: Symbol | None = None
-    as_of_candle_end: datetime
-    generated_at: datetime
-    expires_at: datetime
-    dataset_sha256: Annotated[str, StringConstraints(pattern=r"^[a-f0-9]{64}$")]
-    status: ToolStatus
-    disposition: Literal[ResearchDisposition.ADVISORY_ONLY] = ResearchDisposition.ADVISORY_ONLY
-    findings: dict[str, str | int | float | bool | None]
-    checks: dict[str, bool | int | float | str | None] = Field(default_factory=dict)
-
-    @model_validator(mode="after")
-    def validate_research(self) -> ExternalResearchSnapshot:
-        for field, value in (
-            ("as_of_candle_end", self.as_of_candle_end),
-            ("generated_at", self.generated_at),
-            ("expires_at", self.expires_at),
-        ):
-            _require_aware(value, field)
-        if self.expires_at <= self.generated_at:
-            raise ValueError("research snapshot expiry is invalid")
-        if self.scope is ResearchScope.INSTRUMENT and self.symbol is None:
-            raise ValueError("instrument research requires symbol")
-        if self.scope is ResearchScope.GLOBAL_MARKET_CONTEXT and self.symbol is not None:
-            raise ValueError("global research cannot claim an instrument symbol")
         return self
 
 

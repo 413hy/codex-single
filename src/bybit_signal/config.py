@@ -16,7 +16,7 @@ class RuntimeConfig(StrictModel):
     data_root: Path = Path("runtime/data")
     log_root: Path = Path("runtime/logs")
     database_path: Path = Path("runtime/state/signal.db")
-    max_parallel_cmi: int = Field(default=3, ge=1, le=10)
+    market_request_concurrency: int = Field(default=8, ge=1, le=20)
 
 
 class AnalysisConfig(StrictModel):
@@ -41,6 +41,12 @@ class BybitConfig(StrictModel):
         return self
 
 
+class PublicSourcesConfig(StrictModel):
+    cross_exchange_enabled: bool = True
+    binance_futures_base_url: str = "https://fapi.binance.com"
+    okx_base_url: str = "https://www.okx.com"
+
+
 class ScannerConfig(StrictModel):
     preselect_limit: int = Field(default=60, ge=5, le=200)
     candle_limit: int = Field(default=72, ge=49, le=300)
@@ -53,44 +59,13 @@ class ScannerConfig(StrictModel):
     minimum_max_return_percent: float = Field(default=0.35, ge=0, le=100)
 
 
-class CmiConfig(StrictModel):
-    enabled: bool = True
-    mode: Literal["source", "executable"] = "source"
-    source_root: Path | None = None
-    python_executable: Path | None = None
-    executable_path: Path | None = None
-    timeout_seconds: int = Field(default=75, ge=10, le=600)
-    live_seconds: int = Field(default=30, ge=5, le=45)
-    max_snapshot_age_seconds: int = Field(default=180, ge=30, le=900)
-    max_snapshot_bytes: int = Field(default=32 * 1024 * 1024, ge=1024, le=128 * 1024 * 1024)
-
-    @model_validator(mode="after")
-    def validate_mode(self) -> CmiConfig:
-        if (
-            self.enabled
-            and self.mode == "source"
-            and (self.source_root is None or self.python_executable is None)
-        ):
-            raise ValueError("CMI source mode requires source_root and python_executable")
-        if self.enabled and self.mode == "executable" and self.executable_path is None:
-            raise ValueError("CMI executable mode requires executable_path")
-        if self.enabled and self.timeout_seconds < self.live_seconds + 10:
-            raise ValueError("CMI timeout_seconds must be at least live_seconds + 10")
-        return self
-
-
 class MonitoringConfig(StrictModel):
+    enabled: bool = True
     event_coalesce_seconds: int = Field(default=60, ge=5, le=300)
     symbol_cooldown_seconds: int = Field(default=600, ge=60, le=3600)
     soft_model_wakes_per_hour: int = Field(default=10, ge=1, le=60)
-
-
-class ToolsConfig(StrictModel):
-    kronos_mode: Literal["auto", "disabled"] = "auto"
-    kronos_repository: Path | None = None
-    trading_agents_mode: Literal["snapshot_only", "disabled"] = "snapshot_only"
-    openbb_mode: Literal["snapshot_only", "disabled"] = "snapshot_only"
-    external_research_root: Path = Path("runtime/research")
+    directive_refresh_seconds: int = Field(default=30, ge=10, le=300)
+    reconnect_delay_seconds: int = Field(default=5, ge=1, le=60)
 
 
 class TelegramConfig(StrictModel):
@@ -114,6 +89,8 @@ class AppSettings(BaseSettings):
     model_config = SettingsConfigDict(
         env_prefix="BYBIT_SIGNAL_",
         env_nested_delimiter="__",
+        env_file=".env",
+        env_file_encoding="utf-8",
         extra="forbid",
         frozen=True,
     )
@@ -123,10 +100,9 @@ class AppSettings(BaseSettings):
     runtime: RuntimeConfig = RuntimeConfig()
     analysis: AnalysisConfig = AnalysisConfig()
     bybit: BybitConfig = BybitConfig()
+    public_sources: PublicSourcesConfig = PublicSourcesConfig()
     scanner: ScannerConfig = ScannerConfig()
-    cmi: CmiConfig = CmiConfig(enabled=False)
     monitoring: MonitoringConfig = MonitoringConfig()
-    tools: ToolsConfig = ToolsConfig()
     telegram: TelegramConfig = TelegramConfig()
 
     @classmethod

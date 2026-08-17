@@ -1,213 +1,173 @@
 from __future__ import annotations
 
-from datetime import UTC, datetime
-from pathlib import Path
-from typing import Any
+from datetime import UTC, datetime, timedelta
+from decimal import Decimal
 
-from bybit_signal.cmi.models import CmiSnapshot
 from bybit_signal.domain.enums import PriceType, ToolStatus
+from bybit_signal.domain.models import Candle
 from bybit_signal.evidence.builder import EvidenceBuilder
+from bybit_signal.providers.bybit import (
+    BybitBookLevel,
+    BybitOpenInterest,
+    BybitOrderBook,
+    BybitPublicTrade,
+    BybitTicker,
+)
+from bybit_signal.providers.cross_exchange import ReferenceTicker
+from bybit_signal.providers.deep_market import NativeMarketSnapshot
 
 
-def _candles(symbol: str, timeframe: str, interval_ms: int) -> dict[str, Any]:
-    base_time = 1_786_970_000_000
-    completed = []
-    for index in range(60):
-        center = 100 + index * 0.2 + (index % 5 - 2) * 0.1
-        completed.append(
-            {
-                "normalized_symbol": symbol,
-                "interval": timeframe,
-                "complete": True,
-                "gap_detected": False,
-                "is_stale": False,
-                "open_time_ms": base_time + index * interval_ms,
-                "open": center - 0.1,
-                "high": center + 0.4,
-                "low": center - 0.5,
-                "close": center + 0.1,
-            }
+def _candles(symbol: str, timeframe: str, duration: timedelta) -> tuple[Candle, ...]:
+    start = datetime(2026, 7, 1, tzinfo=UTC)
+    result = []
+    for index in range(240):
+        center = Decimal("100") + Decimal(index) / Decimal("10")
+        open_time = start + duration * index
+        result.append(
+            Candle(
+                symbol=symbol,
+                timeframe=timeframe,
+                open_time=open_time,
+                close_time=open_time + duration,
+                open=center,
+                high=center + Decimal("0.8"),
+                low=center - Decimal("0.7"),
+                close=center + (Decimal("0.3") if index % 2 else Decimal("-0.2")),
+                volume=Decimal("1000"),
+                turnover=Decimal("100000") + Decimal(index * 100),
+                completed=True,
+                source="BYBIT",
+            )
         )
-    return {
-        "available": True,
-        "quality_status": "QUALIFIED",
-        "completed": completed,
-        "forming": [
-            {
-                "normalized_symbol": symbol,
-                "interval": timeframe,
-                "complete": False,
-                "open_time_ms": base_time + 60 * interval_ms,
-                "open": 100,
-                "high": 999_999,
-                "low": 0.0001,
-                "close": 999_999,
-            }
-        ],
-    }
+    return tuple(result)
 
 
-def _snapshot(tmp_path: Path) -> CmiSnapshot:
+def _snapshot(*, partial_trades: bool = False) -> NativeMarketSnapshot:
     symbol = "CYSUSDT"
-    now = datetime.now(UTC)
-    now_ms = int(now.timestamp() * 1000)
-    payload: dict[str, Any] = {
-        "perpetual_tickers": {
-            "bybit": {
-                "normalized_symbol": symbol,
-                "last_price": 111.9,
-                "mark_price": 112.1,
-                "index_price": 112.0,
-                "last_price_time_ms": now_ms,
-                "mark_price_time_ms": now_ms - 100,
-                "bid_price": 111.8,
-                "ask_price": 112.0,
-                "funding_rate": 0.0001,
-                "turnover_24h": 1_000_000,
-                "open_interest_value": 2_000_000,
-            }
-        },
-        "candles": {
-            "bybit": {
-                "5m": _candles(symbol, "5m", 300_000),
-                "15m": _candles(symbol, "15m", 900_000),
-                "1h": _candles(symbol, "1h", 3_600_000),
-                "4h": _candles(symbol, "4h", 14_400_000),
-            }
-        },
-        "technical_indicators": {"bybit": {"perp": {}}},
-        "order_flow": {
-            "bybit": {
-                "perp": {
-                    "1m": {
-                        "available": True,
-                        "coverage_complete": True,
-                        "partial": False,
-                        "quality_status": "QUALIFIED",
-                        "status": "COMPLETE",
-                        "stream_gap_detected": False,
-                        "truncated_by_api_limit": False,
-                        "coverage_ratio": 1.0,
-                        "sample_count": 20,
-                        "window_buy_notional": 700,
-                        "window_sell_notional": 300,
-                        "window_delta": 400,
-                        "buy_sell_ratio": 2.333,
-                        "large_trade_count": 1,
-                    },
-                    "5m": {
-                        "available": True,
-                        "coverage_complete": False,
-                        "partial": True,
-                        "quality_status": "PARTIAL",
-                        "status": "WARMING_UP",
-                        "stream_gap_detected": False,
-                        "truncated_by_api_limit": True,
-                        "coverage_ratio": 0.4,
-                        "sample_count": 30,
-                        "window_delta": 9_999_999,
-                    },
-                }
-            }
-        },
-        "orderbook": {
-            "bybit:perp": {
-                "available": True,
-                "partial": False,
-                "quality_status": "QUALIFIED",
-                "sequence_healthy": True,
-                "snapshot_healthy": True,
-                "stream_healthy": True,
-                "spread_bps": 2.5,
-                "resync_count": 0,
-                "sequence_gap_count": 0,
-                "level_imbalance": {"top5": 0.2, "top20": 0.1},
-                "depth": {
-                    "10bps": {"bid_notional": 5_000, "ask_notional": 4_000}
-                },
-            }
-        },
-        "open_interest": {
-            "bybit": {
-                "15m": {
-                    "available": True,
-                    "coverage_complete": True,
-                    "quality_status": "QUALIFIED",
-                    "percent_change": 0.02,
-                }
-            }
-        },
-        "liquidations": {
-            "5m": {
-                "available": True,
-                "coverage_complete": False,
-                "partial": True,
-                "long_liquidation_notional": 9_999_999,
-            }
-        },
-    }
-    return CmiSnapshot(
+    now = datetime(2026, 8, 17, 8, tzinfo=UTC)
+    ticker = BybitTicker(
         symbol=symbol,
-        schema_version="2.0",
+        last_price=Decimal("123.90"),
+        mark_price=Decimal("123.85"),
+        index_price=Decimal("123.80"),
+        bid_price=Decimal("123.89"),
+        ask_price=Decimal("123.91"),
+        high_24h=Decimal("130"),
+        low_24h=Decimal("110"),
+        turnover_24h=Decimal("5000000"),
+        volume_24h=Decimal("40000"),
+        price_change_24h=Decimal("0.05"),
+        funding_rate=Decimal("0.0001"),
+        open_interest=Decimal("2000000"),
+        open_interest_value=Decimal("240000000"),
+        next_funding_time=now + timedelta(hours=4),
+        observed_at=now,
+    )
+    book = BybitOrderBook(
+        symbol=symbol,
+        observed_at=now,
+        update_id=10,
+        sequence=11,
+        bids=tuple(
+            BybitBookLevel(price=Decimal("123.89") - i / Decimal("100"), size=100 + i)
+            for i in range(20)
+        ),
+        asks=tuple(
+            BybitBookLevel(price=Decimal("123.91") + i / Decimal("100"), size=90 + i)
+            for i in range(20)
+        ),
+    )
+    count = 10 if partial_trades else 80
+    spacing = 2 if partial_trades else 5
+    trades = tuple(
+        BybitPublicTrade(
+            symbol=symbol,
+            trade_id=f"trade-{index}",
+            timestamp=now - timedelta(seconds=(count - 1 - index) * spacing),
+            side="Buy" if index % 3 else "Sell",
+            price=Decimal("123.90"),
+            size=Decimal("2"),
+        )
+        for index in range(count)
+    )
+    oi = tuple(
+        BybitOpenInterest(
+            symbol=symbol,
+            timestamp=now - timedelta(minutes=(47 - index) * 5),
+            open_interest=Decimal("1900000") + Decimal(index * 2000),
+        )
+        for index in range(48)
+    )
+    return NativeMarketSnapshot(
+        symbol=symbol,
+        collection_started_at=now - timedelta(seconds=2),
         generated_at=now,
-        captured_at=now,
-        json_path=tmp_path / "snapshot.json",
-        text_path=tmp_path / "snapshot.txt",
-        health_path=tmp_path / "health.json",
-        sha256="a" * 64,
-        status=ToolStatus.PARTIAL,
-        snapshot_status="USABLE_WITH_PARTIAL_WINDOWS",
-        completeness_status="INCOMPLETE",
-        health_status="DEGRADED",
-        application_version="2.2.1",
-        available_perpetual_exchanges=("bybit",),
-        limitation_count=1,
-        limitation_summaries=("test limitation",),
-        payload=payload,
+        ticker=ticker,
+        candles={
+            "5m": _candles(symbol, "5m", timedelta(minutes=5)),
+            "15m": _candles(symbol, "15m", timedelta(minutes=15)),
+            "1h": _candles(symbol, "1h", timedelta(hours=1)),
+            "4h": _candles(symbol, "4h", timedelta(hours=4)),
+        },
+        orderbook=book,
+        recent_trades=trades,
+        open_interest=oi,
+        reference_tickers=(
+            ReferenceTicker(
+                symbol=symbol,
+                exchange="BINANCE",
+                instrument=symbol,
+                last_price=Decimal("123.88"),
+                bid_price=Decimal("123.87"),
+                ask_price=Decimal("123.89"),
+                observed_at=now,
+            ),
+        ),
     )
 
 
-def test_builder_preserves_canonical_prices_and_excludes_forming_candles(
-    tmp_path: Path,
-) -> None:
-    bundle = EvidenceBuilder().build(_snapshot(tmp_path))
+def test_builder_preserves_prices_and_derives_completed_candle_features() -> None:
+    bundle = EvidenceBuilder().build(_snapshot())
 
     assert bundle.canonical_last.price_type is PriceType.LAST
     assert bundle.canonical_last.value != bundle.canonical_mark.value
     price_action = next(
         item for item in bundle.evidence_items if item.evidence_id == "CYSUSDT.PA.5M"
     )
-    assert price_action.values["completed_candles"] == 60
+    assert price_action.values["completed_candles"] == 240
     assert float(price_action.values["rolling_high_20"]) < 1_000
-    assert float(price_action.values["rolling_low_20"]) > 1
-
-
-def test_builder_fail_closes_partial_order_flow_and_liquidations(tmp_path: Path) -> None:
-    bundle = EvidenceBuilder().build(_snapshot(tmp_path))
-
-    qualified = next(
-        item for item in bundle.evidence_items if item.evidence_id == "CYSUSDT.OF.1M"
+    assert price_action.values["ema_50"] is not None
+    core = next(
+        tool for tool in bundle.tool_assessments if tool.tool == "BYBIT_NATIVE_MARKET_DATA"
     )
-    partial = next(
-        item for item in bundle.evidence_items if item.evidence_id == "CYSUSDT.OF.5M"
+    assert core.status is ToolStatus.AVAILABLE
+    reference = next(
+        item
+        for item in bundle.evidence_items
+        if item.evidence_id == "CYSUSDT.REFERENCE.BINANCE"
     )
-    derivatives = next(
-        item for item in bundle.evidence_items if item.evidence_id == "CYSUSDT.DERIVATIVES"
-    )
-    assert qualified.values["normalized_delta"] == 0.4
-    assert partial.values["qualified"] is False
-    assert "window_delta" not in partial.values
-    assert derivatives.values["liquidations_5m_qualified"] is False
-    assert "long_liquidation_notional_5m" not in derivatives.values
+    assert reference.values["last_divergence_vs_bybit_bps"] is not None
 
 
-def test_confirmed_pivots_never_use_a_future_or_forming_bar(tmp_path: Path) -> None:
-    bundle = EvidenceBuilder().build(_snapshot(tmp_path))
+def test_builder_fail_closes_incomplete_public_trade_window() -> None:
+    bundle = EvidenceBuilder().build(_snapshot(partial_trades=True))
+
+    trade_window = next(
+        item
+        for item in bundle.evidence_items
+        if item.evidence_id == "CYSUSDT.MICRO.TRADES.5M"
+    )
+    assert trade_window.values["qualified"] is False
+    assert trade_window.values["normalized_delta"] is None
+
+
+def test_confirmed_pivots_use_only_right_side_completed_bars() -> None:
+    bundle = EvidenceBuilder().build(_snapshot())
     price_action = next(
         item for item in bundle.evidence_items if item.evidence_id == "CYSUSDT.PA.5M"
     )
 
-    latest_time = int(price_action.values["latest_completed_open_time_ms"])
-    for key in ("swing_high_confirmed_at_ms", "swing_low_confirmed_at_ms"):
-        confirmed_at = price_action.values[key]
-        assert confirmed_at is None or int(confirmed_at) <= latest_time
+    latest = datetime.fromisoformat(str(price_action.values["latest_completed_close_time"]))
+    for key in ("pivot_high_confirmed_at", "pivot_low_confirmed_at"):
+        confirmed = price_action.values[key]
+        assert confirmed is None or datetime.fromisoformat(str(confirmed)) <= latest

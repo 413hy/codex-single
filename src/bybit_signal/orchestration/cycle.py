@@ -8,7 +8,6 @@ from decimal import Decimal
 from uuid import uuid4
 
 from bybit_signal.analysis.codex import CodexAnalysisError, CodexAnalyzer
-from bybit_signal.cmi.adapter import CmiAdapter, CmiCaptureError
 from bybit_signal.config import AppSettings
 from bybit_signal.domain.enums import (
     Direction,
@@ -26,6 +25,7 @@ from bybit_signal.domain.models import (
     ToolAssessment,
 )
 from bybit_signal.evidence.builder import EvidenceBuilder
+from bybit_signal.providers.deep_market import BybitDeepMarketCollector
 from bybit_signal.selection.scanner import BybitUniverseScanner
 from bybit_signal.storage.sqlite import SignalStore
 
@@ -36,14 +36,14 @@ class SignalCycleService:
         settings: AppSettings,
         *,
         scanner: BybitUniverseScanner,
-        cmi: CmiAdapter,
+        market_collector: BybitDeepMarketCollector,
         evidence_builder: EvidenceBuilder,
         analyzer: CodexAnalyzer,
         store: SignalStore,
     ) -> None:
         self._settings = settings
         self._scanner = scanner
-        self._cmi = cmi
+        self._market_collector = market_collector
         self._evidence_builder = evidence_builder
         self._analyzer = analyzer
         self._store = store
@@ -52,6 +52,91 @@ class SignalCycleService:
     async def run_cycle(self) -> AnalysisCycleResult:
         async with self._cycle_lock:
             return await self._run_cycle_locked()
+
+    async def run_emergency(
+        self,
+        symbol: str,
+        reasons: tuple[str, ...],
+    ) -> AnalysisCycleResult:
+        async with self._cycle_lock:
+            started_at = datetime.now(UTC)
+            analysis_id = f"urgent_{started_at:%Y%m%dT%H%M%SZ}_{uuid4().hex[:8]}"
+            await self._store.initialize()
+            prior = await self._store.latest_conclusion(symbol)
+            bundles, failures = await self._capture_evidence((symbol,))
+            bundle = bundles[0] if bundles else None
+            assessment: CandidateAssessment | None = None
+            context_sha256 = self._fallback_context_hash(analysis_id, (symbol,), failures)
+            model_diagnostics: dict[str, object] = {}
+            if bundle is not None:
+                try:
+                    model_result = await self._analyzer.analyze(
+                        analysis_id=analysis_id,
+                        bundles=(bundle,),
+                        tracked_symbols=(symbol,),
+                    )
+                    assessment = model_result.response.assessments[0]
+                    context_sha256 = model_result.context_sha256
+                    model_diagnostics = {
+                        "attempts": model_result.attempts,
+                        "latency_ms": model_result.latency_ms,
+                        "usage": model_result.usage,
+                    }
+                except CodexAnalysisError as error:
+                    failures["CODEX"] = f"{error.code}: {error}"
+            if assessment is None:
+                assessment = self._indeterminate_assessment(
+                    symbol, failures.get(symbol) or failures.get("CODEX")
+                )
+            canonical = self._fallback_price(
+                symbol=symbol,
+                bundle=bundle,
+                candidate_price=None,
+                previous=prior,
+                now=started_at,
+            )
+            tracking_status, comparison = self._compare(prior, assessment, canonical)
+            tools = (
+                bundle.tool_assessments
+                if bundle is not None
+                else (
+                    ToolAssessment(
+                        tool="BYBIT_NATIVE_MARKET_DATA",
+                        status=ToolStatus.ERROR,
+                        reason=self._tool_reason(
+                            failures.get(symbol, "market evidence unavailable")
+                        ),
+                    ),
+                )
+            )
+            conclusion = SignalConclusion(
+                analysis_id=analysis_id,
+                generated_at=datetime.now(UTC),
+                canonical_price=canonical,
+                assessment=assessment,
+                tracking_status=tracking_status,
+                comparison_with_previous=comparison,
+                tool_assessments=tools,
+            )
+            completed_at = datetime.now(UTC)
+            result = AnalysisCycleResult(
+                analysis_id=analysis_id,
+                started_at=started_at,
+                completed_at=completed_at,
+                candidate_symbols=(symbol,),
+                tracked_symbols=(symbol,) if prior is not None else (),
+                conclusions=(conclusion,),
+                strong_signal_count=int(assessment.strength is SignalStrength.STRONG),
+                context_sha256=context_sha256,
+                diagnostics={
+                    "mode": "emergency_threshold_review",
+                    "trigger_reasons": reasons,
+                    "failures": failures,
+                    "model": model_diagnostics,
+                },
+            )
+            await self._store.save_cycle(result, bundles)
+            return result
 
     async def _run_cycle_locked(self) -> AnalysisCycleResult:
         started_at = datetime.now(UTC)
@@ -114,9 +199,11 @@ class SignalCycleService:
                 if bundle is not None
                 else (
                     ToolAssessment(
-                        tool="CMI",
+                        tool="BYBIT_NATIVE_MARKET_DATA",
                         status=ToolStatus.ERROR,
-                        reason=failures.get(symbol, "market evidence unavailable"),
+                        reason=self._tool_reason(
+                            failures.get(symbol, "market evidence unavailable")
+                        ),
                     ),
                 )
             )
@@ -158,19 +245,17 @@ class SignalCycleService:
         self,
         symbols: tuple[str, ...],
     ) -> tuple[tuple[EvidenceBundle, ...], dict[str, str]]:
-        failures: dict[str, str] = {}
-
-        async def capture(symbol: str) -> EvidenceBundle | None:
+        snapshots, failures = await self._market_collector.collect_many(symbols)
+        bundles: list[EvidenceBundle] = []
+        for symbol in symbols:
+            snapshot = snapshots.get(symbol)
+            if snapshot is None:
+                continue
             try:
-                snapshot = await self._cmi.capture(symbol)
-                return self._evidence_builder.build(snapshot)
-            except (CmiCaptureError, ValueError) as error:
-                code = error.code if isinstance(error, CmiCaptureError) else type(error).__name__
-                failures[symbol] = f"{code}: {error}"
-                return None
-
-        values = await asyncio.gather(*(capture(symbol) for symbol in symbols))
-        return tuple(value for value in values if value is not None), failures
+                bundles.append(self._evidence_builder.build(snapshot))
+            except Exception as error:
+                failures[symbol] = f"{type(error).__name__}: {error}"
+        return tuple(bundles), failures
 
     @staticmethod
     def _indeterminate_assessment(
@@ -278,3 +363,8 @@ class SignalCycleService:
             sort_keys=True,
         )
         return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def _tool_reason(value: str) -> str:
+        compact = value.replace("\r", " ").replace("\n", " ").strip()
+        return compact if len(compact) <= 500 else compact[:497] + "..."

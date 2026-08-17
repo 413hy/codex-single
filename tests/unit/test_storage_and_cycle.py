@@ -194,13 +194,19 @@ class FakeScanner:
         )
 
 
-class FakeCmi:
+class FakeMarketCollector:
     def __init__(self) -> None:
         self.symbols: list[str] = []
 
-    async def capture(self, symbol: str) -> Any:
-        self.symbols.append(symbol)
-        return type("Snapshot", (), {"symbol": symbol})()
+    async def collect_many(self, symbols: Any) -> tuple[dict[str, Any], dict[str, str]]:
+        self.symbols.extend(symbols)
+        return (
+            {
+                symbol: type("Snapshot", (), {"symbol": symbol})()
+                for symbol in symbols
+            },
+            {},
+        )
 
 
 class FakeEvidenceBuilder:
@@ -248,11 +254,11 @@ async def test_cycle_always_reanalyzes_and_marks_previous_strong_signal_weakened
     await store.initialize()
     prior = _strong_conclusion("analysis_00")
     await store.save_cycle(_cycle(prior), (_bundle("CYSUSDT"),))
-    cmi = FakeCmi()
+    market_collector = FakeMarketCollector()
     service = SignalCycleService(
-        AppSettings(cmi={"enabled": False}),
+        AppSettings(),
         scanner=FakeScanner(),  # type: ignore[arg-type]
-        cmi=cmi,  # type: ignore[arg-type]
+        market_collector=market_collector,  # type: ignore[arg-type]
         evidence_builder=FakeEvidenceBuilder(),  # type: ignore[arg-type]
         analyzer=FakeAnalyzer(),  # type: ignore[arg-type]
         store=store,
@@ -262,7 +268,7 @@ async def test_cycle_always_reanalyzes_and_marks_previous_strong_signal_weakened
 
     assert result.candidate_symbols == ("GPSUSDT",)
     assert result.tracked_symbols == ("CYSUSDT",)
-    assert cmi.symbols == ["GPSUSDT", "CYSUSDT"]
+    assert market_collector.symbols == ["GPSUSDT", "CYSUSDT"]
     cys = next(
         conclusion
         for conclusion in result.conclusions

@@ -33,6 +33,7 @@ class BybitTicker(BaseModel):
     symbol: Symbol
     last_price: Decimal = Field(gt=0)
     mark_price: Decimal | None = Field(default=None, gt=0)
+    index_price: Decimal | None = Field(default=None, gt=0)
     bid_price: Decimal = Field(gt=0)
     ask_price: Decimal = Field(gt=0)
     high_24h: Decimal = Field(gt=0)
@@ -40,6 +41,10 @@ class BybitTicker(BaseModel):
     turnover_24h: Decimal = Field(ge=0)
     volume_24h: Decimal = Field(ge=0)
     price_change_24h: Decimal
+    funding_rate: Decimal | None = None
+    open_interest: Decimal | None = Field(default=None, ge=0)
+    open_interest_value: Decimal | None = Field(default=None, ge=0)
+    next_funding_time: datetime | None = None
     observed_at: datetime
 
     @property
@@ -149,20 +154,151 @@ class BybitPublicClient:
                 tickers[ticker.symbol] = ticker
         return tickers
 
-    async def completed_5m_candles(self, symbol: str, *, limit: int = 72) -> tuple[Candle, ...]:
+    async def completed_candles(
+        self,
+        symbol: str,
+        *,
+        timeframe: Literal["1m", "5m", "15m", "1h", "4h"],
+        limit: int = 240,
+    ) -> tuple[Candle, ...]:
+        interval, duration = {
+            "1m": ("1", timedelta(minutes=1)),
+            "5m": ("5", timedelta(minutes=5)),
+            "15m": ("15", timedelta(minutes=15)),
+            "1h": ("60", timedelta(hours=1)),
+            "4h": ("240", timedelta(hours=4)),
+        }[timeframe]
         result, observed_at = await self._get_result(
             "/v5/market/kline",
-            {"category": "linear", "symbol": symbol, "interval": "5", "limit": limit},
+            {
+                "category": "linear",
+                "symbol": symbol,
+                "interval": interval,
+                "limit": limit,
+            },
         )
         if result.get("symbol") != symbol:
             raise BybitPublicError("Bybit kline symbol does not match request")
         rows = result.get("list")
         if not isinstance(rows, list):
             raise BybitPublicError("Bybit kline list is invalid")
-        candles = [_candle(symbol, row, observed_at) for row in rows]
+        candles = [
+            _candle(symbol, timeframe, duration, row, observed_at) for row in rows
+        ]
         completed = [candle for candle in candles if candle.completed]
         completed.sort(key=lambda candle: candle.open_time)
         return tuple(completed)
+
+    async def completed_5m_candles(
+        self, symbol: str, *, limit: int = 72
+    ) -> tuple[Candle, ...]:
+        return await self.completed_candles(
+            symbol,
+            timeframe="5m",
+            limit=limit,
+        )
+
+    async def orderbook(self, symbol: str, *, limit: int = 50) -> BybitOrderBook:
+        result, observed_at = await self._get_result(
+            "/v5/market/orderbook",
+            {"category": "linear", "symbol": symbol, "limit": limit},
+        )
+        if result.get("s") != symbol:
+            raise BybitPublicError("Bybit orderbook symbol does not match request")
+        bids = _book_levels(result.get("b"), "bids")
+        asks = _book_levels(result.get("a"), "asks")
+        if not bids or not asks or bids[0].price >= asks[0].price:
+            raise BybitPublicError("Bybit orderbook is empty or crossed")
+        return BybitOrderBook(
+            symbol=symbol,
+            observed_at=observed_at,
+            update_id=_non_negative_int(result.get("u"), "orderbook update id"),
+            sequence=_non_negative_int(result.get("seq"), "orderbook sequence"),
+            bids=tuple(bids),
+            asks=tuple(asks),
+        )
+
+    async def recent_trades(
+        self, symbol: str, *, limit: int = 1000
+    ) -> tuple[BybitPublicTrade, ...]:
+        result, _ = await self._get_result(
+            "/v5/market/recent-trade",
+            {"category": "linear", "symbol": symbol, "limit": limit},
+        )
+        rows = result.get("list")
+        if not isinstance(rows, list):
+            raise BybitPublicError("Bybit public trade list is invalid")
+        trades = [_public_trade(symbol, row) for row in rows]
+        trades.sort(key=lambda trade: trade.timestamp)
+        return tuple(trades)
+
+    async def open_interest_history(
+        self,
+        symbol: str,
+        *,
+        interval: Literal["5min", "15min", "30min", "1h", "4h"] = "5min",
+        limit: int = 48,
+    ) -> tuple[BybitOpenInterest, ...]:
+        result, _ = await self._get_result(
+            "/v5/market/open-interest",
+            {
+                "category": "linear",
+                "symbol": symbol,
+                "intervalTime": interval,
+                "limit": limit,
+            },
+        )
+        rows = result.get("list")
+        if not isinstance(rows, list):
+            raise BybitPublicError("Bybit open-interest list is invalid")
+        points = [_open_interest(symbol, row) for row in rows]
+        points.sort(key=lambda point: point.timestamp)
+        return tuple(points)
+
+
+class BybitBookLevel(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    price: Decimal = Field(gt=0)
+    size: Decimal = Field(gt=0)
+
+    @property
+    def notional(self) -> Decimal:
+        return self.price * self.size
+
+
+class BybitOrderBook(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    symbol: Symbol
+    observed_at: datetime
+    update_id: int = Field(ge=0)
+    sequence: int = Field(ge=0)
+    bids: tuple[BybitBookLevel, ...] = Field(min_length=1)
+    asks: tuple[BybitBookLevel, ...] = Field(min_length=1)
+
+
+class BybitPublicTrade(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    symbol: Symbol
+    trade_id: str = Field(min_length=1, max_length=160)
+    timestamp: datetime
+    side: Literal["Buy", "Sell"]
+    price: Decimal = Field(gt=0)
+    size: Decimal = Field(gt=0)
+
+    @property
+    def notional(self) -> Decimal:
+        return self.price * self.size
+
+
+class BybitOpenInterest(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    symbol: Symbol
+    timestamp: datetime
+    open_interest: Decimal = Field(ge=0)
 
 
 def _instrument(value: object) -> BybitInstrument | None:
@@ -202,10 +338,35 @@ def _ticker(value: object, observed_at: datetime) -> BybitTicker | None:
     try:
         mark_raw = value.get("markPrice")
         mark = _decimal(mark_raw, "mark price") if mark_raw not in {None, ""} else None
+        index_raw = value.get("indexPrice")
+        index = _decimal(index_raw, "index price") if index_raw not in {None, ""} else None
+        funding_raw = value.get("fundingRate")
+        funding = (
+            _decimal(funding_raw, "funding rate") if funding_raw not in {None, ""} else None
+        )
+        open_interest_raw = value.get("openInterest")
+        open_interest = (
+            _decimal(open_interest_raw, "open interest")
+            if open_interest_raw not in {None, ""}
+            else None
+        )
+        open_interest_value_raw = value.get("openInterestValue")
+        open_interest_value = (
+            _decimal(open_interest_value_raw, "open interest value")
+            if open_interest_value_raw not in {None, ""}
+            else None
+        )
+        next_funding_raw = value.get("nextFundingTime")
+        next_funding_time = (
+            _timestamp(next_funding_raw, "next funding time")
+            if next_funding_raw not in {None, "", "0", 0}
+            else None
+        )
         return BybitTicker(
             symbol=symbol,
             last_price=_decimal(value.get("lastPrice"), "last price"),
             mark_price=mark,
+            index_price=index,
             bid_price=_decimal(value.get("bid1Price"), "best bid"),
             ask_price=_decimal(value.get("ask1Price"), "best ask"),
             high_24h=_decimal(value.get("highPrice24h"), "24h high"),
@@ -213,20 +374,30 @@ def _ticker(value: object, observed_at: datetime) -> BybitTicker | None:
             turnover_24h=_decimal(value.get("turnover24h"), "24h turnover"),
             volume_24h=_decimal(value.get("volume24h"), "24h volume"),
             price_change_24h=_decimal(value.get("price24hPcnt"), "24h price change"),
+            funding_rate=funding,
+            open_interest=open_interest,
+            open_interest_value=open_interest_value,
+            next_funding_time=next_funding_time,
             observed_at=observed_at,
         )
     except (ValueError, TypeError):
         return None
 
 
-def _candle(symbol: str, value: object, observed_at: datetime) -> Candle:
+def _candle(
+    symbol: str,
+    timeframe: Literal["1m", "5m", "15m", "1h", "4h"],
+    duration: timedelta,
+    value: object,
+    observed_at: datetime,
+) -> Candle:
     if not isinstance(value, list) or len(value) < 7:
         raise BybitPublicError("Bybit kline row is invalid")
     open_time = _timestamp(value[0], "kline start")
-    close_time = open_time + timedelta(minutes=5)
+    close_time = open_time + duration
     return Candle(
         symbol=symbol,
-        timeframe="5m",
+        timeframe=timeframe,
         open_time=open_time,
         close_time=close_time,
         open=_decimal(value[1], "kline open"),
@@ -240,6 +411,49 @@ def _candle(symbol: str, value: object, observed_at: datetime) -> Candle:
     )
 
 
+def _book_levels(value: object, field: str) -> list[BybitBookLevel]:
+    if not isinstance(value, list):
+        raise BybitPublicError(f"Bybit orderbook {field} are invalid")
+    levels: list[BybitBookLevel] = []
+    for row in value:
+        if not isinstance(row, list) or len(row) < 2:
+            raise BybitPublicError(f"Bybit orderbook {field} row is invalid")
+        levels.append(
+            BybitBookLevel(
+                price=_decimal(row[0], f"{field} price"),
+                size=_decimal(row[1], f"{field} size"),
+            )
+        )
+    return levels
+
+
+def _public_trade(symbol: str, value: object) -> BybitPublicTrade:
+    if not isinstance(value, dict):
+        raise BybitPublicError("Bybit public trade row is invalid")
+    side = value.get("side")
+    trade_id = value.get("execId")
+    if side not in {"Buy", "Sell"} or not isinstance(trade_id, str):
+        raise BybitPublicError("Bybit public trade identity is invalid")
+    return BybitPublicTrade(
+        symbol=symbol,
+        trade_id=trade_id,
+        timestamp=_timestamp(value.get("time"), "public trade time"),
+        side=side,
+        price=_decimal(value.get("price"), "public trade price"),
+        size=_decimal(value.get("size"), "public trade size"),
+    )
+
+
+def _open_interest(symbol: str, value: object) -> BybitOpenInterest:
+    if not isinstance(value, dict):
+        raise BybitPublicError("Bybit open-interest row is invalid")
+    return BybitOpenInterest(
+        symbol=symbol,
+        timestamp=_timestamp(value.get("timestamp"), "open-interest time"),
+        open_interest=_decimal(value.get("openInterest"), "open interest"),
+    )
+
+
 def _decimal(value: object, field: str) -> Decimal:
     if not isinstance(value, (str, int, float)):
         raise ValueError(f"{field} is not numeric")
@@ -249,6 +463,16 @@ def _decimal(value: object, field: str) -> Decimal:
         raise ValueError(f"{field} is invalid") from error
     if not result.is_finite():
         raise ValueError(f"{field} is not finite")
+    return result
+
+
+def _non_negative_int(value: object, field: str) -> int:
+    try:
+        result = int(str(value))
+    except (TypeError, ValueError) as error:
+        raise ValueError(f"{field} is invalid") from error
+    if result < 0:
+        raise ValueError(f"{field} cannot be negative")
     return result
 
 
