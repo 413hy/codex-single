@@ -100,6 +100,30 @@ CMI 是深度采集主入口。采用其多交易所公开行情、原子快照�
 | Streamable HTTP 参考分支默认公开且构建吞错 | 高 | `origin: "*"`、监听 `0.0.0.0`、`tsc || exit 0` 和编译错误记录 | 默认 stdio/localhost；远程必须认证；任何构建失败均非零退出 |
 | Kronos 和外部研究可能拖慢多币种周期 | 中 | 参考资料记录单次预测/分析存在明显延迟 | `auto`、只处理最终候选、严格超时、失败不阻断 |
 
+### 4.6 工具适配决策
+
+参考资料中的工具不按“全部安装”处理，而是根据本系统的 Bybit 山寨币、5m、每30分钟通知和无交易权限边界逐项决定：
+
+| 工具或方法 | 决策 | 在本系统中的位置 | 约束 |
+|---|---|---|---|
+| CMI | 核心采用 | 实时深度数据采集 | 指定币种运行，负责三所公开数据和质量状态 |
+| Louie Price Action | 原生兼容实现 | 实时证据层 | 只使用已完成 K 线，输出多周期结构和水平位，不复制第三方源码 |
+| PYTA OrderFlow | 原生兼容实现 | 实时证据层 | 基于 CMI 的真实盘口/逐笔数据计算 delta、CVD、sweep、absorption；数据断档则关闭相关结论 |
+| Quantitative Knowledge v2 | 核心采用 | 实时软证据层 | 回归通道、枢轴、Fib、ATR/Gann、Dow、Elliott/缠论启发式等均带 evidence ID |
+| Kronos-mini | 条件采用 | 实时候选软证据 | 固定 `67b630e...`，已完成5m K线，批量预测优先；`auto`、超时降级、不得否决 Codex |
+| Codex CLI | 核心采用 | 唯一实时综合判断者 | `gpt-5.6-sol/high`、只读、严格 Schema |
+| TradingAgents | 条件采用 | 隔离低频研究层 | 不进入30分钟关键路径；优先分析 BTC/ETH 和其原生可靠覆盖的资产；只输出研究摘要，不输出可执行信号 |
+| OpenBB | 条件采用 | 低频宏观/事件数据层 | AGPL 工具独立进程运行，不复制进核心；无数据时 unavailable |
+| Freqtrade | 条件采用 | 离线事件回测/无前视验证 | GPL 工具独立环境，只运行 backtesting、lookahead/recursive analysis，绝不启动 trade 模式 |
+| VectorBT | 谨慎条件采用 | 离线敏感性/walk-forward | 当前上游含 Commons Clause；不 vendoring，使用前再次确认部署/分发许可 |
+| TideView | 仅采用方法学 | 原生量化知识层 | 没有可靠无头 API；不自动化商业网页，不伪造由普通 OHLCV 无法推出的 Volume Profile |
+| Lightweight Charts | 可选 | localhost 脱敏诊断 | 不属于 Telegram 主需求，主链完成后再启用 |
+| QuantDinger | 暂不接入 | 未来隔离研究候选 | 与本系统采集/MCP/agent 能力重叠，不得持有密钥 |
+| Fincept | 排除 | 无 | 许可、无人值守和 VPS 适配不满足当前要求 |
+| `whchien/ai-trader`、`HKUDS/AI-Trader` 等 | 排除核心集成 | 无 | GPL/许可证不清和功能重叠；不复制代码，不接入密钥 |
+
+TradingAgents 当前上游虽支持结构化输出、检查点和加密货币情绪源，但主要数据与资产流程仍偏 Yahoo Finance/股票式研究。V1 只实现标准化的 `external_research` 快照接口和隔离调度：工具可用时消费其 BTC/ETH/受支持资产研究，不可用时明确标记；不把其 Trader、Portfolio Manager 或模拟执行结果升级成本系统信号。
+
 ## 5. 权威层级
 
 当资料冲突时按以下顺序处理：
@@ -223,7 +247,49 @@ CMI 允许部分交易所失败。若 Bybit 数据仍可靠且其他证据足够
 
 Kronos 采用 `auto` 模式：只有预检通过且资源、延迟预算允许时，才对最终候选运行。输入只包含已完成 5m OHLCV/turnover，输出未来 12 根 5m 的方向概率和收益分位数。它是需要在模型结论中披露状态的软证据；超时、缺模型或结果过期均不阻断分析。
 
-### 7.7 Codex Runner
+### 7.7 工具与研究平面
+
+```mermaid
+flowchart LR
+    SNAP["CMI 标准化快照"] --> PA["Louie 兼容价格行为"]
+    SNAP --> OF["PYTA 兼容订单流"]
+    SNAP --> QK["量化知识 v2"]
+    SNAP --> KR["Kronos-mini<br/>auto"]
+
+    PA --> LIVE["实时证据包"]
+    OF --> LIVE
+    QK --> LIVE
+    KR --> LIVE
+
+    HIST["已完成历史数据集"] --> FT["Freqtrade<br/>离线无前视/事件回测"]
+    HIST --> VBT["VectorBT<br/>敏感性/walk-forward"]
+    MACRO["公开宏观/事件源"] --> OBB["OpenBB<br/>低频可选"]
+    PUBLIC["公开新闻与市场背景"] --> TA["TradingAgents<br/>低频隔离研究"]
+
+    FT --> RS["严格 research snapshot"]
+    VBT --> RS
+    OBB --> RS
+    TA --> RS
+    RS -. "新鲜且校验通过时" .-> LIVE
+    LIVE --> CODEX["主 Codex 综合判断"]
+```
+
+主流程不使用 LangGraph。固定扫描、采集、证据构建、模型校验和通知属于确定性工作流，用普通异步协调器更容易控制延迟、重试和幂等。
+
+TradingAgents 作为独立第三方 LangGraph 研究任务运行，不与主系统共享运行内存、SQLite 写权限、Telegram Token 或 Codex 认证。它的输入仅为公开数据或其自身允许的数据源，输出先经过本项目 Schema 规范化、来源核对、截止时间检查和内容哈希，随后成为 `ADVISORY_ONLY` 证据。
+
+研究快照统一包含：
+
+- 工具名、固定版本/commit 和许可证状态；
+- 资产身份、研究截止时间和输入数据哈希；
+- 结构化 enum/numeric 结论与简短理由；
+- 样本量、时间切分、费用/资金费率和无前视检查状态（适用时）；
+- 生成时间、有效期和 `AVAILABLE/PARTIAL/UNAVAILABLE` 状态；
+- 明确的 `ADVISORY_ONLY` 标记。
+
+Freqtrade 与 VectorBT 报告只有使用同一 `dataset_sha256`、同一 `as_of_candle_end` 且检查合格时才能聚合。TradingAgents/OpenBB 不参与这两者的“回测共识”，只作为单独的市场背景研究项。
+
+### 7.8 Codex Runner
 
 默认以如下安全原则调用本地 Codex：
 
@@ -237,7 +303,7 @@ Kronos 采用 `auto` 模式：只有预检通过且资源、延迟预算允许�
 
 Codex 是方向和策略结论的唯一综合判断者。筛选分数、Kronos、价格行为和订单流均为证据，不使用固定投票权重。
 
-### 7.8 周期分析协调器
+### 7.9 周期分析协调器
 
 每个自然小时的 `:00` 与 `:30` 启动一次：
 
@@ -261,7 +327,7 @@ Codex 是方向和策略结论的唯一综合判断者。筛选分数、Kronos�
 
 为避免历史锚定，上一轮结论不得进入本轮市场方向的模型证据包。每个被分析币都应先输出当前强弱、方向、目标和失效结构；跨轮比较只消费已经校验的当前结构化结果和历史结构化结果。
 
-### 7.9 结构化输出契约
+### 7.10 结构化输出契约
 
 每个强信号至少包含：
 
@@ -279,7 +345,7 @@ Codex 是方向和策略结论的唯一综合判断者。筛选分数、Kronos�
 
 “较近止盈”按当前结构、波动尺度、盘口可达性和跨交易所确认解释，不引用用户仓位或利润金额。
 
-### 7.10 实时监测器
+### 7.11 实时监测器
 
 监测器使用轻量 Bybit 公共 WebSocket/REST，而不是持续执行完整 CMI。它包含两类规则：
 
@@ -298,7 +364,7 @@ Codex 是方向和策略结论的唯一综合判断者。筛选分数、Kronos�
 
 有效事件不会直接发送交易结论，而是重新采集 CMI、构建新证据、运行一次紧急 Codex 分析，再发送提醒。
 
-### 7.11 Telegram 通知器
+### 7.12 Telegram 通知器
 
 Telegram 定位为通知终端：
 
@@ -323,7 +389,7 @@ Telegram 定位为通知终端：
 
 Bot 只响应允许的 Chat ID 和 User ID。配置通过 YAML/环境变量完成，不在 Telegram 内建设复杂配置中心。
 
-### 7.12 状态、审计与 MCP/CLI
+### 7.13 状态、审计与 MCP/CLI
 
 SQLite 保存：
 
@@ -460,6 +526,21 @@ SQLite 保存：
 ### 11.5 离线研究验证
 
 Freqtrade/VectorBT 只消费固定哈希、已完成 K 线的历史数据，用于检查无前视、费用/资金费率敏感性和阈值稳定性。研究结果有生成时间、样本数量和有效期，只能作为后续改进依据，不能覆盖当前市场事实。
+
+### 11.6 工具融合代表场景
+
+场景输入：CYS 进入 Top 5，CMI 三所数据可用；Kronos 已安装；TradingAgents 仅可靠支持当前 BTC/ETH 背景；该 CYS 暂无合格 Freqtrade/VectorBT 报告。
+
+预期路径：
+
+1. CYS 运行 Louie 兼容价格行为、PYTA 兼容订单流、量化知识和 Kronos；
+2. TradingAgents 不被强行用于 CYS，状态为 `UNAVAILABLE_FOR_INSTRUMENT`；
+3. 若存在新鲜 BTC/ETH TradingAgents/OpenBB 快照，只进入全局市场背景；
+4. Freqtrade/VectorBT 状态为 `UNAVAILABLE`，不产生零值或负面票权；
+5. Codex 使用实时证据独立判断 CYS，并在工具状态中准确披露可用与不可用项；
+6. Telegram 仍按时收到结论，不显示第三方工具的伪确定性结论。
+
+文档桌面推演结果：该路径不需要 TradingAgents 支持任意 Bybit 小币种，不阻断实时分析，也没有引入第二个实时最终裁决者，符合本系统的延迟、Token 和责任边界。
 
 ## 12. 运维与部署
 

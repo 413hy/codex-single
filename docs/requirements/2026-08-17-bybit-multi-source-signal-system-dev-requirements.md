@@ -27,6 +27,7 @@
 - 本地 Python 版本和依赖由项目锁定文件确定，优先支持当前 Windows 与 Linux VPS。
 - 一轮采用一次批量 Codex 综合分析，而不是对每个币无上限单独调用，紧急事件按合并后的币种集合调用。
 - Kronos、公告/新闻和离线研究均为可插拔能力，缺失时系统继续运行并披露状态。
+- 参考工具先做适用性、许可、数据覆盖和延迟审查；“参考”不等于默认安装或进入实时链路。
 - Telegram 使用私聊和允许列表，Bot Token 在部署时提供，不写入仓库。
 - VPS 具体规格尚未给出，因此重计算组件默认采用自动探测和资源上限。
 
@@ -114,6 +115,22 @@
 - 筛选器和确定性工具只提供证据，Codex 负责综合方向结论。
 - 缺少可选工具时继续分析，禁止固定票权和机械扣分。
 
+### FR-06A 实时证据工具
+
+- Louie Price Action 以项目原生兼容实现提供已完成 K 线、多周期结构和水平位证据。
+- PYTA OrderFlow 以项目原生兼容实现消费 CMI 的真实盘口与逐笔数据；数据断档时相关指标必须不可用。
+- Quantitative Knowledge v2 提供带 evidence ID 的可复算软证据。
+- Kronos-mini 在 `auto` 模式下对最终候选提供5m概率预测，超时或方向冲突不得直接否决 Codex。
+
+### FR-06B 低频研究工具
+
+- Freqtrade 仅用于离线事件回测、lookahead 和 recursive 检查，运行环境不具备交易密钥且不得启动交易模式。
+- VectorBT 仅用于参数敏感性、时间切分和 walk-forward；因 Commons Clause，不复制进核心并在实际启用前复核许可。
+- OpenBB 仅作为可选低频宏观/事件数据适配器，独立进程运行。
+- TradingAgents 仅作为隔离低频研究适配器，优先服务 BTC/ETH 市场背景和其可靠覆盖的资产，不参与每30分钟实时模型额度。
+- 所有研究输出必须转成绑定输入哈希、截止时间、工具版本和有效期的 `ADVISORY_ONLY` 快照。
+- Fincept、TideView 商业终端自动化和许可不清的 agent 项目不得进入 V1 运行依赖；TideView 仅参考可复算方法学。
+
 ### FR-07 信号选择
 
 - 深度分析 Top 5，最多发布 2 个强信号。
@@ -199,6 +216,13 @@
 - 本机绝对路径只出现在示例或部署覆盖中，不进入核心逻辑。
 - 配置、数据、日志和运行时目录可重定位。
 
+### NFR-06 第三方隔离与许可
+
+- 第三方研究工具使用独立 venv 或容器，不获得核心 SQLite 写权限、Telegram Token、Codex 认证或任何交易密钥。
+- GPL、AGPL、Commons Clause 和许可不明代码不得复制进项目核心。
+- 每个启用工具固定版本并记录许可证、输入哈希和输出 Schema 版本。
+- 上游版本或许可证变化后重新审查，不能静默升级。
+
 ## 8. 信号输出最小字段
 
 ```text
@@ -273,6 +297,10 @@ monitoring_directives[]
 
 无效 JSON、错误 `analysis_id`、缺失必需字段或未知证据 ID 不得进入 Telegram 信号，系统执行有限修复重试并记录失败。
 
+### AC-11 工具按适用性融合
+
+给定 CYS 进入 Top 5、Kronos 可用、TradingAgents 只支持 BTC/ETH 背景且 CYS 没有合格离线回测报告，系统应运行 CYS 的实时原生证据与 Kronos，把 TradingAgents 仅用于可用的全局背景，把 CYS 的离线研究标记为不可用，并继续生成本轮信号；不得为了“工具齐全”给 CYS 伪造 TradingAgents 或回测结论。
+
 ## 10. 代表性验证场景
 
 ### 场景：CYS 偏空信号减弱并紧急失效
@@ -298,6 +326,9 @@ monitoring_directives[]
 | 把旧快照当新数据 | 高 | 运行 ID、生成时间、文件哈希和原子完成标记 |
 | 过度唤醒消耗 Token | 中 | 合并、冷却、软限频、紧凑上下文和 Token 审计 |
 | Kronos 在 VPS 上过慢 | 中 | auto 模式、只跑最终候选、超时降级 |
+| TradingAgents 多智能体调用成本和非确定性 | 中 | 低频隔离、只输出研究快照、不计入实时主判断额度 |
+| TradingAgents 对 Bybit 小币种覆盖不足 | 高 | 主要用于 BTC/ETH 背景；不支持的资产明确 unavailable |
+| 第三方工具许可证影响后续仓库分发 | 高 | 独立进程/Schema 边界、不 vendoring、固定版本前复审 |
 | Telegram 客户端隐藏键盘图标 | 中 | 不移除键盘，固定 flags，/menu 和命令菜单恢复 |
 | 符号与项目新闻错配 | 中 | symbol/token/project 多别名和官方来源核验 |
 | MCP 被公网暴露 | 高 | 默认 stdio/localhost，远程必须认证代理 |
