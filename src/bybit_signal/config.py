@@ -39,6 +39,18 @@ class BybitConfig(StrictModel):
         return self
 
 
+class ScannerConfig(StrictModel):
+    preselect_limit: int = Field(default=60, ge=5, le=200)
+    candle_limit: int = Field(default=72, ge=49, le=300)
+    request_concurrency: int = Field(default=8, ge=1, le=20)
+    minimum_24h_turnover_usdt: float = Field(default=250_000, ge=0)
+    maximum_spread_bps: float = Field(default=50, gt=0, le=500)
+    minimum_completed_candles: int = Field(default=48, ge=24, le=200)
+    maximum_missing_intervals: int = Field(default=2, ge=0, le=12)
+    minimum_median_range_percent: float = Field(default=0.15, ge=0, le=100)
+    minimum_max_return_percent: float = Field(default=0.35, ge=0, le=100)
+
+
 class CmiConfig(StrictModel):
     enabled: bool = True
     mode: Literal["source", "executable"] = "source"
@@ -103,6 +115,7 @@ class AppSettings(BaseSettings):
     runtime: RuntimeConfig = RuntimeConfig()
     analysis: AnalysisConfig = AnalysisConfig()
     bybit: BybitConfig = BybitConfig()
+    scanner: ScannerConfig = ScannerConfig()
     cmi: CmiConfig = CmiConfig(enabled=False)
     monitoring: MonitoringConfig = MonitoringConfig()
     tools: ToolsConfig = ToolsConfig()

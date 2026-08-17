@@ -19,7 +19,7 @@ from bybit_signal.domain.enums import (
     TrackingStatus,
 )
 
-Symbol = Annotated[str, StringConstraints(pattern=r"^[A-Z0-9]{2,24}USDT$")]
+Symbol = Annotated[str, StringConstraints(pattern=r"^[A-Z0-9]{1,24}USDT$")]
 EvidenceId = Annotated[str, StringConstraints(pattern=r"^[A-Z0-9][A-Z0-9_.:-]{2,127}$")]
 
 

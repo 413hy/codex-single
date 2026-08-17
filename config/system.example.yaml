@@ -19,6 +19,17 @@ bybit:
   rest_base_url: https://api.bybit.com
   public_linear_ws_url: wss://stream.bybit.com/v5/public/linear
 
+scanner:
+  preselect_limit: 60
+  candle_limit: 72
+  request_concurrency: 8
+  minimum_24h_turnover_usdt: 250000
+  maximum_spread_bps: 50
+  minimum_completed_candles: 48
+  maximum_missing_intervals: 2
+  minimum_median_range_percent: 0.15
+  minimum_max_return_percent: 0.35
+
 cmi:
   enabled: true
   mode: source
@@ -44,4 +55,3 @@ telegram:
   enabled: false
   allowed_chat_ids: []
   allowed_user_ids: []
-
