@@ -87,6 +87,35 @@ class EvidenceItem(ContractModel):
         return self
 
 
+class EvidenceBundle(ContractModel):
+    schema_version: Literal[1] = 1
+    symbol: Symbol
+    generated_at: datetime
+    source_snapshot_sha256: Annotated[str, StringConstraints(pattern=r"^[a-f0-9]{64}$")]
+    canonical_last: CanonicalPrice
+    canonical_mark: CanonicalPrice
+    evidence_items: tuple[EvidenceItem, ...] = Field(min_length=1)
+    tool_assessments: tuple[ToolAssessment, ...] = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def validate_bundle(self) -> EvidenceBundle:
+        _require_aware(self.generated_at, "generated_at")
+        if self.canonical_last.symbol != self.symbol or self.canonical_mark.symbol != self.symbol:
+            raise ValueError("canonical prices must match evidence bundle symbol")
+        identifiers = [item.evidence_id for item in self.evidence_items]
+        if len(identifiers) != len(set(identifiers)):
+            raise ValueError("evidence identifiers must be unique")
+        known = set(identifiers)
+        referenced = {
+            evidence_id
+            for assessment in self.tool_assessments
+            for evidence_id in assessment.evidence_ids
+        }
+        if not referenced <= known:
+            raise ValueError("tool assessment references unknown evidence")
+        return self
+
+
 class ToolAssessment(ContractModel):
     tool: str = Field(min_length=2, max_length=80)
     status: ToolStatus
