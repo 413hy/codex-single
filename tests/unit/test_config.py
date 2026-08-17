@@ -1,0 +1,24 @@
+from pathlib import Path
+
+import pytest
+from pydantic import ValidationError
+
+from bybit_signal.config import AppSettings, BybitConfig, TelegramConfig
+
+
+def test_example_configuration_loads() -> None:
+    settings = AppSettings.from_yaml(Path("config/system.example.yaml"))
+    assert settings.analysis.interval_minutes == 30
+    assert settings.analysis.model == "gpt-5.6-sol"
+    assert settings.analysis.reasoning_effort == "high"
+    assert settings.telegram.enabled is False
+
+
+def test_private_bybit_websocket_is_rejected() -> None:
+    with pytest.raises(ValidationError, match="public market"):
+        BybitConfig(public_linear_ws_url="wss://stream.bybit.com/v5/private")
+
+
+def test_enabled_telegram_requires_token_and_allowlists() -> None:
+    with pytest.raises(ValidationError, match="environment token"):
+        TelegramConfig(enabled=True)

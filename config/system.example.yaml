@@ -1,0 +1,47 @@
+schema_version: 1
+timezone: Asia/Shanghai
+
+runtime:
+  data_root: runtime/data
+  log_root: runtime/logs
+  database_path: runtime/state/signal.db
+  max_parallel_cmi: 3
+
+analysis:
+  interval_minutes: 30
+  top_candidates: 5
+  max_strong_signals: 2
+  model: gpt-5.6-sol
+  reasoning_effort: high
+  timeout_seconds: 300
+
+bybit:
+  rest_base_url: https://api.bybit.com
+  public_linear_ws_url: wss://stream.bybit.com/v5/public/linear
+
+cmi:
+  enabled: true
+  mode: source
+  source_root: E:/quantify/sol_realtime_snapshot
+  python_executable: D:/rely/python/data/python.exe
+  executable_path: null
+  timeout_seconds: 75
+  live_seconds: 30
+
+monitoring:
+  event_coalesce_seconds: 60
+  symbol_cooldown_seconds: 600
+  soft_model_wakes_per_hour: 10
+
+tools:
+  kronos_mode: auto
+  kronos_repository: null
+  trading_agents_mode: snapshot_only
+  openbb_mode: snapshot_only
+  external_research_root: runtime/research
+
+telegram:
+  enabled: false
+  allowed_chat_ids: []
+  allowed_user_ids: []
+
