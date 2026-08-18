@@ -8,7 +8,7 @@ import os
 import shutil
 import tempfile
 import time
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -17,7 +17,7 @@ from typing import Any, Protocol
 from pydantic import ValidationError
 
 from bybit_signal.config import AnalysisConfig
-from bybit_signal.domain.enums import Direction, MonitoringMetric, SignalStrength
+from bybit_signal.domain.enums import CycleMode, Direction, MonitoringMetric
 from bybit_signal.domain.models import (
     CandidateAssessment,
     EvidenceBundle,
@@ -120,6 +120,7 @@ class CodexAnalyzer:
         prompt_path: Path,
         process_runner: CodexProcessRunner = run_codex_process,
         codex_executable: str = "codex",
+        clock: Callable[[], datetime] | None = None,
     ) -> None:
         self._config = config
         self._workspace = workspace.resolve()
@@ -127,6 +128,7 @@ class CodexAnalyzer:
         self._prompt_path = prompt_path.resolve()
         self._process_runner = process_runner
         self._codex_command_prefix = _codex_command_prefix(codex_executable)
+        self._clock = clock or (lambda: datetime.now(UTC))
 
     async def analyze(
         self,
@@ -134,6 +136,7 @@ class CodexAnalyzer:
         analysis_id: str,
         bundles: Sequence[EvidenceBundle],
         tracked_symbols: Sequence[str] = (),
+        mode: CycleMode = CycleMode.SCHEDULED,
     ) -> CodexAnalysisResult:
         if not bundles:
             raise CodexAnalysisError("EMPTY_CONTEXT", "Codex analysis requires evidence")
@@ -145,14 +148,14 @@ class CodexAnalyzer:
         symbols = [bundle.symbol for bundle in bundles]
         if len(symbols) != len(set(symbols)):
             raise CodexAnalysisError("DUPLICATE_SYMBOL", "analysis bundles contain duplicates")
-        requested_at = datetime.now(UTC)
-        forming_window_start = requested_at.replace(minute=0, second=0, microsecond=0)
-        forming_window_end = forming_window_start + timedelta(hours=1)
+        requested_at = self._clock()
+        outlook_windows = _candle_outlook_windows(requested_at)
         context = self._context(
             analysis_id=analysis_id,
             bundles=bundles,
             tracked_symbols=tracked_symbols,
-            max_strong_signals=2,
+            mode=mode,
+            primary_signal_count=self._config.primary_signal_count,
             max_target_distance_percent=self._config.max_target_distance_percent,
             requested_at=requested_at,
         )
@@ -193,6 +196,9 @@ class CodexAnalyzer:
                 usage = self._usage(process.stdout) or usage
                 if process.return_code != 0:
                     last_error = self._process_failure(process)
+                    permanent_code = self._permanent_failure_code(process)
+                    if permanent_code is not None:
+                        raise CodexAnalysisError(permanent_code, last_error)
                     validation_feedback = self._feedback(last_error)
                     continue
                 if not output_path.is_file():
@@ -211,8 +217,8 @@ class CodexAnalyzer:
                         response=response,
                         analysis_id=analysis_id,
                         bundles=bundles,
-                        forming_window_start=forming_window_start,
-                        forming_window_end=forming_window_end,
+                        mode=mode,
+                        outlook_windows=outlook_windows,
                     )
                 except (OSError, UnicodeError, ValidationError, ValueError) as error:
                     last_error = self._concise_error(error)
@@ -258,26 +264,30 @@ class CodexAnalyzer:
         analysis_id: str,
         bundles: Sequence[EvidenceBundle],
         tracked_symbols: Sequence[str],
-        max_strong_signals: int,
+        mode: CycleMode,
+        primary_signal_count: int,
         max_target_distance_percent: float,
         requested_at: datetime,
     ) -> dict[str, Any]:
-        window_start = requested_at.replace(minute=0, second=0, microsecond=0)
+        outlook_windows = _candle_outlook_windows(requested_at)
         cutoffs = [bundle.generated_at for bundle in bundles]
         return {
             "schema_version": 1,
             "analysis_id": analysis_id,
+            "analysis_mode": mode.value,
             "requested_at": requested_at.isoformat(),
             "batch_evidence_cutoff_utc": max(cutoffs).isoformat(),
             "bundle_cutoff_skew_seconds": (
                 max(cutoffs) - min(cutoffs)
             ).total_seconds(),
-            "forming_1h_window_utc": {
-                "start": window_start.isoformat(),
-                "end": (window_start + timedelta(hours=1)).isoformat(),
+            "candle_outlook_windows_utc": {
+                name: {"start": start.isoformat(), "end": end.isoformat()}
+                for name, (start, end) in outlook_windows.items()
             },
             "analysis_policy": {
-                "max_strong_signals": max_strong_signals,
+                "required_primary_signals": (
+                    primary_signal_count if mode is CycleMode.SCHEDULED else 0
+                ),
                 "max_target_distance_percent": max_target_distance_percent,
                 "monitoring_valid_for_seconds": {"minimum": 1800, "maximum": 3600},
             },
@@ -291,29 +301,68 @@ class CodexAnalyzer:
         response: ModelAnalysisResponse,
         analysis_id: str,
         bundles: Sequence[EvidenceBundle],
-        forming_window_start: datetime,
-        forming_window_end: datetime,
+        mode: CycleMode,
+        outlook_windows: Mapping[str, tuple[datetime, datetime]],
     ) -> None:
         if response.analysis_id != analysis_id:
             raise ValueError("analysis_id does not match the request")
+        if response.mode is not mode:
+            raise ValueError("analysis mode does not match the request")
         expected = {bundle.symbol for bundle in bundles}
         actual = {assessment.symbol for assessment in response.assessments}
         if actual != expected:
             raise ValueError(
                 f"assessment symbols differ: expected {sorted(expected)}, got {sorted(actual)}"
             )
+        selected = sorted(
+            (
+                assessment
+                for assessment in response.assessments
+                if assessment.selection_rank is not None
+            ),
+            key=lambda assessment: assessment.selection_rank or 0,
+        )
+        if mode is CycleMode.SCHEDULED:
+            if [assessment.selection_rank for assessment in selected] != [1, 2]:
+                raise ValueError("scheduled analysis must select exactly ranks 1 and 2")
+        elif selected:
+            raise ValueError("emergency analysis cannot select scheduled primary signals")
         bundle_by_symbol = {bundle.symbol: bundle for bundle in bundles}
         for assessment in response.assessments:
             bundle = bundle_by_symbol[assessment.symbol]
             known = {item.evidence_id for item in bundle.evidence_items}
             referenced = set(assessment.evidence_ids)
-            if assessment.forming_1h is not None and (
-                assessment.forming_1h.window_start != forming_window_start
-                or assessment.forming_1h.window_end != forming_window_end
+            outlooks = {
+                "forming_15m": assessment.forming_15m,
+                "forming_30m": assessment.forming_30m,
+                "forming_1h": assessment.forming_1h,
+                "next_15m": assessment.next_15m,
+            }
+            visible = assessment.selection_rank is not None or mode is CycleMode.EMERGENCY
+            if visible and (
+                assessment.direction is None
+                or assessment.take_profit is None
+                or assessment.invalidation is None
+                or not assessment.evidence_ids
+                or any(outlook is None for outlook in outlooks.values())
             ):
                 raise ValueError(
-                    f"{assessment.symbol} forming 1h window differs from the requested window"
+                    f"{assessment.symbol} visible signal requires direction, target, "
+                    "invalidation, evidence and all four candle outlooks"
                 )
+            if not visible and any(outlook is not None for outlook in outlooks.values()):
+                raise ValueError(
+                    f"{assessment.symbol} non-selected assessment cannot contain outlooks"
+                )
+            for name, outlook in outlooks.items():
+                expected_start, expected_end = outlook_windows[name]
+                if outlook is not None and (
+                    outlook.window_start != expected_start
+                    or outlook.window_end != expected_end
+                ):
+                    raise ValueError(
+                        f"{assessment.symbol} {name} window differs from the requested window"
+                    )
             if assessment.take_profit is not None:
                 referenced.update(assessment.take_profit.evidence_ids)
             if assessment.invalidation is not None:
@@ -346,11 +395,26 @@ class CodexAnalyzer:
                         f"{assessment.symbol} requested unsupported realtime metric "
                         f"{directive.metric.value}"
                     )
+            if mode is CycleMode.SCHEDULED:
+                if assessment.selection_rank is None and assessment.monitoring_directives:
+                    raise ValueError(
+                        f"{assessment.symbol} non-selected assessment cannot monitor"
+                    )
+                if assessment.selection_rank is not None and not (
+                    1 <= len(assessment.monitoring_directives) <= 2
+                ):
+                    raise ValueError(
+                        f"{assessment.symbol} selected signal requires 1-2 monitoring directives"
+                    )
+            elif len(assessment.monitoring_directives) > 2:
+                raise ValueError(
+                    f"{assessment.symbol} emergency review allows at most 2 directives"
+                )
             if not referenced <= known:
                 unknown = sorted(referenced - known)
                 raise ValueError(f"{assessment.symbol} references unknown evidence: {unknown}")
-            self._validate_direction_consistency(assessment, bundle)
-            if assessment.strength is SignalStrength.STRONG:
+            if assessment.selection_rank is not None or mode is CycleMode.EMERGENCY:
+                self._validate_direction_consistency(assessment, bundle)
                 self._validate_strong_price_geometry(assessment, bundle)
 
     def _validate_direction_consistency(
@@ -509,9 +573,45 @@ class CodexAnalyzer:
         return f"Codex exited {result.return_code}: {detail or 'no diagnostics'}"
 
     @staticmethod
+    def _permanent_failure_code(result: CodexProcessResult) -> str | None:
+        message = f"{result.stderr}\n{result.stdout}".lower()
+        if "out of credits" in message or "credits exhausted" in message:
+            return "CODEX_CREDITS_EXHAUSTED"
+        if (
+            "401 unauthorized" in message
+            or "403 forbidden" in message
+            or "not logged in" in message
+            or "missing bearer or basic authentication" in message
+        ):
+            return "CODEX_AUTH_REQUIRED"
+        if "model" in message and (
+            "not found" in message or "does not exist" in message or "not available" in message
+        ):
+            return "CODEX_MODEL_UNAVAILABLE"
+        return None
+
+    @staticmethod
     def _concise_error(error: Exception) -> str:
         detail = str(error).replace("\r", " ").replace("\n", " ")
         return detail[:1000]
+
+
+def _candle_outlook_windows(
+    requested_at: datetime,
+) -> dict[str, tuple[datetime, datetime]]:
+    if requested_at.tzinfo is None or requested_at.utcoffset() is None:
+        raise ValueError("requested_at must be timezone-aware")
+    base = requested_at.replace(second=0, microsecond=0)
+    forming_15m_start = base.replace(minute=base.minute - base.minute % 15)
+    forming_30m_start = base.replace(minute=base.minute - base.minute % 30)
+    forming_1h_start = base.replace(minute=0)
+    forming_15m_end = forming_15m_start + timedelta(minutes=15)
+    return {
+        "forming_15m": (forming_15m_start, forming_15m_end),
+        "forming_30m": (forming_30m_start, forming_30m_start + timedelta(minutes=30)),
+        "forming_1h": (forming_1h_start, forming_1h_start + timedelta(hours=1)),
+        "next_15m": (forming_15m_end, forming_15m_end + timedelta(minutes=15)),
+    }
 
 
 def _codex_command_prefix(codex_executable: str) -> tuple[str, ...]:

@@ -27,7 +27,7 @@ sudo -u bybit-signal cp .env.example .env
 
 - `telegram.enabled: true`
 - `allowed_chat_ids` 与 `allowed_user_ids` 填自己的数字 ID；
-- 默认公开数据 URL、30 分钟周期、Top 5、最多 2 个强信号和监测限频通常无需修改。
+- 默认公开数据 URL、30 分钟周期、Top 5、固定 2 个相对最优主信号和监测限频通常无需修改。
 
 编辑 `.env`：
 
@@ -64,7 +64,7 @@ sudo -u bybit-signal .venv/bin/python -m bybit_signal run-cycle --config config/
 sudo -u bybit-signal .venv/bin/python -m bybit_signal run-cycle --config config/system.local.yaml --notify
 ```
 
-预期：market-capture 显示四个完成周期、Bybit last/mark、盘口、成交和 OI；完整轮次最多 2 个 STRONG；Telegram 收到核心结论和详情按钮。
+预期：market-capture 显示五个完成周期、Bybit last/mark、盘口、成交和 OI；成功轮次恰好 2 个主信号，每条具备形成中 15m/30m/1h 和下一根 15m 预测；Telegram 收到核心结论、详情和返回按钮。
 
 ## 5. systemd
 

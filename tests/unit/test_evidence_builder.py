@@ -106,6 +106,7 @@ def _snapshot(*, partial_trades: bool = False) -> NativeMarketSnapshot:
         candles={
             "5m": _candles(symbol, "5m", timedelta(minutes=5)),
             "15m": _candles(symbol, "15m", timedelta(minutes=15)),
+            "30m": _candles(symbol, "30m", timedelta(minutes=30)),
             "1h": _candles(symbol, "1h", timedelta(hours=1)),
             "4h": _candles(symbol, "4h", timedelta(hours=4)),
         },
@@ -141,6 +142,10 @@ def test_builder_preserves_prices_and_derives_completed_candle_features() -> Non
     assert float(price_action.values["recent_30m_turnover_usdt"]) > 0
     assert float(price_action.values["drawdown_from_rolling_high_atr"]) >= 0
     assert float(price_action.values["rebound_from_rolling_low_atr"]) >= 0
+    thirty = next(
+        item for item in bundle.evidence_items if item.evidence_id == "CYSUSDT.PA.30M"
+    )
+    assert thirty.values["completed_candles"] == 240
     core = next(
         tool for tool in bundle.tool_assessments if tool.tool == "BYBIT_NATIVE_MARKET_DATA"
     )

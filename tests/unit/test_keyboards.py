@@ -3,7 +3,12 @@ from typing import Any
 
 import pytest
 
-from bybit_signal.notifications.keyboards import details_keyboard, main_reply_keyboard
+from bybit_signal.notifications.keyboards import (
+    back_to_cycle_keyboard,
+    cycle_details_keyboard,
+    details_keyboard,
+    main_reply_keyboard,
+)
 
 
 def _all_keys(value: Any) -> set[str]:
@@ -32,3 +37,15 @@ def test_details_keyboard_callback_is_bounded() -> None:
 def test_details_keyboard_rejects_oversized_callback() -> None:
     with pytest.raises(ValueError, match="1-64"):
         details_keyboard("x" * 60, "CYSUSDT")
+
+
+def test_cycle_details_and_back_keyboard_form_a_bounded_round_trip() -> None:
+    cycle = cycle_details_keyboard("analysis_01", ("CYSUSDT", "GPSUSDT"))
+    back = back_to_cycle_keyboard("analysis_01")
+
+    assert len(cycle["inline_keyboard"]) == 2
+    assert cycle["inline_keyboard"][0][0]["callback_data"] == (
+        "detail:analysis_01:CYSUSDT"
+    )
+    assert back["inline_keyboard"][0][0]["callback_data"] == "back:analysis_01"
+    assert "remove_keyboard" not in _all_keys((cycle, back))

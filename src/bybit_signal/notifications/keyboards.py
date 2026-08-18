@@ -27,9 +27,27 @@ def details_keyboard(analysis_id: str, symbol: str) -> dict[str, Any]:
 
 def cycle_details_keyboard(analysis_id: str, symbols: tuple[str, ...]) -> dict[str, Any]:
     rows: list[list[dict[str, str]]] = []
-    for symbol in symbols:
+    for rank, symbol in enumerate(symbols, start=1):
         callback_data = f"detail:{analysis_id}:{symbol}"
         if not 1 <= len(callback_data.encode("utf-8")) <= 64:
             raise ValueError("Telegram callback data must be 1-64 UTF-8 bytes")
-        rows.append([{"text": f"查看 {symbol} 分析详情", "callback_data": callback_data}])
+        rows.append(
+            [
+                {
+                    "text": f"查看主信号 {rank} · {symbol}",
+                    "callback_data": callback_data,
+                }
+            ]
+        )
     return {"inline_keyboard": rows}
+
+
+def back_to_cycle_keyboard(analysis_id: str) -> dict[str, Any]:
+    callback_data = f"back:{analysis_id}"
+    if not 1 <= len(callback_data.encode("utf-8")) <= 64:
+        raise ValueError("Telegram callback data must be 1-64 UTF-8 bytes")
+    return {
+        "inline_keyboard": [
+            [{"text": "⬅️ 返回本轮信号", "callback_data": callback_data}]
+        ]
+    }

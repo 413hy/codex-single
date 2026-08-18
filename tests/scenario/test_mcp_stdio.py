@@ -59,4 +59,8 @@ async def test_read_only_mcp_stdio_lists_and_calls_health_tool(tmp_path: Path) -
         "last_analysis_id": None,
         "last_completed_at": None,
         "strong_signal_count": 0,
+        "selected_signal_count": 0,
+        "model_status": "NO_DATA",
+        "last_successful_analysis_id": None,
+        "last_emergency_analysis_id": None,
     }

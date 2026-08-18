@@ -36,9 +36,9 @@ async def get_system_health() -> dict[str, str | int | None]:
 
 
 async def get_latest_signals() -> dict[str, Any]:
-    """Return the latest completed cycle and every current conclusion."""
+    """Return the latest successful scheduled cycle and its two primary signals."""
 
-    cycle = await (await _store()).latest_cycle()
+    cycle = await (await _store()).latest_scheduled_cycle(successful_only=True)
     if cycle is None:
         return {"status": "EMPTY", "cycle": None}
     return {"status": "AVAILABLE", "cycle": cycle.model_dump(mode="json")}
@@ -66,9 +66,9 @@ async def get_market_snapshot(symbol: str) -> dict[str, Any]:
 
 
 async def list_monitoring_directives() -> dict[str, Any]:
-    """List latest dynamic public-market thresholds across tracked symbols."""
+    """List active thresholds for the current scheduled primary signals."""
 
-    conclusions = await (await _store()).latest_conclusions()
+    conclusions = await (await _store()).active_monitoring_conclusions()
     directives = [
         {
             "analysis_id": conclusion.analysis_id,

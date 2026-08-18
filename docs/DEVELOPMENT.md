@@ -6,9 +6,9 @@
 
 1. 每个整点和半点扫描 Bybit 全量 USDT 线性永续；服务启动后先立即运行一轮。
 2. 从新鲜且可交易的动态币池中，按完成 5m K 线波动、成交额、spread 和数据完整度选 Top 5；GPS、TUT、ALICE、AIO、PORTAL、CYS、BTW、HEMI、SNXX、H 等只是偏好示例，不是白名单。
-3. 对 Top 5 和上一轮强信号币重新采集公开市场数据。上一轮强信号本轮即使转弱或不再进入 Top 5，也必须复核并发送结果。
-4. `gpt-5.6-sol`、`high` 在一次批调用中独立分析全部币种，最多输出 2 个强机会，允许零个。
-5. Telegram 每 30 分钟都发送一条本轮结论；强信号和上一轮转弱/失效币优先展示，按钮可查看完整详情。
+3. 对 Top 5 和上一轮两个主信号币重新采集公开市场数据。上一轮主信号本轮即使不再进入 Top 5，也必须复核；若退出或失效则单独提醒并停止监测。
+4. `gpt-5.6-sol`、`high` 在一次批调用中独立分析全部币种，并在成功定时周期恰好选出 2 个相对最优主信号；内部 `STRONG/WATCH` 只表示证据质量，不决定名额。
+5. Telegram 每 30 分钟发送两个主信号。每条包含形成中 15m、形成中 30m、形成中 1h 和下一根 15m 预测；内部 WATCH 不通知。按钮可查看完整详情并返回本轮。
 6. 两轮之间使用公开 WebSocket 观察模型指定的少量动态阈值。穿越后只触发重新采集和紧急 Codex 复核，不直接形成信号或执行交易。
 7. 主导航只使用 ReplyKeyboardMarkup：`resize_keyboard=true`、`is_persistent=false`、`one_time_keyboard=false`；任何流程都不移除键盘。详情使用 InlineKeyboardMarkup，不改变已有 ReplyKeyboard 状态。
 8. 服务可在 Windows 本机隐藏运行，也能把项目和本文档交给 VPS Codex，按 systemd 部署。
@@ -39,7 +39,7 @@
 每个待分析币种采集：
 
 - Bybit last、mark、index、bid/ask、24h turnover、funding、OI；
-- 完成 5m/15m/1h/4h K 线，各周期验证身份、间隔、缺口、陈旧和形成中柱排除；
+- 完成 5m/15m/30m/1h/4h K 线，各周期验证身份、间隔、缺口、陈旧和形成中柱排除；
 - order book 50 档 REST 快照；
 - recent trades 最多 1000 条，仅在覆盖窗口完整时计算 delta；
 - OI 5m 历史 48 点；
@@ -51,7 +51,7 @@
 
 证据包包含冻结截止时间、源快照哈希、canonical last/mark、证据 ID 和工具质量状态。主要字段：
 
-- 5m/15m/1h/4h OHLCV、returns、ATR%、EMA9/20/50、RSI14、MACD histogram；
+- 5m/15m/30m/1h/4h OHLCV、returns、ATR%、EMA9/20/50、RSI14、MACD histogram；
 - rolling20 高低/中位、方向效率、K 线重叠、bull ratio、turnover ratio；
 - 已确认 pivot 的发生时间和确认时间，不能使用未来柱；
 - spread、top5/top20 深度与 imbalance（只声明 REST 快照）；
@@ -65,12 +65,13 @@
 - 模型和推理强度固定来自配置，默认 `gpt-5.6-sol` / `high`。
 - 输入是排序、压缩、哈希后的单批 JSON；市场文本是数据，不具备指令权限。
 - 输出必须通过 Pydantic 生成的严格 JSON Schema；最多重试 2 次。
-- 宿主继续校验币种集合、evidence ID、强信号目标/失效几何、目标最大距离、forming 1h 窗口、监测 metric、family ID 和 1800–3600 秒有效期。
-- 30–60 分钟近端方向由 15m 主导，5m 负责入场时机与反转确认；1h/4h 只作为背景，不能覆盖已完成 15m/5m 的明确反向结构。
+- 宿主继续校验币种集合、evidence ID、主信号目标/失效几何、目标最大距离、四项预测窗口、监测 metric、family ID 和 1800–3600 秒有效期。
+- 30–60 分钟综合方向由 15m 主导，5m 负责眼前时机，30m 连接短线摆动与小时背景；1h/4h 不能覆盖已完成 15m/5m 的明确反向结构。
 - STRONG 需要 5m 时机、15m 结构和 1h/4h 背景没有未解释强冲突；逆趋势不能只凭超买超卖。急拉后出现近端回落、滚动高点回撤和新近 pivot high 时禁止继续追多，急跌后的规则完全对称。
 - 宿主对模型输出做方向一致性复核：只拒绝与完成 K 线证据冲突的方向并触发重试，不自行生成交易方向。
-- WATCH/NO_STRONG 仍需解释缺少的确认。追踪币只要不是 INDETERMINATE，应尽量给完整当前方向、目标、forming 1h 和失效条件。
-- 上一轮方向不放入模型上下文，避免锚定；模型本轮结论完成后，宿主才比较方向、目标和失效状态。追踪基准只取最近一个定时周期的强信号，紧急阈值复核不能覆盖它。
+- 两个主信号无论内部强度如何，都必须有方向、目标、失效条件、可信度和四项预测；非主信号不得带预测或监测指令。
+- 四项预测分别对应宿主计算的自然窗口，只输出方向、强度、窗口与依据，不编造精确 OHLC。模型预测不能在同轮或下轮当作市场事实。
+- 上一轮方向不放入模型上下文，避免锚定；模型本轮结论完成后，宿主才比较方向、目标和失效状态。追踪基准只取最近一个成功定时周期的两个主信号，紧急阈值复核不能覆盖它。
 
 完整 Prompt 见 `prompts/signal_analysis_zh.md`。
 
@@ -78,14 +79,14 @@
 
 - Token 只从 `.env` 的 `BYBIT_SIGNAL_TELEGRAM__TOKEN` 读取；chat/user 均需白名单。
 - 每轮只投递一次，SQLite `deliveries` 负责幂等。
-- 核心通知包括：时间、候选、强信号数、参考价、综合方向、市场状态、唯一目标、forming 1h、相比上一轮和方向失效。
-- InlineKeyboard callback 只包含 `analysis_id + symbol`，最长 64 UTF-8 bytes；点击后从 SQLite 获取已落库详情。
+- 核心通知包括：时间、两个主信号、参考价、综合方向、市场状态、唯一目标、四项 K 线预测、相比上一轮和方向失效。
+- InlineKeyboard callback 只包含 `analysis_id + symbol`，最长 64 UTF-8 bytes；点击后从 SQLite 获取已落库详情，详情页提供返回本轮按钮并优先编辑原消息。
 - `/start`、`/menu`、`/latest`、`/status` 与虚拟键盘均返回白名单用户；未知和未授权消息不响应。
 - 不发送 ReplyKeyboardRemove，不设置 `remove_keyboard`，不使用 one-time 或 persistent 常驻模式。
 
 ## 6. 实时监测合同
 
-支持的指标只有 last、mark、spread、OI、funding 和完成 5m/15m/1h close。模型通常为强信号、观察信号和追踪币生成 1–2 条动态阈值：
+支持的指标只有 last、mark、spread、OI、funding 和完成 5m/15m/1h close。模型只为当前两个主信号生成 1–2 条动态阈值；内部 WATCH、退出币和历史残留不监测：
 
 - 首次观测只武装，不把已经满足的条件当作新穿越；
 - crossing 后必须离开 hysteresis 区域才重新武装；
@@ -100,7 +101,7 @@
 - MCP 只通过 stdio 暴露六个只读工具：健康、最新信号、详情、市场证据、监测阈值和历史。
 - 服务日志 UTC 写入 `runtime/logs/service.log`，5 MiB 轮转 5 份。
 - `runtime/state/service.lock` 防止重复调度器；Windows PID 文件只辅助脚本显示和停止，不代替文件锁。
-- 正式服务遇到单轮失败会记录异常并尝试发错误通知，下一整点/半点继续；Telegram 错误通知本身失败不能终止调度器。
+- 正式服务遇到单轮失败会记录异常并按错误类型去重通知，下一整点/半点继续；失败轮次没有伪信号，模型恢复时只发一次恢复消息。
 
 ## 8. 代码导航
 
@@ -122,9 +123,9 @@
 
 - 静态源码没有私有交易端点、签名或键盘移除字段；
 - 扫描与深采使用真实公开网络，完成柱和时间截止检查通过；
-- 每轮只调用一次模型，输出覆盖全部候选和追踪币，强信号不超过 2；
-- 上轮强信号转弱或失效仍出现在本轮通知；
-- 模型格式、未知 evidence、错误目标方向、错误 forming 1h 和不支持监测指标均被拒绝或重试；
+- 每轮通常只调用一次模型，输出覆盖全部候选和追踪币；成功定时周期恰好两个主信号，模型失败周期为零；
+- 上轮主信号退出或失效仍作为独立状态更新出现，并停止实时监测；
+- 模型格式、未知 evidence、错误目标方向、四项预测缺失/错窗和不支持监测指标均被拒绝或重试；
 - Telegram 主 ReplyKeyboard 参数逐项精确匹配需求，InlineKeyboard 不移除它；
 - 阈值 crossing、hysteresis、过期、冷却、合并和小时软上限有自动化测试；
 - Ruff、mypy、pytest、真实 market-capture、完整 no-notify、正式 notify、MCP handshake 和服务存活检查全部通过。

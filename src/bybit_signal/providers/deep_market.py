@@ -23,7 +23,7 @@ from bybit_signal.providers.cross_exchange import (
     ReferenceTicker,
 )
 
-DeepTimeframe = Literal["5m", "15m", "1h", "4h"]
+DeepTimeframe = Literal["5m", "15m", "30m", "1h", "4h"]
 DeepCandleSet = dict[DeepTimeframe, tuple[Candle, ...]]
 T = TypeVar("T")
 
@@ -94,16 +94,18 @@ class NativeMarketSnapshot(BaseModel):
 class BybitDeepMarketCollector:
     """Build a compact, auditable evidence snapshot from Bybit public endpoints."""
 
-    _TIMEFRAMES: tuple[DeepTimeframe, ...] = ("5m", "15m", "1h", "4h")
+    _TIMEFRAMES: tuple[DeepTimeframe, ...] = ("5m", "15m", "30m", "1h", "4h")
     _MINIMUM_CANDLES: ClassVar[dict[DeepTimeframe, int]] = {
         "5m": 120,
         "15m": 96,
+        "30m": 72,
         "1h": 72,
         "4h": 30,
     }
     _DURATIONS: ClassVar[dict[DeepTimeframe, timedelta]] = {
         "5m": timedelta(minutes=5),
         "15m": timedelta(minutes=15),
+        "30m": timedelta(minutes=30),
         "1h": timedelta(hours=1),
         "4h": timedelta(hours=4),
     }

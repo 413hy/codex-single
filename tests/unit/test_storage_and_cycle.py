@@ -8,8 +8,12 @@ from typing import Any
 from bybit_signal.analysis.codex import CodexAnalysisResult
 from bybit_signal.config import AppSettings
 from bybit_signal.domain.enums import (
+    Comparator,
+    CycleMode,
     Direction,
+    MonitoringMetric,
     PriceType,
+    SignalConfidence,
     SignalStrength,
     ToolStatus,
     TrackingStatus,
@@ -23,6 +27,7 @@ from bybit_signal.domain.models import (
     FormingHourOutlook,
     InvalidationCondition,
     ModelAnalysisResponse,
+    MonitoringDirective,
     PriceLevel,
     SignalConclusion,
     ToolAssessment,
@@ -78,12 +83,16 @@ def _bundle(symbol: str, price: str = "100") -> EvidenceBundle:
 def _strong_conclusion(
     analysis_id: str,
     symbol: str = "CYSUSDT",
+    *,
+    rank: int = 1,
 ) -> SignalConclusion:
     now = datetime.now(UTC)
     evidence_id = f"{symbol}.PA.5M"
     assessment = CandidateAssessment(
         symbol=symbol,
         strength=SignalStrength.STRONG,
+        selection_rank=rank,  # type: ignore[arg-type]
+        confidence=SignalConfidence.MEDIUM,
         direction=Direction.LONG_BIAS,
         market_state="趋势修复",
         take_profit=PriceLevel(
@@ -107,6 +116,18 @@ def _strong_conclusion(
         summary="strong long fixture",
         details="fixture details with completed evidence",
         evidence_ids=(evidence_id,),
+        monitoring_directives=(
+            MonitoringDirective(
+                family_id=f"{symbol.lower()}.invalidation.5m",
+                metric=MonitoringMetric.COMPLETED_5M_CLOSE,
+                comparator=Comparator.LESS_THAN,
+                threshold=Decimal("98"),
+                hysteresis=Decimal("0.1"),
+                valid_for_seconds=3600,
+                reason="completed candle invalidates the long structure",
+                evidence_ids=(evidence_id,),
+            ),
+        ),
     )
     return SignalConclusion(
         analysis_id=analysis_id,
@@ -131,15 +152,24 @@ def _strong_conclusion(
     )
 
 
-def _cycle(conclusion: SignalConclusion) -> AnalysisCycleResult:
+def _cycle(
+    conclusion: SignalConclusion,
+    *,
+    mode: CycleMode = CycleMode.SCHEDULED,
+) -> AnalysisCycleResult:
     now = datetime.now(UTC)
     return AnalysisCycleResult(
         analysis_id=conclusion.analysis_id,
+        mode=mode,
         started_at=now,
         completed_at=now,
         candidate_symbols=(conclusion.assessment.symbol,),
         conclusions=(conclusion,),
         strong_signal_count=int(conclusion.assessment.strength is SignalStrength.STRONG),
+        selected_symbols=(conclusion.assessment.symbol,)
+        if conclusion.assessment.selection_rank is not None
+        else (),
+        selected_signal_count=int(conclusion.assessment.selection_rank is not None),
         context_sha256="c" * 64,
     )
 
@@ -150,7 +180,12 @@ def _watch_conclusion(
 ) -> SignalConclusion:
     strong = _strong_conclusion(analysis_id, symbol)
     assessment = strong.assessment.model_copy(
-        update={"strength": SignalStrength.WATCH}
+        update={
+            "strength": SignalStrength.WATCH,
+            "selection_rank": None,
+            "confidence": None,
+            "monitoring_directives": (),
+        }
     )
     return strong.model_copy(
         update={
@@ -177,38 +212,70 @@ async def test_store_round_trip_and_previous_strong_symbols(tmp_path: Path) -> N
     assert await store.latest_bundle("CYSUSDT") == bundle
     health = await store.health_summary()
     assert health["strong_signal_count"] == 1
+    assert health["selected_signal_count"] == 1
+    assert health["model_status"] == "SUCCESS"
+
+
+async def test_reversed_emergency_review_stops_selected_signal_monitoring(
+    tmp_path: Path,
+) -> None:
+    store = SignalStore(tmp_path / "signals.db")
+    await store.initialize()
+    scheduled = _strong_conclusion("cycle_analysis_01")
+    await store.save_cycle(_cycle(scheduled), (_bundle("CYSUSDT"),))
+    emergency_base = _watch_conclusion("urgent_analysis_02")
+    emergency = emergency_base.model_copy(
+        update={
+            "assessment": emergency_base.assessment.model_copy(
+                update={
+                    "direction": Direction.SHORT_BIAS,
+                    "monitoring_directives": scheduled.assessment.monitoring_directives,
+                }
+            ),
+            "tracking_status": TrackingStatus.REVERSED,
+        }
+    )
+    await store.save_cycle(
+        _cycle(emergency, mode=CycleMode.EMERGENCY),
+        (_bundle("CYSUSDT"),),
+    )
+
+    assert await store.active_monitoring_conclusions() == ()
 
 
 class FakeScanner:
     async def scan(self, *, limit: int = 5) -> ScanResult:
         assert limit == 5
         now = datetime.now(UTC)
-        candidate = RankedCandidate(
-            rank=1,
-            symbol="GPSUSDT",
-            score=100,
-            last_price=Decimal("20"),
-            observed_at=now,
-            features=CandidateFeatures(
-                median_range_percent=1,
-                realized_volatility_percent=1,
-                maximum_absolute_return_percent=2,
-                direction_efficiency=0.5,
-                recent_turnover_ratio=2,
-                recent_30m_turnover_usdt=100_000,
-                spread_bps=3,
-                turnover_24h_usdt=1_000_000,
-                completed_candles=60,
-                missing_intervals=0,
-            ),
-            reasons=("volatile",),
+        candidates = tuple(
+            RankedCandidate(
+                rank=rank,
+                symbol=symbol,
+                score=100 - rank,
+                last_price=Decimal("20"),
+                observed_at=now,
+                features=CandidateFeatures(
+                    median_range_percent=1,
+                    realized_volatility_percent=1,
+                    maximum_absolute_return_percent=2,
+                    direction_efficiency=0.5,
+                    recent_turnover_ratio=2,
+                    recent_30m_turnover_usdt=100_000,
+                    spread_bps=3,
+                    turnover_24h_usdt=1_000_000,
+                    completed_candles=60,
+                    missing_intervals=0,
+                ),
+                reasons=("volatile",),
+            )
+            for rank, symbol in enumerate(("GPSUSDT", "TUTUSDT"), start=1)
         )
         return ScanResult(
             generated_at=now,
             universe_size=100,
             ticker_eligible_size=50,
             kline_analyzed_size=50,
-            candidates=(candidate,),
+            candidates=candidates,
             failures={},
         )
 
@@ -233,6 +300,75 @@ class FakeEvidenceBuilder:
         return _bundle(snapshot.symbol, "100" if snapshot.symbol == "CYSUSDT" else "20")
 
 
+def _selected_assessment(
+    symbol: str,
+    rank: int,
+    *,
+    selected: bool = True,
+) -> CandidateAssessment:
+    evidence_id = f"{symbol}.PA.5M"
+    if not selected:
+        return CandidateAssessment(
+            symbol=symbol,
+            strength=SignalStrength.WATCH,
+            market_state="relative opportunity is weaker",
+            summary="not selected in this scheduled cycle",
+            details="another two symbols have clearer near-term structures",
+            evidence_ids=(evidence_id,),
+        )
+    observed = datetime.now(UTC).replace(second=0, microsecond=0)
+    forming_15m = observed.replace(minute=observed.minute - observed.minute % 15)
+    forming_30m = observed.replace(minute=observed.minute - observed.minute % 30)
+    forming_1h = observed.replace(minute=0)
+
+    def outlook(start: datetime, duration: timedelta) -> FormingHourOutlook:
+        return FormingHourOutlook(
+            direction=Direction.LONG_BIAS,
+            strength="NORMAL",
+            window_start=start,
+            window_end=start + duration,
+            rationale="completed multi-timeframe structure",
+        )
+
+    return CandidateAssessment(
+        symbol=symbol,
+        strength=SignalStrength.WATCH,
+        selection_rank=rank,  # type: ignore[arg-type]
+        confidence=SignalConfidence.MEDIUM,
+        direction=Direction.LONG_BIAS,
+        market_state="near-term trend continuation",
+        take_profit=PriceLevel(
+            value=Decimal("21"),
+            rationale="nearby completed structure",
+            evidence_ids=(evidence_id,),
+        ),
+        forming_15m=outlook(forming_15m, timedelta(minutes=15)),
+        forming_30m=outlook(forming_30m, timedelta(minutes=30)),
+        forming_1h=outlook(forming_1h, timedelta(hours=1)),
+        next_15m=outlook(forming_15m + timedelta(minutes=15), timedelta(minutes=15)),
+        invalidation=InvalidationCondition(
+            condition="completed 5m closes below the structure",
+            reference_price=Decimal("19"),
+            evidence_ids=(evidence_id,),
+        ),
+        summary="relative-best long fixture",
+        details="selected from the complete scheduled candidate batch",
+        evidence_ids=(evidence_id,),
+        monitoring_directives=(
+            MonitoringDirective(
+                family_id=f"{symbol.lower()}.invalidation.5m",
+                metric=MonitoringMetric.COMPLETED_5M_CLOSE,
+                comparator=Comparator.LESS_THAN,
+                threshold=Decimal("19"),
+                hysteresis=Decimal("0.1"),
+                valid_for_seconds=3600,
+                reason="completed candle invalidates the selected structure",
+                evidence_ids=(evidence_id,),
+            ),
+        ),
+    )
+
+
 class FakeAnalyzer:
     async def analyze(
         self,
@@ -240,21 +376,21 @@ class FakeAnalyzer:
         analysis_id: str,
         bundles: Any,
         tracked_symbols: Any = (),
+        mode: CycleMode = CycleMode.SCHEDULED,
     ) -> CodexAnalysisResult:
         assert tuple(tracked_symbols) == ("CYSUSDT",)
+        assert mode is CycleMode.SCHEDULED
         assessments = tuple(
-            CandidateAssessment(
-                symbol=bundle.symbol,
-                strength=SignalStrength.NO_STRONG_SIGNAL,
-                market_state="无强信号",
-                summary="当前没有足够强的信号",
-                details="本轮证据不足以形成强信号。",
-                evidence_ids=(f"{bundle.symbol}.PA.5M",),
+            _selected_assessment(
+                bundle.symbol,
+                rank=index,
+                selected=index <= 2,
             )
-            for bundle in bundles
+            for index, bundle in enumerate(bundles, start=1)
         )
         return CodexAnalysisResult(
             response=ModelAnalysisResponse(
+                mode=CycleMode.SCHEDULED,
                 analysis_id=analysis_id,
                 cycle_summary="all symbols assessed",
                 assessments=assessments,
@@ -266,7 +402,7 @@ class FakeAnalyzer:
         )
 
 
-async def test_cycle_always_reanalyzes_and_marks_previous_strong_signal_weakened(
+async def test_cycle_selects_exactly_two_and_marks_dropped_previous_signal_exited(
     tmp_path: Path,
 ) -> None:
     store = SignalStore(tmp_path / "signals.db")
@@ -274,7 +410,10 @@ async def test_cycle_always_reanalyzes_and_marks_previous_strong_signal_weakened
     prior = _strong_conclusion("cycle_analysis_00")
     await store.save_cycle(_cycle(prior), (_bundle("CYSUSDT"),))
     emergency = _watch_conclusion("urgent_analysis_01")
-    await store.save_cycle(_cycle(emergency), (_bundle("CYSUSDT"),))
+    await store.save_cycle(
+        _cycle(emergency, mode=CycleMode.EMERGENCY),
+        (_bundle("CYSUSDT"),),
+    )
     market_collector = FakeMarketCollector()
     service = SignalCycleService(
         AppSettings(),
@@ -287,14 +426,17 @@ async def test_cycle_always_reanalyzes_and_marks_previous_strong_signal_weakened
 
     result = await service.run_cycle()
 
-    assert result.candidate_symbols == ("GPSUSDT",)
+    assert result.candidate_symbols == ("GPSUSDT", "TUTUSDT")
     assert result.tracked_symbols == ("CYSUSDT",)
-    assert market_collector.symbols == ["GPSUSDT", "CYSUSDT"]
+    assert market_collector.symbols == ["GPSUSDT", "TUTUSDT", "CYSUSDT"]
+    assert result.selected_signal_count == 2
+    assert result.selected_symbols == ("GPSUSDT", "TUTUSDT")
     cys = next(
         conclusion
         for conclusion in result.conclusions
         if conclusion.assessment.symbol == "CYSUSDT"
     )
-    assert cys.assessment.strength is SignalStrength.NO_STRONG_SIGNAL
-    assert cys.tracking_status is TrackingStatus.WEAKENED
-    assert "上一轮强信号" in cys.comparison_with_previous
+    assert cys.assessment.strength is SignalStrength.WATCH
+    assert cys.assessment.monitoring_directives == ()
+    assert cys.tracking_status is TrackingStatus.EXITED
+    assert "已停止实时监测" in cys.comparison_with_previous

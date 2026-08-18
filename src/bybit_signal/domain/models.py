@@ -8,10 +8,13 @@ from pydantic import BaseModel, ConfigDict, Field, StringConstraints, model_vali
 
 from bybit_signal.domain.enums import (
     Comparator,
+    CycleMode,
+    CycleStatus,
     Direction,
     MarketType,
     MonitoringMetric,
     PriceType,
+    SignalConfidence,
     SignalStrength,
     ToolStatus,
     TrackingStatus,
@@ -32,7 +35,7 @@ def _require_aware(value: datetime, field: str) -> None:
 
 class Candle(ContractModel):
     symbol: Symbol
-    timeframe: Literal["1m", "5m", "15m", "1h", "4h"]
+    timeframe: Literal["1m", "5m", "15m", "30m", "1h", "4h"]
     open_time: datetime
     close_time: datetime
     open: Decimal = Field(gt=0)
@@ -129,7 +132,7 @@ class PriceLevel(ContractModel):
     evidence_ids: tuple[EvidenceId, ...] = Field(min_length=1)
 
 
-class FormingHourOutlook(ContractModel):
+class CandleOutlook(ContractModel):
     direction: Direction
     strength: Literal["WEAK", "NORMAL", "STRONG"]
     window_start: datetime
@@ -137,12 +140,15 @@ class FormingHourOutlook(ContractModel):
     rationale: str = Field(min_length=4, max_length=500)
 
     @model_validator(mode="after")
-    def validate_window(self) -> FormingHourOutlook:
+    def validate_window(self) -> CandleOutlook:
         _require_aware(self.window_start, "window_start")
         _require_aware(self.window_end, "window_end")
         if self.window_end <= self.window_start:
-            raise ValueError("forming 1h window is invalid")
+            raise ValueError("candle outlook window is invalid")
         return self
+
+
+FormingHourOutlook = CandleOutlook
 
 
 class InvalidationCondition(ContractModel):
@@ -165,10 +171,15 @@ class MonitoringDirective(ContractModel):
 class CandidateAssessment(ContractModel):
     symbol: Symbol
     strength: SignalStrength
+    selection_rank: Literal[1, 2] | None = None
+    confidence: SignalConfidence | None = None
     direction: Direction | None = None
     market_state: str = Field(min_length=2, max_length=500)
     take_profit: PriceLevel | None = None
-    forming_1h: FormingHourOutlook | None = None
+    forming_15m: CandleOutlook | None = None
+    forming_30m: CandleOutlook | None = None
+    forming_1h: CandleOutlook | None = None
+    next_15m: CandleOutlook | None = None
     invalidation: InvalidationCondition | None = None
     summary: str = Field(min_length=4, max_length=1500)
     details: str = Field(min_length=4, max_length=12_000)
@@ -178,22 +189,27 @@ class CandidateAssessment(ContractModel):
 
     @model_validator(mode="after")
     def validate_strength_contract(self) -> CandidateAssessment:
-        if self.strength is SignalStrength.STRONG:
+        if self.selection_rank is None and self.confidence is not None:
+            raise ValueError("non-selected assessment cannot have confidence")
+        if self.selection_rank is not None and self.confidence is None:
+            raise ValueError("selected assessment requires confidence")
+        if self.strength is SignalStrength.STRONG or self.selection_rank is not None:
             if self.direction is None:
-                raise ValueError("strong assessment requires one direction")
+                raise ValueError("selected or strong assessment requires one direction")
             if self.take_profit is None:
-                raise ValueError("strong assessment requires one take-profit level")
+                raise ValueError("selected or strong assessment requires one take-profit level")
             if self.forming_1h is None:
-                raise ValueError("strong assessment requires forming 1h outlook")
+                raise ValueError("selected or strong assessment requires forming 1h outlook")
             if self.invalidation is None:
-                raise ValueError("strong assessment requires invalidation condition")
+                raise ValueError("selected or strong assessment requires invalidation condition")
             if not self.evidence_ids:
-                raise ValueError("strong assessment requires evidence")
+                raise ValueError("selected or strong assessment requires evidence")
         return self
 
 
 class ModelAnalysisResponse(ContractModel):
     schema_version: Literal[1] = 1
+    mode: CycleMode
     analysis_id: Annotated[str, StringConstraints(pattern=r"^[a-zA-Z0-9_-]{8,96}$")]
     cycle_summary: str = Field(min_length=4, max_length=2000)
     assessments: tuple[CandidateAssessment, ...] = Field(min_length=1, max_length=10)
@@ -203,6 +219,13 @@ class ModelAnalysisResponse(ContractModel):
         symbols = [assessment.symbol for assessment in self.assessments]
         if len(symbols) != len(set(symbols)):
             raise ValueError("model response contains duplicate symbols")
+        ranks = [
+            assessment.selection_rank
+            for assessment in self.assessments
+            if assessment.selection_rank is not None
+        ]
+        if len(ranks) != len(set(ranks)):
+            raise ValueError("model response contains duplicate selection ranks")
         strong_count = sum(
             assessment.strength is SignalStrength.STRONG for assessment in self.assessments
         )
@@ -232,13 +255,18 @@ class SignalConclusion(ContractModel):
 
 
 class AnalysisCycleResult(ContractModel):
+    selection_contract_version: Literal[1, 2, 3] = 1
     analysis_id: Annotated[str, StringConstraints(pattern=r"^[a-zA-Z0-9_-]{8,96}$")]
+    mode: CycleMode = CycleMode.SCHEDULED
+    status: CycleStatus = CycleStatus.SUCCESS
     started_at: datetime
     completed_at: datetime
     candidate_symbols: tuple[Symbol, ...] = Field(max_length=5)
     tracked_symbols: tuple[Symbol, ...] = ()
     conclusions: tuple[SignalConclusion, ...]
     strong_signal_count: int = Field(ge=0, le=2)
+    selected_symbols: tuple[Symbol, ...] = Field(default=(), max_length=2)
+    selected_signal_count: int = Field(default=0, ge=0, le=2)
     context_sha256: Annotated[str, StringConstraints(pattern=r"^[a-f0-9]{64}$")]
     diagnostics: dict[str, Any] = Field(default_factory=dict)
 
@@ -254,4 +282,64 @@ class AnalysisCycleResult(ContractModel):
         )
         if self.strong_signal_count != actual:
             raise ValueError("strong_signal_count does not match conclusions")
+        selected = sorted(
+            (
+                conclusion
+                for conclusion in self.conclusions
+                if conclusion.assessment.selection_rank is not None
+            ),
+            key=lambda conclusion: conclusion.assessment.selection_rank or 0,
+        )
+        selected_symbols = tuple(
+            conclusion.assessment.symbol for conclusion in selected
+        )
+        if self.selected_signal_count != len(selected):
+            raise ValueError("selected_signal_count does not match conclusions")
+        if self.selected_symbols != selected_symbols:
+            raise ValueError("selected_symbols do not match ranked conclusions")
+        if self.selection_contract_version == 2:
+            if self.mode is CycleMode.SCHEDULED and self.status is CycleStatus.SUCCESS:
+                if self.selected_signal_count != 2:
+                    raise ValueError("successful scheduled cycle requires two selected signals")
+            elif self.selected_signal_count != 0:
+                raise ValueError("failed or emergency cycle cannot select scheduled signals")
+        if self.selection_contract_version == 3:
+            if self.mode is CycleMode.SCHEDULED and self.status is CycleStatus.SUCCESS:
+                if self.selected_signal_count != 2:
+                    raise ValueError("successful scheduled cycle requires two selected signals")
+                for conclusion in self.conclusions:
+                    assessment = conclusion.assessment
+                    if assessment.selection_rank is not None:
+                        _require_all_outlooks(assessment)
+                    elif any(
+                        outlook is not None
+                        for outlook in (
+                            assessment.forming_15m,
+                            assessment.forming_30m,
+                            assessment.forming_1h,
+                            assessment.next_15m,
+                        )
+                    ):
+                        raise ValueError("non-selected assessment cannot contain new outlooks")
+            elif self.mode is CycleMode.EMERGENCY and self.status is CycleStatus.SUCCESS:
+                if self.selected_signal_count != 0:
+                    raise ValueError("emergency cycle cannot select scheduled signals")
+                if len(self.conclusions) != 1:
+                    raise ValueError("successful emergency cycle requires one conclusion")
+                _require_all_outlooks(self.conclusions[0].assessment)
+            elif self.selected_signal_count != 0:
+                raise ValueError("failed cycle cannot select scheduled signals")
         return self
+
+
+def _require_all_outlooks(assessment: CandidateAssessment) -> None:
+    if any(
+        outlook is None
+        for outlook in (
+            assessment.forming_15m,
+            assessment.forming_30m,
+            assessment.forming_1h,
+            assessment.next_15m,
+        )
+    ):
+        raise ValueError("visible signal requires all four candle outlooks")

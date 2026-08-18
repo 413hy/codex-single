@@ -23,9 +23,27 @@ class SignalStrength(StrEnum):
     INDETERMINATE = "INDETERMINATE"
 
 
+class SignalConfidence(StrEnum):
+    HIGH = "HIGH"
+    MEDIUM = "MEDIUM"
+    LOW = "LOW"
+
+
+class CycleMode(StrEnum):
+    SCHEDULED = "SCHEDULED"
+    EMERGENCY = "EMERGENCY"
+
+
+class CycleStatus(StrEnum):
+    SUCCESS = "SUCCESS"
+    FAILED = "FAILED"
+
+
 class TrackingStatus(StrEnum):
     NEW = "NEW"
     MAINTAINED = "MAINTAINED"
+    REVERSED = "REVERSED"
+    EXITED = "EXITED"
     WEAKENED = "WEAKENED"
     INVALIDATED = "INVALIDATED"
     INDETERMINATE = "INDETERMINATE"

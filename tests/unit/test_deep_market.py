@@ -40,6 +40,7 @@ class FakePublicClient:
         duration = {
             "5m": timedelta(minutes=5),
             "15m": timedelta(minutes=15),
+            "30m": timedelta(minutes=30),
             "1h": timedelta(hours=1),
             "4h": timedelta(hours=4),
         }[timeframe]
@@ -81,8 +82,8 @@ async def test_native_collector_fetches_all_required_timeframes_and_degrades_opt
     client = FakePublicClient()
     snapshot = await BybitDeepMarketCollector(client).collect("CYSUSDT")  # type: ignore[arg-type]
 
-    assert sorted(client.timeframes) == ["15m", "1h", "4h", "5m"]
-    assert set(snapshot.candles) == {"5m", "15m", "1h", "4h"}
+    assert sorted(client.timeframes) == ["15m", "1h", "30m", "4h", "5m"]
+    assert set(snapshot.candles) == {"5m", "15m", "30m", "1h", "4h"}
     assert snapshot.orderbook is None
     assert "orderbook" in snapshot.collection_failures
     assert all(

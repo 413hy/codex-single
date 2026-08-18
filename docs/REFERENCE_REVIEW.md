@@ -11,7 +11,7 @@
 | nirholas/Binance-MCP | `df8861cf3d6815644912ae3c4437c082ff24c7a2` | 参考 MCP 工具边界、stdio 交互和明确的行情请求表达 |
 | junsonle/Binance-mcp | `cbb849c16b8065b869c7dcef248b2602c74918a1` | 参考行情 Prompt 中 symbol/timeframe/depth 的明确口径 |
 | followers-asm/refactor/bitget-btc-codex | `dd2996659267b6430c828999e4d4deab48a32a13` | 参考 Codex 独立裁决、完成柱、证据 ID、阈值迟滞/合并/限频和失败关闭 |
-| 无图分析 Prompt | `E:\quantify\prompt\无图分析 Prompt.txt` | 参考证据与指令隔离、价格身份、字段级降级、唯一方向/目标、forming 1h 和最终自检 |
+| 无图分析 Prompt | `E:\quantify\prompt\无图分析 Prompt.txt` | 参考证据与指令隔离、价格身份、字段级降级、唯一方向/目标、多周期窗口和最终自检 |
 | sol_realtime_snapshot / CMI 对话 | `E:\quantify\sol_realtime_snapshot` 与本机 CMI 安装目录 | 参考多源采集、原子快照、数据质量和缺失不等于零；未作为运行时组件 |
 | Louie price action | `E:\quantify\louie_price_action_system_v1` | 参考多周期职责、效率/重叠、确认 pivot 和结构目标 |
 | PYTA OrderFlow | `E:\quantify\PYTA_OrderFlow_Quant_System_Spec_v0.1.0` | 参考盘口绝对深度、成交方向映射和覆盖门槛 |
@@ -21,10 +21,10 @@
 
 - MCP：只保留本地只读 stdio 工具，工具只查询 SQLite 中的健康、信号、详情、快照、阈值和历史；没有 HTTP/SSE 暴露，也没有交易工具。
 - 数据：自行实现 Bybit REST/WS、Binance USD-M ticker 和 OKX Swap ticker 适配器；Bybit last/mark 分离，跨交易所不平均。
-- 时间：快照冻结截止线、已完成 K 线、最大缺口、陈旧检查和 SHA-256 身份；forming 1h 仅由模型预测，不拿形成中 K 线确认结构。
+- 时间：快照冻结截止线、已完成 K 线、最大缺口、陈旧检查和 SHA-256 身份；形成中 15m/30m/1h 与下一根 15m 只由模型预测，不拿形成中报价确认结构。
 - 价格行为：EMA、Wilder ATR/RSI、MACD、rolling range、方向效率、重叠度、成交量比和已确认 pivot 均由本项目计算。
 - 订单流：只使用 REST 盘口快照和有完整覆盖的近期成交窗口；不声称拥有连续 L2 的 OFI、补单、吸收或 sweep 真值。
-- Codex：每轮使用新的 ephemeral、read-only 会话，严格 Schema、证据 ID 和宿主二次校验；候选分数不是方向，最多 2 个强信号且允许零个。
+- Codex：每轮使用新的 ephemeral、read-only 会话，严格 Schema、证据 ID 和宿主二次校验；候选分数不是方向，成功定时周期必须选出两个相对最优主信号。
 - 监测：模型只生成当前实现可观测的动态阈值，宿主负责迟滞、首次观测武装、60 秒合并、单币冷却和小时软上限。
 - Prompt：保留无图分析的证据纪律，删除图片基线、网页搜索、BTC 单币历史继承和仓位假设，改成 Top 5 + 追踪币批量 JSON 合同。
 

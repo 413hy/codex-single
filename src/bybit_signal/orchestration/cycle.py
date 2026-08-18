@@ -10,6 +10,8 @@ from uuid import uuid4
 from bybit_signal.analysis.codex import CodexAnalysisError, CodexAnalyzer
 from bybit_signal.config import AppSettings
 from bybit_signal.domain.enums import (
+    CycleMode,
+    CycleStatus,
     Direction,
     PriceType,
     SignalStrength,
@@ -62,18 +64,21 @@ class SignalCycleService:
             started_at = datetime.now(UTC)
             analysis_id = f"urgent_{started_at:%Y%m%dT%H%M%SZ}_{uuid4().hex[:8]}"
             await self._store.initialize()
-            prior = await self._store.latest_conclusion(symbol)
+            prior = await self._store.selected_scheduled_conclusion(symbol)
             bundles, failures = await self._capture_evidence((symbol,))
             bundle = bundles[0] if bundles else None
             assessment: CandidateAssessment | None = None
             context_sha256 = self._fallback_context_hash(analysis_id, (symbol,), failures)
             model_diagnostics: dict[str, object] = {}
-            if bundle is not None:
+            if prior is None:
+                failures["ANALYSIS"] = "symbol is not an active scheduled primary signal"
+            elif bundle is not None:
                 try:
                     model_result = await self._analyzer.analyze(
                         analysis_id=analysis_id,
                         bundles=(bundle,),
                         tracked_symbols=(symbol,),
+                        mode=CycleMode.EMERGENCY,
                     )
                     assessment = model_result.response.assessments[0]
                     context_sha256 = model_result.context_sha256
@@ -85,9 +90,21 @@ class SignalCycleService:
                 except CodexAnalysisError as error:
                     failures["CODEX"] = f"{error.code}: {error}"
             if assessment is None:
-                assessment = self._indeterminate_assessment(
-                    symbol, failures.get(symbol) or failures.get("CODEX")
+                result = self._failed_cycle(
+                    analysis_id=analysis_id,
+                    mode=CycleMode.EMERGENCY,
+                    started_at=started_at,
+                    candidate_symbols=(symbol,),
+                    tracked_symbols=(symbol,) if prior is not None else (),
+                    context_sha256=context_sha256,
+                    diagnostics={
+                        "trigger_reasons": reasons,
+                        "failures": failures,
+                        "model": model_diagnostics,
+                    },
                 )
+                await self._store.save_cycle(result, bundles)
+                return result
             canonical = self._fallback_price(
                 symbol=symbol,
                 bundle=bundle,
@@ -95,7 +112,13 @@ class SignalCycleService:
                 previous=prior,
                 now=started_at,
             )
-            tracking_status, comparison = self._compare(prior, assessment, canonical)
+            if prior is None:
+                raise ValueError("emergency assessment lacks an active scheduled signal")
+            tracking_status, comparison = self._compare_emergency(
+                prior,
+                assessment,
+                canonical,
+            )
             tools = (
                 bundle.tool_assessments
                 if bundle is not None
@@ -120,16 +143,20 @@ class SignalCycleService:
             )
             completed_at = datetime.now(UTC)
             result = AnalysisCycleResult(
+                selection_contract_version=3,
                 analysis_id=analysis_id,
+                mode=CycleMode.EMERGENCY,
+                status=CycleStatus.SUCCESS,
                 started_at=started_at,
                 completed_at=completed_at,
                 candidate_symbols=(symbol,),
                 tracked_symbols=(symbol,) if prior is not None else (),
                 conclusions=(conclusion,),
                 strong_signal_count=int(assessment.strength is SignalStrength.STRONG),
+                selected_symbols=(),
+                selected_signal_count=0,
                 context_sha256=context_sha256,
                 diagnostics={
-                    "mode": "emergency_threshold_review",
                     "trigger_reasons": reasons,
                     "failures": failures,
                     "model": model_diagnostics,
@@ -142,7 +169,7 @@ class SignalCycleService:
         started_at = datetime.now(UTC)
         analysis_id = f"cycle_{started_at:%Y%m%dT%H%M%SZ}_{uuid4().hex[:8]}"
         await self._store.initialize()
-        previous_strong = await self._store.previous_scheduled_strong_conclusions()
+        previous_strong = await self._store.previous_scheduled_selected_conclusions()
         previous = {
             conclusion.assessment.symbol: conclusion for conclusion in previous_strong
         }
@@ -155,12 +182,13 @@ class SignalCycleService:
         assessments: dict[str, CandidateAssessment] = {}
         context_sha256 = self._fallback_context_hash(analysis_id, symbols, failures)
         model_diagnostics: dict[str, object] = {}
-        if bundles:
+        if len(bundles) >= self._settings.analysis.primary_signal_count:
             try:
                 model_result = await self._analyzer.analyze(
                     analysis_id=analysis_id,
                     bundles=bundles,
                     tracked_symbols=tracked_symbols,
+                    mode=CycleMode.SCHEDULED,
                 )
                 assessments = {
                     assessment.symbol: assessment
@@ -175,6 +203,27 @@ class SignalCycleService:
                 }
             except CodexAnalysisError as error:
                 failures["CODEX"] = f"{error.code}: {error}"
+        else:
+            failures["ANALYSIS"] = (
+                "fewer than two validated evidence bundles are available"
+            )
+
+        if not assessments:
+            result = self._failed_cycle(
+                analysis_id=analysis_id,
+                mode=CycleMode.SCHEDULED,
+                started_at=started_at,
+                candidate_symbols=candidate_symbols,
+                tracked_symbols=tracked_symbols,
+                context_sha256=context_sha256,
+                diagnostics={
+                    "scan": scan.model_dump(mode="json"),
+                    "failures": failures,
+                    "model": model_diagnostics,
+                },
+            )
+            await self._store.save_cycle(result, bundles)
+            return result
 
         bundle_by_symbol = {bundle.symbol: bundle for bundle in bundles}
         candidate_price = {candidate.symbol: candidate.last_price for candidate in scan.candidates}
@@ -219,8 +268,19 @@ class SignalCycleService:
             )
 
         completed_at = datetime.now(UTC)
+        selected = sorted(
+            (
+                conclusion
+                for conclusion in conclusions
+                if conclusion.assessment.selection_rank is not None
+            ),
+            key=lambda conclusion: conclusion.assessment.selection_rank or 0,
+        )
         result = AnalysisCycleResult(
+            selection_contract_version=3,
             analysis_id=analysis_id,
+            mode=CycleMode.SCHEDULED,
+            status=CycleStatus.SUCCESS,
             started_at=started_at,
             completed_at=completed_at,
             candidate_symbols=candidate_symbols,
@@ -230,6 +290,10 @@ class SignalCycleService:
                 conclusion.assessment.strength is SignalStrength.STRONG
                 for conclusion in conclusions
             ),
+            selected_symbols=tuple(
+                conclusion.assessment.symbol for conclusion in selected
+            ),
+            selected_signal_count=len(selected),
             context_sha256=context_sha256,
             diagnostics={
                 "scan": scan.model_dump(mode="json"),
@@ -239,6 +303,34 @@ class SignalCycleService:
         )
         await self._store.save_cycle(result, bundles)
         return result
+
+    @staticmethod
+    def _failed_cycle(
+        *,
+        analysis_id: str,
+        mode: CycleMode,
+        started_at: datetime,
+        candidate_symbols: tuple[str, ...],
+        tracked_symbols: tuple[str, ...],
+        context_sha256: str,
+        diagnostics: dict[str, object],
+    ) -> AnalysisCycleResult:
+        return AnalysisCycleResult(
+            selection_contract_version=3,
+            analysis_id=analysis_id,
+            mode=mode,
+            status=CycleStatus.FAILED,
+            started_at=started_at,
+            completed_at=datetime.now(UTC),
+            candidate_symbols=candidate_symbols,
+            tracked_symbols=tracked_symbols,
+            conclusions=(),
+            strong_signal_count=0,
+            selected_symbols=(),
+            selected_signal_count=0,
+            context_sha256=context_sha256,
+            diagnostics=diagnostics,
+        )
 
     async def _capture_evidence(
         self,
@@ -302,43 +394,53 @@ class SignalCycleService:
         if previous is None:
             status = (
                 TrackingStatus.NEW
-                if current.strength is SignalStrength.STRONG
+                if current.selection_rank is not None
                 else TrackingStatus.INDETERMINATE
             )
-            return status, "没有上一轮已记录的强信号可比较。"
+            return status, "没有上一轮已记录的主信号可比较。"
         prior = previous.assessment
-        if prior.strength is not SignalStrength.STRONG:
-            status = (
-                TrackingStatus.NEW
-                if current.strength is SignalStrength.STRONG
-                else TrackingStatus.INDETERMINATE
-            )
-            return status, f"上一轮为 {prior.strength.value}, 本轮为 {current.strength.value}。"
         invalidated = SignalCycleService._prior_invalidated(previous, canonical.value)
-        if current.strength is not SignalStrength.STRONG:
-            status = TrackingStatus.INVALIDATED if invalidated else TrackingStatus.WEAKENED
+        if current.selection_rank is None:
+            if current.strength is SignalStrength.INDETERMINATE:
+                return (
+                    TrackingStatus.INDETERMINATE,
+                    "上一轮主信号本轮数据不可判定, 已停止实时监测。",
+                )
+            status = TrackingStatus.INVALIDATED if invalidated else TrackingStatus.EXITED
             return (
                 status,
-                f"上一轮强信号本轮降为 {current.strength.value}; "
+                "上一轮主信号本轮未进入相对最优两个机会; "
                 + (
                     "价格已触及上一轮失效参考位。"
                     if invalidated
-                    else "尚未确认触及上一轮失效参考位。"
+                    else "尚未触及上一轮失效参考位, 已停止实时监测。"
                 ),
             )
         if current.direction is not prior.direction:
-            return TrackingStatus.INVALIDATED, "本轮强信号方向与上一轮相反, 上一轮方向失效。"
+            return TrackingStatus.REVERSED, "本轮主信号方向与上一轮相反。"
         if current.direction is None:
-            raise ValueError("strong signal is missing its direction")
+            raise ValueError("selected signal is missing its direction")
         prior_target = prior.take_profit.value if prior.take_profit is not None else None
         current_target = current.take_profit.value if current.take_profit is not None else None
         return (
             TrackingStatus.MAINTAINED,
             (
-                f"强信号方向维持 {current.direction.value}; "
+                f"主信号方向维持 {current.direction.value}; "
                 f"目标由 {prior_target} 调整为 {current_target}。"
             ),
         )
+
+    @staticmethod
+    def _compare_emergency(
+        previous: SignalConclusion,
+        current: CandidateAssessment,
+        canonical: CanonicalPrice,
+    ) -> tuple[TrackingStatus, str]:
+        if SignalCycleService._prior_invalidated(previous, canonical.value):
+            return TrackingStatus.INVALIDATED, "价格已触及定时主信号的失效参考位。"
+        if current.direction is not None and current.direction is not previous.assessment.direction:
+            return TrackingStatus.REVERSED, "紧急复核方向已与定时主信号相反。"
+        return TrackingStatus.MAINTAINED, "阈值穿越后复核, 原主信号方向尚未失效。"
 
     @staticmethod
     def _prior_invalidated(previous: SignalConclusion, price: Decimal) -> bool:

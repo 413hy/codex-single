@@ -20,7 +20,7 @@ from bybit_signal.providers.deep_market import DeepTimeframe, NativeMarketSnapsh
 class EvidenceBuilder:
     """Derive neutral, reproducible facts from this project's public data snapshot."""
 
-    _TIMEFRAMES: tuple[DeepTimeframe, ...] = ("5m", "15m", "1h", "4h")
+    _TIMEFRAMES: tuple[DeepTimeframe, ...] = ("5m", "15m", "30m", "1h", "4h")
 
     def build(self, snapshot: NativeMarketSnapshot) -> EvidenceBundle:
         ticker = snapshot.ticker
@@ -65,7 +65,8 @@ class EvidenceBuilder:
                 version="native-v1",
                 reason=(
                     "self-contained public REST collector; last and mark remain separate; "
-                    f"{len(price_action_ids)}/4 completed-candle timeframes qualified"
+                    f"{len(price_action_ids)}/{len(self._TIMEFRAMES)} "
+                    "completed-candle timeframes qualified"
                 ),
                 evidence_ids=core_ids,
             )

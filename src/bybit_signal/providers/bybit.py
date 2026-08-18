@@ -158,13 +158,14 @@ class BybitPublicClient:
         self,
         symbol: str,
         *,
-        timeframe: Literal["1m", "5m", "15m", "1h", "4h"],
+        timeframe: Literal["1m", "5m", "15m", "30m", "1h", "4h"],
         limit: int = 240,
     ) -> tuple[Candle, ...]:
         interval, duration = {
             "1m": ("1", timedelta(minutes=1)),
             "5m": ("5", timedelta(minutes=5)),
             "15m": ("15", timedelta(minutes=15)),
+            "30m": ("30", timedelta(minutes=30)),
             "1h": ("60", timedelta(hours=1)),
             "4h": ("240", timedelta(hours=4)),
         }[timeframe]
@@ -386,7 +387,7 @@ def _ticker(value: object, observed_at: datetime) -> BybitTicker | None:
 
 def _candle(
     symbol: str,
-    timeframe: Literal["1m", "5m", "15m", "1h", "4h"],
+    timeframe: Literal["1m", "5m", "15m", "30m", "1h", "4h"],
     duration: timedelta,
     value: object,
     observed_at: datetime,

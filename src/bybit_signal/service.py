@@ -132,10 +132,11 @@ async def run_once(
     if notify and runtime.telegram is not None:
         await runtime.telegram.deliver_cycle(result)
     logger.info(
-        "analysis cycle completed analysis_id=%s candidates=%s strong=%s notify=%s",
+        "analysis cycle completed analysis_id=%s status=%s candidates=%s selected=%s notify=%s",
         result.analysis_id,
+        result.status.value,
         len(result.candidate_symbols),
-        result.strong_signal_count,
+        result.selected_signal_count,
         notify,
     )
     return result
@@ -183,14 +184,18 @@ async def _scheduled_cycles(
             if runtime.telegram is not None:
                 await runtime.telegram.deliver_cycle(result)
             logger.info(
-                "scheduled analysis cycle completed analysis_id=%s strong=%s",
+                "scheduled analysis cycle completed analysis_id=%s status=%s selected=%s",
                 result.analysis_id,
-                result.strong_signal_count,
+                result.status.value,
+                result.selected_signal_count,
             )
         except Exception as error:
             logger.exception("scheduled analysis cycle failed")
             if runtime.telegram is not None:
-                message = f"分析周期失败, 本轮未生成交易信号。\n错误类型: {type(error).__name__}"
+                message = (
+                    "分析周期发生未捕获异常, 本轮未生成交易信号。\n"
+                    f"错误类型: {type(error).__name__}"
+                )
                 for chat_id in runtime.settings.telegram.allowed_chat_ids:
                     try:
                         await runtime.telegram.send_message(chat_id, message)

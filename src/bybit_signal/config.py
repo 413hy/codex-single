@@ -23,6 +23,7 @@ class AnalysisConfig(StrictModel):
     interval_minutes: Literal[30] = 30
     top_candidates: int = Field(default=5, ge=1, le=10)
     max_strong_signals: int = Field(default=2, ge=1, le=2)
+    primary_signal_count: Literal[2] = 2
     model: str = "gpt-5.6-sol"
     reasoning_effort: Literal["high"] = "high"
     timeout_seconds: int = Field(default=300, ge=60, le=900)

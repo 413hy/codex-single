@@ -117,6 +117,44 @@ async def test_rest_kline_excludes_current_forming_candle_and_sorts_ascending() 
 
 
 @pytest.mark.asyncio
+async def test_rest_kline_maps_completed_30m_candles() -> None:
+    start = datetime(2026, 8, 17, 0, tzinfo=UTC)
+    observed_at = start + timedelta(hours=1, minutes=1)
+    rows = [
+        [
+            str(int((start + timedelta(minutes=30 * index)).timestamp() * 1000)),
+            "1",
+            "1.1",
+            "0.9",
+            "1.05",
+            "100",
+            "105",
+        ]
+        for index in range(3)
+    ]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.params["interval"] == "30"
+        return _response({"symbol": "CYSUSDT", "list": rows}, observed_at)
+
+    http_client = httpx.AsyncClient(
+        base_url="https://api.bybit.com",
+        transport=httpx.MockTransport(handler),
+    )
+    client = BybitPublicClient(client=http_client, max_attempts=1)
+    candles = await client.completed_candles(
+        "CYSUSDT",
+        timeframe="30m",
+        limit=3,
+    )
+    await http_client.aclose()
+
+    assert len(candles) == 2
+    assert candles[-1].timeframe == "30m"
+    assert candles[-1].close_time - candles[-1].open_time == timedelta(minutes=30)
+
+
+@pytest.mark.asyncio
 async def test_ticker_keeps_last_and_mark_prices_separate() -> None:
     now = datetime(2026, 8, 17, 8, tzinfo=UTC)
 

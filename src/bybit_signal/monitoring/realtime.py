@@ -96,7 +96,9 @@ class RealtimeMonitor:
             await asyncio.gather(*self._flush_tasks.values(), return_exceptions=True)
 
     async def _refresh_directives(self) -> None:
-        self._engine.replace_conclusions(await self._store.latest_conclusions())
+        self._engine.replace_conclusions(
+            await self._store.active_monitoring_conclusions()
+        )
 
     def _topics(self) -> list[str]:
         directives = self._engine.directives()
