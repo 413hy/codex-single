@@ -4,6 +4,7 @@ import asyncio
 import json
 import logging
 from collections.abc import Awaitable, Callable, Mapping
+from contextlib import suppress
 from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
 from typing import Any, cast
@@ -63,18 +64,25 @@ class RealtimeMonitor:
                         await websocket.send(
                             json.dumps({"op": "subscribe", "args": topics[index : index + 10]})
                         )
+                    loop = asyncio.get_running_loop()
+                    refresh_deadline = loop.time() + self._config.directive_refresh_seconds
                     while not stop_event.is_set():
-                        try:
+                        message: str | bytes | None = None
+                        with suppress(TimeoutError):
                             message = await asyncio.wait_for(
                                 websocket.recv(),
-                                timeout=self._config.directive_refresh_seconds,
+                                timeout=max(0.001, refresh_deadline - loop.time()),
                             )
-                        except TimeoutError:
+                        if loop.time() >= refresh_deadline:
                             previous_topics = topics
                             await self._refresh_directives()
                             topics = self._topics()
+                            refresh_deadline = (
+                                loop.time() + self._config.directive_refresh_seconds
+                            )
                             if topics != previous_topics:
                                 break
+                        if message is None:
                             continue
                         if isinstance(message, bytes):
                             message = message.decode("utf-8", errors="replace")
@@ -178,7 +186,16 @@ class RealtimeMonitor:
     async def _flush(self, symbol: str) -> None:
         try:
             await asyncio.sleep(self._config.event_coalesce_seconds)
-            events = tuple(self._pending.pop(symbol, []))
+            await self._refresh_directives()
+            active_keys = {
+                (active.analysis_id, active.symbol, active.directive.family_id)
+                for active in self._engine.directives()
+            }
+            events = tuple(
+                event
+                for event in self._pending.pop(symbol, [])
+                if (event.analysis_id, event.symbol, event.family_id) in active_keys
+            )
             if not events:
                 return
             now = datetime.now(UTC)
