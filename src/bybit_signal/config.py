@@ -13,6 +13,7 @@ class StrictModel(BaseModel):
 
 
 class RuntimeConfig(StrictModel):
+    mode: Literal["production", "shadow", "no_notify"] = "production"
     data_root: Path = Path("runtime/data")
     log_root: Path = Path("runtime/logs")
     database_path: Path = Path("runtime/state/signal.db")
@@ -21,14 +22,20 @@ class RuntimeConfig(StrictModel):
 
 class AnalysisConfig(StrictModel):
     interval_minutes: Literal[30] = 30
-    top_candidates: int = Field(default=5, ge=1, le=10)
+    top_candidates: Literal[5] = 5
     max_strong_signals: int = Field(default=2, ge=1, le=2)
     primary_signal_count: Literal[2] = 2
-    model: str = "gpt-5.6-sol"
-    reasoning_effort: Literal["high"] = "high"
+    model: str = "gpt-5.6-terra"
+    reasoning_effort: Literal["medium", "high"] = "medium"
     timeout_seconds: int = Field(default=300, ge=60, le=900)
     max_attempts: int = Field(default=2, ge=1, le=3)
-    max_target_distance_percent: float = Field(default=8.0, gt=0, le=50)
+    monitoring_review_repair_attempts: int = Field(default=3, ge=0, le=3)
+    tool_protocol_enabled: bool = True
+    max_tool_rounds: int = Field(default=2, ge=0, le=3)
+    max_tool_calls: int = Field(default=8, ge=0, le=24)
+    tool_timeout_seconds: int = Field(default=12, ge=2, le=60)
+    strategy_version: str = Field(default="ultrashort-v5", min_length=3, max_length=80)
+    prompt_version: str = Field(default="signal-analysis-v9", min_length=3, max_length=80)
 
 
 class BybitConfig(StrictModel):
@@ -59,15 +66,24 @@ class ScannerConfig(StrictModel):
     maximum_missing_intervals: int = Field(default=2, ge=0, le=12)
     minimum_median_range_percent: float = Field(default=0.15, ge=0, le=100)
     minimum_max_return_percent: float = Field(default=0.35, ge=0, le=100)
+    depth_check_limit: int = Field(default=20, ge=5, le=60)
+    thin_depth_notional_usdt: float = Field(default=5_000, ge=0)
+    choppy_overlap_ratio: float = Field(default=0.72, ge=0, le=1)
+    impact_extension_atr: float = Field(default=2.5, gt=0, le=20)
+    minimum_tradability_score: float = Field(default=18, ge=0, le=100)
 
 
 class MonitoringConfig(StrictModel):
     enabled: bool = True
-    event_coalesce_seconds: int = Field(default=60, ge=5, le=300)
-    symbol_cooldown_seconds: int = Field(default=600, ge=60, le=3600)
     soft_model_wakes_per_hour: int = Field(default=10, ge=1, le=60)
     directive_refresh_seconds: int = Field(default=30, ge=10, le=300)
     reconnect_delay_seconds: int = Field(default=5, ge=1, le=60)
+    maximum_directives_per_symbol: int = Field(default=3, ge=1, le=3)
+    microstructure_confirmation_seconds: int = Field(default=3, ge=1, le=30)
+
+
+class FreshnessConfig(StrictModel):
+    enabled: bool = True
 
 
 class TelegramConfig(StrictModel):
@@ -77,6 +93,7 @@ class TelegramConfig(StrictModel):
     allowed_user_ids: frozenset[int] = frozenset()
     api_base_url: str = "https://api.telegram.org"
     polling_timeout_seconds: int = Field(default=25, ge=1, le=50)
+    delivery_enabled: bool = True
 
     @model_validator(mode="after")
     def validate_enabled(self) -> TelegramConfig:
@@ -105,6 +122,7 @@ class AppSettings(BaseSettings):
     public_sources: PublicSourcesConfig = PublicSourcesConfig()
     scanner: ScannerConfig = ScannerConfig()
     monitoring: MonitoringConfig = MonitoringConfig()
+    freshness: FreshnessConfig = FreshnessConfig()
     telegram: TelegramConfig = TelegramConfig()
 
     @classmethod

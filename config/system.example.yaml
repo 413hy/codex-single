@@ -2,6 +2,7 @@ schema_version: 1
 timezone: Asia/Shanghai
 
 runtime:
+  mode: production
   data_root: runtime/data
   log_root: runtime/logs
   database_path: runtime/state/signal.db
@@ -12,11 +13,17 @@ analysis:
   top_candidates: 5
   max_strong_signals: 2
   primary_signal_count: 2
-  model: gpt-5.6-sol
-  reasoning_effort: high
+  model: gpt-5.6-terra
+  reasoning_effort: medium
   timeout_seconds: 300
   max_attempts: 2
-  max_target_distance_percent: 8
+  monitoring_review_repair_attempts: 3
+  tool_protocol_enabled: true
+  max_tool_rounds: 2
+  max_tool_calls: 8
+  tool_timeout_seconds: 12
+  strategy_version: ultrashort-v5
+  prompt_version: signal-analysis-v9
 
 bybit:
   rest_base_url: https://api.bybit.com
@@ -38,14 +45,22 @@ scanner:
   maximum_missing_intervals: 2
   minimum_median_range_percent: 0.15
   minimum_max_return_percent: 0.35
+  depth_check_limit: 20
+  thin_depth_notional_usdt: 5000
+  choppy_overlap_ratio: 0.72
+  impact_extension_atr: 2.5
+  minimum_tradability_score: 18
 
 monitoring:
   enabled: true
-  event_coalesce_seconds: 60
-  symbol_cooldown_seconds: 600
   soft_model_wakes_per_hour: 10
   directive_refresh_seconds: 30
   reconnect_delay_seconds: 5
+  maximum_directives_per_symbol: 3
+  microstructure_confirmation_seconds: 3
+
+freshness:
+  enabled: true
 
 telegram:
   enabled: false
@@ -53,3 +68,4 @@ telegram:
   allowed_user_ids: []
   api_base_url: https://api.telegram.org
   polling_timeout_seconds: 25
+  delivery_enabled: true

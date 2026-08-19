@@ -1,5 +1,7 @@
 # 信号质量与山寨币流动性优化设计
 
+> 历史专题设计。候选流动性字段仍可参考，但其中任何 WATCH 降级、方向硬门槛或旧阈值语义均已废止；当前权威设计是 [`2026-08-19-model-centered-signal-system-reliability-design.md`](2026-08-19-model-centered-signal-system-reliability-design.md)。
+
 日期：2026-08-18  
 状态：待用户复核
 

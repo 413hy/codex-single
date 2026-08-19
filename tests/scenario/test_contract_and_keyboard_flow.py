@@ -130,6 +130,7 @@ def test_cys_strong_signal_contract_reaches_notification_keyboards() -> None:
     assert main_reply_keyboard()["is_persistent"] is False
     callback = details_keyboard(conclusion.analysis_id, conclusion.assessment.symbol)
     assert callback["inline_keyboard"][0][0]["text"] == "查看分析详情"
-    assert back_to_cycle_keyboard(conclusion.analysis_id)["inline_keyboard"][0][0][
-        "text"
-    ] == "⬅️ 返回本轮信号"
+    assert (
+        back_to_cycle_keyboard(conclusion.analysis_id)["inline_keyboard"][0][0]["text"]
+        == "⬅️ 返回本轮信号"
+    )

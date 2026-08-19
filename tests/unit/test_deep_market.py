@@ -8,7 +8,7 @@ import pytest
 
 from bybit_signal.domain.models import Candle
 from bybit_signal.providers.bybit import BybitTicker
-from bybit_signal.providers.deep_market import BybitDeepMarketCollector
+from bybit_signal.providers.deep_market import BybitDeepMarketCollector, DeepTimeframe
 
 
 class FakePublicClient:
@@ -34,10 +34,11 @@ class FakePublicClient:
         }
 
     async def completed_candles(
-        self, symbol: str, *, timeframe: str, limit: int
+        self, symbol: str, *, timeframe: DeepTimeframe, limit: int
     ) -> tuple[Candle, ...]:
         self.timeframes.append(timeframe)
         duration = {
+            "1m": timedelta(minutes=1),
             "5m": timedelta(minutes=5),
             "15m": timedelta(minutes=15),
             "30m": timedelta(minutes=30),
@@ -76,18 +77,48 @@ class FakePublicClient:
     ) -> tuple[Any, ...]:
         return ()
 
+    async def long_short_ratio(self, symbol: str, *, period: str, limit: int) -> tuple[Any, ...]:
+        return ()
+
+
+class BoundaryCrossingClient(FakePublicClient):
+    async def completed_candles(
+        self, symbol: str, *, timeframe: DeepTimeframe, limit: int
+    ) -> tuple[Candle, ...]:
+        candles = await super().completed_candles(symbol, timeframe=timeframe, limit=limit)
+        duration = candles[-1].close_time - candles[-1].open_time
+        last = candles[-1]
+        post_cutoff = last.model_copy(
+            update={
+                "open_time": last.close_time,
+                "close_time": last.close_time + duration,
+            }
+        )
+        return (*candles, post_cutoff)
+
 
 @pytest.mark.asyncio
 async def test_native_collector_fetches_all_required_timeframes_and_degrades_optional() -> None:
     client = FakePublicClient()
     snapshot = await BybitDeepMarketCollector(client).collect("CYSUSDT")  # type: ignore[arg-type]
 
-    assert sorted(client.timeframes) == ["15m", "1h", "30m", "4h", "5m"]
-    assert set(snapshot.candles) == {"5m", "15m", "30m", "1h", "4h"}
+    assert sorted(client.timeframes) == ["15m", "1h", "1m", "30m", "4h", "5m"]
+    assert set(snapshot.candles) == {"1m", "5m", "15m", "30m", "1h", "4h"}
     assert snapshot.orderbook is None
     assert "orderbook" in snapshot.collection_failures
+    assert all(candle.completed for candles in snapshot.candles.values() for candle in candles)
+
+
+@pytest.mark.asyncio
+async def test_native_collector_trims_candle_completed_after_snapshot_cutoff() -> None:
+    client = BoundaryCrossingClient()
+
+    snapshot = await BybitDeepMarketCollector(client).collect(  # type: ignore[arg-type]
+        "CYSUSDT"
+    )
+
+    assert set(snapshot.candles) == {"1m", "5m", "15m", "30m", "1h", "4h"}
     assert all(
-        candle.completed
+        candles[-1].close_time <= snapshot.collection_started_at
         for candles in snapshot.candles.values()
-        for candle in candles
     )

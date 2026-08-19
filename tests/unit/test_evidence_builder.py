@@ -14,10 +14,12 @@ from bybit_signal.providers.bybit import (
     BybitTicker,
 )
 from bybit_signal.providers.cross_exchange import ReferenceTicker
-from bybit_signal.providers.deep_market import NativeMarketSnapshot
+from bybit_signal.providers.deep_market import DeepTimeframe, NativeMarketSnapshot
 
 
-def _candles(symbol: str, timeframe: str, duration: timedelta) -> tuple[Candle, ...]:
+def _candles(
+    symbol: str, timeframe: DeepTimeframe, duration: timedelta
+) -> tuple[Candle, ...]:
     start = datetime(2026, 7, 1, tzinfo=UTC)
     result = []
     for index in range(240):
@@ -69,11 +71,17 @@ def _snapshot(*, partial_trades: bool = False) -> NativeMarketSnapshot:
         update_id=10,
         sequence=11,
         bids=tuple(
-            BybitBookLevel(price=Decimal("123.89") - i / Decimal("100"), size=100 + i)
+            BybitBookLevel(
+                price=Decimal("123.89") - i / Decimal("100"),
+                size=Decimal(100 + i),
+            )
             for i in range(20)
         ),
         asks=tuple(
-            BybitBookLevel(price=Decimal("123.91") + i / Decimal("100"), size=90 + i)
+            BybitBookLevel(
+                price=Decimal("123.91") + i / Decimal("100"),
+                size=Decimal(90 + i),
+            )
             for i in range(20)
         ),
     )
@@ -142,29 +150,33 @@ def test_builder_preserves_prices_and_derives_completed_candle_features() -> Non
     assert float(price_action.values["recent_30m_turnover_usdt"]) > 0
     assert float(price_action.values["drawdown_from_rolling_high_atr"]) >= 0
     assert float(price_action.values["rebound_from_rolling_low_atr"]) >= 0
-    thirty = next(
-        item for item in bundle.evidence_items if item.evidence_id == "CYSUSDT.PA.30M"
-    )
+    thirty = next(item for item in bundle.evidence_items if item.evidence_id == "CYSUSDT.PA.30M")
     assert thirty.values["completed_candles"] == 240
-    core = next(
-        tool for tool in bundle.tool_assessments if tool.tool == "BYBIT_NATIVE_MARKET_DATA"
-    )
+    core = next(tool for tool in bundle.tool_assessments if tool.tool == "BYBIT_NATIVE_MARKET_DATA")
     assert core.status is ToolStatus.AVAILABLE
     reference = next(
-        item
-        for item in bundle.evidence_items
-        if item.evidence_id == "CYSUSDT.REFERENCE.BINANCE"
+        item for item in bundle.evidence_items if item.evidence_id == "CYSUSDT.REFERENCE.BINANCE"
     )
     assert reference.values["last_divergence_vs_bybit_bps"] is not None
+    raw = next(item for item in bundle.evidence_items if item.evidence_id == "CYSUSDT.RAW.5M")
+    assert raw.values["columns"] == [
+        "open_time",
+        "open",
+        "high",
+        "low",
+        "close",
+        "volume",
+        "turnover",
+    ]
+    assert len(raw.values["rows"]) == 24
+    assert len(raw.values["rows"][0]) == 7
 
 
 def test_builder_fail_closes_incomplete_public_trade_window() -> None:
     bundle = EvidenceBuilder().build(_snapshot(partial_trades=True))
 
     trade_window = next(
-        item
-        for item in bundle.evidence_items
-        if item.evidence_id == "CYSUSDT.MICRO.TRADES.5M"
+        item for item in bundle.evidence_items if item.evidence_id == "CYSUSDT.MICRO.TRADES.5M"
     )
     assert trade_window.values["qualified"] is False
     assert trade_window.values["normalized_delta"] is None

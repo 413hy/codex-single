@@ -48,6 +48,11 @@ async def test_read_only_mcp_stdio_lists_and_calls_health_tool(tmp_path: Path) -
         "get_market_snapshot",
         "list_monitoring_directives",
         "get_signal_history",
+        "get_current_top_candidates",
+        "get_market_context",
+        "get_analysis_audit",
+        "get_threshold_events",
+        "get_signal_outcomes",
     }
     assert not any(
         forbidden in name

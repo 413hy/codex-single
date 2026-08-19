@@ -7,6 +7,10 @@ import typer
 
 from bybit_signal import __version__
 from bybit_signal.config import AppSettings
+from bybit_signal.evaluation.model_benchmark import (
+    DEFAULT_CASES,
+    benchmark_models_sequentially,
+)
 from bybit_signal.operations import ServiceInstanceLock, configure_logging
 from bybit_signal.providers.bybit import BybitPublicClient
 from bybit_signal.providers.cross_exchange import CrossExchangePublicClient
@@ -97,15 +101,12 @@ def market_capture(
             "last_price": str(snapshot.ticker.last_price),
             "mark_price": str(snapshot.ticker.mark_price),
             "completed_candles": {
-                timeframe: len(candles)
-                for timeframe, candles in snapshot.candles.items()
+                timeframe: len(candles) for timeframe, candles in snapshot.candles.items()
             },
             "orderbook_available": snapshot.orderbook is not None,
             "recent_trade_count": len(snapshot.recent_trades),
             "open_interest_points": len(snapshot.open_interest),
-            "reference_exchanges": [
-                ticker.exchange for ticker in snapshot.reference_tickers
-            ],
+            "reference_exchanges": [ticker.exchange for ticker in snapshot.reference_tickers],
             "collection_failures": snapshot.collection_failures,
             "sha256": snapshot.sha256,
         }
@@ -202,3 +203,62 @@ def serve_command(
 
     with ServiceInstanceLock(database_path.parent / "service.lock"):
         asyncio.run(run())
+
+
+@app.command("benchmark-models")
+def benchmark_models(
+    config: Annotated[
+        Path,
+        typer.Option("--config", exists=True, dir_okay=False, readable=True),
+    ],
+    case_timeout_seconds: Annotated[
+        int,
+        typer.Option("--case-timeout-seconds", min=300, max=1800),
+    ] = 900,
+    rounds: Annotated[int, typer.Option("--rounds", min=1, max=3)] = 2,
+    case: Annotated[
+        str,
+        typer.Option(
+            "--case", help="Optional single case: sol-medium/sol-high/terra-medium/terra-high"
+        ),
+    ] = "",
+) -> None:
+    """Sequentially benchmark sol/terra medium/high through isolated full cycles."""
+
+    settings = AppSettings.from_yaml(config)
+    selected_cases = DEFAULT_CASES
+    if case:
+        selected_cases = tuple(item for item in DEFAULT_CASES if item[0] == case)
+        if not selected_cases:
+            raise typer.BadParameter(f"unknown benchmark case: {case}")
+    report = asyncio.run(
+        benchmark_models_sequentially(
+            settings,
+            workspace=Path.cwd(),
+            cases=selected_cases,
+            case_timeout_seconds=case_timeout_seconds,
+            rounds=rounds,
+        )
+    )
+    raw_results = report.get("results")
+    results = (
+        tuple(result for result in raw_results if isinstance(result, dict))
+        if isinstance(raw_results, list)
+        else ()
+    )
+    summary = {
+        "root": report["root"],
+        "execution": report["execution"],
+        "results": [
+            {
+                "case": result["case"],
+                "status": result["status"],
+                "wall_time_ms": result["wall_time_ms"],
+                "candidate_symbols": result.get("candidate_symbols", []),
+                "selected_symbols": result.get("selected_symbols", []),
+                "error": result.get("error"),
+            }
+            for result in results
+        ],
+    }
+    typer.echo(json.dumps(summary, ensure_ascii=False, indent=2))

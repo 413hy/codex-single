@@ -48,9 +48,7 @@ class CrossExchangePublicClient:
     async def close(self) -> None:
         await asyncio.gather(self._binance.aclose(), self._okx.aclose())
 
-    async def tickers(
-        self, symbol: str
-    ) -> tuple[tuple[ReferenceTicker, ...], dict[str, str]]:
+    async def tickers(self, symbol: str) -> tuple[tuple[ReferenceTicker, ...], dict[str, str]]:
         results = await asyncio.gather(
             self._capture("BINANCE", self._binance_ticker(symbol)),
             self._capture("OKX", self._okx_ticker(symbol)),
@@ -75,21 +73,33 @@ class CrossExchangePublicClient:
             return source, None, f"{type(error).__name__}: {error}"
 
     async def _binance_ticker(self, symbol: str) -> ReferenceTicker:
-        document = await self._get_json(
-            self._binance,
-            "/fapi/v1/ticker/24hr",
-            {"symbol": symbol},
+        document, book = await asyncio.gather(
+            self._get_json(
+                self._binance,
+                "/fapi/v1/ticker/24hr",
+                {"symbol": symbol},
+            ),
+            self._get_json(
+                self._binance,
+                "/fapi/v1/ticker/bookTicker",
+                {"symbol": symbol},
+            ),
         )
         if not isinstance(document, dict) or document.get("symbol") != symbol:
             raise ValueError("Binance ticker identity does not match")
+        if not isinstance(book, dict) or book.get("symbol") != symbol:
+            raise ValueError("Binance book ticker identity does not match")
         return ReferenceTicker(
             symbol=symbol,
             exchange="BINANCE",
             instrument=symbol,
             last_price=_decimal(document.get("lastPrice"), "Binance last"),
-            bid_price=_decimal(document.get("bidPrice"), "Binance bid"),
-            ask_price=_decimal(document.get("askPrice"), "Binance ask"),
-            observed_at=_timestamp(document.get("closeTime"), "Binance close time"),
+            bid_price=_decimal(book.get("bidPrice"), "Binance bid"),
+            ask_price=_decimal(book.get("askPrice"), "Binance ask"),
+            observed_at=_timestamp(
+                book.get("time", document.get("closeTime")),
+                "Binance book time",
+            ),
         )
 
     async def _okx_ticker(self, symbol: str) -> ReferenceTicker:

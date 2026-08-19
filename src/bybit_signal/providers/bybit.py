@@ -183,16 +183,47 @@ class BybitPublicClient:
         rows = result.get("list")
         if not isinstance(rows, list):
             raise BybitPublicError("Bybit kline list is invalid")
-        candles = [
-            _candle(symbol, timeframe, duration, row, observed_at) for row in rows
-        ]
+        candles = [_candle(symbol, timeframe, duration, row, observed_at) for row in rows]
         completed = [candle for candle in candles if candle.completed]
         completed.sort(key=lambda candle: candle.open_time)
         return tuple(completed)
 
-    async def completed_5m_candles(
-        self, symbol: str, *, limit: int = 72
+    async def recent_candles(
+        self,
+        symbol: str,
+        *,
+        timeframe: Literal["1m", "5m", "15m", "30m", "1h", "4h"],
+        limit: int = 240,
     ) -> tuple[Candle, ...]:
+        """Return completed and forming candles with explicit completion state."""
+
+        interval, duration = {
+            "1m": ("1", timedelta(minutes=1)),
+            "5m": ("5", timedelta(minutes=5)),
+            "15m": ("15", timedelta(minutes=15)),
+            "30m": ("30", timedelta(minutes=30)),
+            "1h": ("60", timedelta(hours=1)),
+            "4h": ("240", timedelta(hours=4)),
+        }[timeframe]
+        result, observed_at = await self._get_result(
+            "/v5/market/kline",
+            {
+                "category": "linear",
+                "symbol": symbol,
+                "interval": interval,
+                "limit": limit,
+            },
+        )
+        if result.get("symbol") != symbol:
+            raise BybitPublicError("Bybit kline symbol does not match request")
+        rows = result.get("list")
+        if not isinstance(rows, list):
+            raise BybitPublicError("Bybit kline list is invalid")
+        candles = [_candle(symbol, timeframe, duration, row, observed_at) for row in rows]
+        candles.sort(key=lambda candle: candle.open_time)
+        return tuple(candles)
+
+    async def completed_5m_candles(self, symbol: str, *, limit: int = 72) -> tuple[Candle, ...]:
         return await self.completed_candles(
             symbol,
             timeframe="5m",
@@ -256,6 +287,29 @@ class BybitPublicClient:
         points.sort(key=lambda point: point.timestamp)
         return tuple(points)
 
+    async def long_short_ratio(
+        self,
+        symbol: str,
+        *,
+        period: Literal["5min", "15min", "30min", "1h", "4h"] = "5min",
+        limit: int = 48,
+    ) -> tuple[BybitLongShortRatio, ...]:
+        result, _ = await self._get_result(
+            "/v5/market/account-ratio",
+            {
+                "category": "linear",
+                "symbol": symbol,
+                "period": period,
+                "limit": limit,
+            },
+        )
+        rows = result.get("list")
+        if not isinstance(rows, list):
+            raise BybitPublicError("Bybit long-short ratio list is invalid")
+        points = [_long_short_ratio(symbol, row) for row in rows]
+        points.sort(key=lambda point: point.timestamp)
+        return tuple(points)
+
 
 class BybitBookLevel(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
@@ -302,6 +356,19 @@ class BybitOpenInterest(BaseModel):
     open_interest: Decimal = Field(ge=0)
 
 
+class BybitLongShortRatio(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    symbol: Symbol
+    timestamp: datetime
+    buy_ratio: Decimal = Field(ge=0, le=1)
+    sell_ratio: Decimal = Field(ge=0, le=1)
+
+    @property
+    def long_short_ratio(self) -> Decimal | None:
+        return self.buy_ratio / self.sell_ratio if self.sell_ratio > 0 else None
+
+
 def _instrument(value: object) -> BybitInstrument | None:
     if not isinstance(value, dict):
         return None
@@ -342,9 +409,7 @@ def _ticker(value: object, observed_at: datetime) -> BybitTicker | None:
         index_raw = value.get("indexPrice")
         index = _decimal(index_raw, "index price") if index_raw not in {None, ""} else None
         funding_raw = value.get("fundingRate")
-        funding = (
-            _decimal(funding_raw, "funding rate") if funding_raw not in {None, ""} else None
-        )
+        funding = _decimal(funding_raw, "funding rate") if funding_raw not in {None, ""} else None
         open_interest_raw = value.get("openInterest")
         open_interest = (
             _decimal(open_interest_raw, "open interest")
@@ -452,6 +517,17 @@ def _open_interest(symbol: str, value: object) -> BybitOpenInterest:
         symbol=symbol,
         timestamp=_timestamp(value.get("timestamp"), "open-interest time"),
         open_interest=_decimal(value.get("openInterest"), "open interest"),
+    )
+
+
+def _long_short_ratio(symbol: str, value: object) -> BybitLongShortRatio:
+    if not isinstance(value, dict):
+        raise BybitPublicError("Bybit long-short ratio row is invalid")
+    return BybitLongShortRatio(
+        symbol=symbol,
+        timestamp=_timestamp(value.get("timestamp"), "long-short ratio time"),
+        buy_ratio=_decimal(value.get("buyRatio"), "buy ratio"),
+        sell_ratio=_decimal(value.get("sellRatio"), "sell ratio"),
     )
 
 

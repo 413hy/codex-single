@@ -1,4 +1,4 @@
-# Python 3.13 / Windows x64 runtime lock generated 2026-08-17.
+# Python 3.13 / Windows x64 runtime constraint set generated 2026-08-17.
 # Install the local project with: python -m pip install -c requirements-runtime.lock.txt .
 aiosqlite==0.22.1
 annotated-doc==0.0.5

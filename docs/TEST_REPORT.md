@@ -1,201 +1,193 @@
 # 全量与灰盒测试报告
 
-测试日期：2026-08-17～2026-08-18（Asia/Shanghai）
-环境：Windows 10、Python 3.13、真实公网公开市场、真实 Telegram Bot、真实 Codex CLI
+测试时间：2026-08-19（Asia/Shanghai）
+环境：Windows 10、Python 3.13、真实公开市场、真实 Codex CLI；灰盒阶段禁用 Telegram 和生产实时监测。
 
-说明：第 2～6 节保留重构前的灰盒基线和问题修复轨迹；第 7～8 节记录当前 `contract_version=3` 的最终行为，最终验收以第 7～9 节为准。
+## 1. 当前结论
 
-## 1. 自动化与静态检查
+当前源码满足已确认的模型中心流程：Top5、Top2 方向通知、后置独立阈值复核、整组一次性触发、单币紧急重采与复核、新阈值覆盖、`:00/:30` 任务开始边界冻结、定时/紧急互不等待、版本 CAS、结构化失败与精准重试均有自动化或真实灰盒证据。
+
+本报告不宣称策略已经证明准确。最新灰盒结论之后尚无新的完整未来行情，方向与实际数据的偏差按用户安排在有新数据后单独结算。
+
+2026-08-18 的旧测试报告、目标驱动 freshness、宿主 ATR/噪声距离调参和微观指标独立唤醒只保留在 Git 历史，不是当前验收口径。
+
+## 2. 静态与全量自动化
 
 | 检查 | 结果 |
 |---|---|
+| `git diff --check` | 通过 |
 | Ruff 全仓 | 通过 |
-| mypy strict（31 个源码文件） | 通过，0 issue |
-| pytest 全量 | 通过，62 项 |
-| pip check | 通过，无破损依赖 |
-| MCP stdio initialize/list/call | 通过 |
-| PowerShell 三个服务脚本语法解析 | 通过 |
-| git diff whitespace | 通过 |
-| Bot Token 提交扫描 | 通过，`.env` 之外无真实 Token |
-| 私有交易能力扫描 | 通过，生产源码无账户/仓位/订单/杠杆端点 |
-| 键盘安全扫描 | 通过，无 ReplyKeyboardRemove 或 `remove_keyboard` |
+| mypy strict（`src` + `tests`，61 个 Python 文件） | 通过，0 issue |
+| pytest 全量 | 通过，159 项 |
+| 项目 Skill 验证 | 通过 |
+| ReplyKeyboard 合同 | 通过：resize=true、persistent=false、one_time=false |
+| 键盘移除扫描 | 通过：无 ReplyKeyboardRemove / remove_keyboard |
+| 私有交易能力 | 通过：MCP 无账户、余额、仓位、杠杆、订单工具 |
 
-自动化覆盖包括：配置、领域 Schema、完成柱、Bybit provider、扫描器、深采、证据构建、Codex 重试/价位几何/监测约束、SQLite、上一轮信号比较、Reply/Inline 键盘、Telegram 白名单/幂等/回调、阈值 crossing/hysteresis/过期/限频、只读 MCP、单实例锁和日志脱敏。
+覆盖重点：
 
-## 2. 真实公开数据采集
+- 定时 assessments 覆盖全部 Top5，恰好 rank 1/2；非 Top2 无四窗口和监测规则；
+- 形成中 15m/30m/1h 与下一根完整 15m 窗口；
+- 大致止盈仅展示，不进入 freshness、监测或失效；
+- 主信号成功不被监测复核/激活失败清空；
+- completed price primary + 可选微观 conjunction；微观单独满足不触发；
+- 连续完成柱计数与自然语言一致，重复推送不重复累计；
+- 任一 family 首次触发后整组 sibling 永久暂停，SQLite 重启后仍暂停；
+- 触发先落库再通知/模型调用，旧阈值不会因回调失败复活；
+- 阈值事件保存 primary、连续观察与全部 confirmations，Telegram/紧急原因可完整还原执行条件；
+- 模型复核 `REJECTED` 作为“本轮无合格阈值”的正常结果，一次结束且不产生失败通知；
+- 模型复核与激活之间的普通完成柱变化只机械重基线、threshold 不变；只有最新同指标基线已经越过阈值、规则在激活前即不可执行时，才重采/重审失败币最多 3 次，耗尽后建立最终失败；
+- 最新定时与最新紧急版本 CAS，迟到 review 不覆盖新版本；
+- Telegram callback 先 ACK、64-byte 边界、详情返回；
+- 失败事件包含步骤、前置完成、原因、因果、影响、解决方式；
+- 重试事务认领、重复点击、后台运行、重启 INTERRUPTED、旧版本 SUPERSEDED；
+- 异常与重试错误中的 Telegram credential 脱敏。
 
-命令：`market-capture --symbol CYSUSDT`
+## 3. 真实全市场与深采
 
-结果：
+真实扫描结果：
 
-- Bybit last `0.4753`、mark `0.4762`，口径分离；
-- 完成 5m/15m/1h/4h 各 239 根；
-- order book 可用；
-- recent trades 1000 条；
-- OI history 48 点；
-- 快照 SHA-256 生成成功；
-- CYS 在 Binance/OKX 无对应合格 ticker，分别写入可选来源 failure；Bybit 主证据不受影响。
+- Bybit 线性合约 universe：717；
+- ticker 硬门槛后：193；
+- 完成 5m 深筛分析：39；
+- Top5：`UNITREEUSDT / GPSUSDT / BTWUSDT / ACEUSDT / JCTUSDT`（后续轮随市场变化出现 HANA）；
+- Top5 24h 成交额约 666 万–1.23 亿 USDT；
+- Top5 最近完成 30m 成交额约 9 万–770 万 USDT；
+- 扫描与 Bybit 主采无失败。
 
-这验证了部分跨所缺失按字段降级、不会填零或把其他交易所价格平均为 Bybit 参考价。
+结论：成交额对准入具有真实约束力，但 150 万/5 万 USDT 门槛没有高到把山寨币机会大量排除，因此保持不变。薄盘口仍作为质量标签和置信度输入，不直接伪造方向。
 
-## 3. 完整 no-notify 灰盒
+Top5 深采验证：
 
-分析 ID：`cycle_20260817T160848Z_fe7ffd08`
+- 1m/5m/15m/30m/1h 各 239 根完成柱；4h 至少 97 根；
+- 50 档盘口、最多 1000 条近期成交、48 点 OI、48 点多空比可用；
+- 市场背景与 Binance 旁证可用；OKX 对未支持币返回可选来源失败；
+- 所有缺失按状态降级，没有填零或覆盖 Bybit 主数据。
 
-| 指标 | 结果 |
-|---|---|
-| Bybit 动态 universe | 713 |
-| ticker 初筛合格 | 455 |
-| 完成 5m 深筛 | 60 |
-| Top 5 | AIOUSDT、FHEUSDT、GUNUSDT、ACEUSDT、HFTUSDT |
-| 上轮强信号追踪 | GPSUSDT |
-| 模型 | gpt-5.6-sol / high |
-| 模型调用 | 单批 1 次通过 |
-| 延迟 | 148300 ms |
-| 强信号 | HFTUSDT LONG_BIAS |
-| 上轮信号变化 | GPSUSDT 降为 WATCH，TrackingStatus=INVALIDATED |
+## 4. 真实默认模型定时灰盒
 
-GPS 不在 Top 5 仍被重新深采和完整分析，满足“上轮出现信号、本轮不再强也必须提醒”的核心场景。所有监测指令均为当前实现支持的指标，有效期 1800 秒；forming 1h 精确对应请求小时。
+默认模型：`gpt-5.6-terra / medium`，单次 300 秒硬超时，最多 2 次输出尝试。
 
-## 4. 正式 24/7 服务与真实通知
+### 4.1 修复发现
 
-启动方式：`scripts/start-service.ps1`，隐藏 Windows 进程，单实例文件锁。
+第一份新合同灰盒中，模型第二次才返回完整五币；随后旧 freshness 实现错误地要求正式失效也必须出现在 monitoring directives，导致方向分析被监测合同反向绑死。已改为 freshness 直接读取 `assessment.invalidation` 的完成柱条件。
 
-正式分析 ID：`cycle_20260817T162038Z_1a58d9e6`
+第二份灰盒成功，但发现模型自然语言写“连续两根”而结构字段仍按单根执行。已增加 `required_consecutive_observations`（1–3）、引擎去重计数和模型/宿主一致性检查。
 
-| 项目 | 结果 |
-|---|---|
-| 服务启动与立即分析 | 通过 |
-| Telegram getMe/preflight | 通过，Bot `@yhetest_bot` |
-| ReplyKeyboard 启动消息 | 已真实发送 |
-| Top 5 | FHEUSDT、AIOUSDT、TUTUSDT、GUNUSDT、ACEUSDT |
-| 追踪币 | HFTUSDT |
-| 模型调用 | 单批 1 次通过，167218 ms |
-| 强信号 | FHEUSDT LONG_BIAS、TUTUSDT LONG_BIAS |
-| 追踪变化 | HFTUSDT 降为 WATCH，TrackingStatus=INVALIDATED |
-| Telegram 核心结论 + Inline 详情按钮 | 已真实发送 |
-| SQLite delivery 幂等记录 | 1 条，cycle/chat/kind 唯一 |
-| 每个币动态阈值 | 2 条，均通过宿主校验 |
-| 服务进程 | 启动后仍存活 |
-| 应用日志 | 无真实 Bot Token |
+### 4.2 最终独立样本
 
-Inline callback 的授权、64-byte 边界、详情查询和答复由自动化场景测试覆盖；实际按钮已经随正式消息发送，最终视觉点击由 Telegram 客户端呈现。
+数据库：`runtime/graybox/20260819T041642Z/state/signal.db`
+周期：`cycle_20260819T041649Z_7a61e315`
 
-### 真实半点续跑
+- 一次模型输出即通过；
+- 五币均有独立 assessment；
+- Top2 为 `GPSUSDT` 偏空（HIGH）与 `UNITREEUSDT` 偏空（MEDIUM）；
+- 两条 freshness 均 PASS；
+- 四项 K 线窗口齐全，大致止盈仅展示；
+- 阈值独立复核两币均为 REWRITTEN，最终 READY；
+- UNITREE：完成 5m 收盘重新站上 126.39，距同指标基线约 1.88%；
+- GPS：完成 5m 收盘重新站上 0.01307，距同指标基线约 6.76%；
+- 两条均是偏空结论的反向完成结构，没有 target family、同向加速或微观单独唤醒；复核说明普通下一两根 1m 波动不足以满足，同时仍早于更大结构完全反转。
 
-服务随后在上海时间 00:30:00 自动启动下一轮，而不是按首次启动时间简单加 30 分钟。分析 `cycle_20260817T163000Z_f0ab7d6e` 一次通过并再次投递：
+模型方向逻辑审计：GPS 与 UNITREE 都引用了最新完成 15m/5m/1m 的低点/低收盘推进，并把超卖、盘口和成交差作为限制置信度的证据，而非单独定向。没有复制过滤器得分，也没有因高周期背景机械覆盖近端完成结构。该逻辑符合当前 Prompt/Skill；实际方向误差待未来数据结算。
 
-- 上轮强信号 FHEUSDT、TUTUSDT 均被强制追踪；
-- FHEUSDT 降为 WATCH / WEAKENED，仍出现在通知；
-- TUTUSDT 保持 STRONG / MAINTAINED；
-- HFTUSDT 成为新的 STRONG；
-- SQLite 对该 cycle 仍只有 1 条 Telegram delivery；
-- 轮次完成后服务继续存活，日志再次确认无 Token。
+## 5. 真实紧急复核灰盒
 
-该续跑同时验证了墙钟整点/半点调度、跨轮追踪、转弱提醒、信号更新和长期服务不中断。
+来源周期：`cycle_20260819T041649Z_7a61e315`
+紧急周期：`urgent_20260819T041940Z_3021cb26`
+触发币：`GPSUSDT`
 
-## 5. 灰盒故障与修复
+模拟已原子消费旧 GPS 一次性规则后执行完整后半链路：
 
-首次正式启动时发现根日志 INFO 会让 `httpx` 把 Telegram 请求 URL 写入本地 `runtime/logs/service.log`，URL 含 Bot Token。该日志受 `.gitignore` 保护且未进入 Git/SQLite/通知，但仍属于本地敏感信息风险。
+1. 重新采集 GPS 与全市场背景；
+2. 默认模型独立复核，返回 `SHORT_BIAS / MAINTAINED`；
+3. 参考价更新为 0.012082，形成中 15m/30m/1h 与下一根 15m 齐全；
+4. 模型保留正式 15m 收复 0.01307 的方向失效结构；
+5. 独立阈值复核把新规则改写为“完成 5m 收盘收复 0.012668”；
+6. 激活同指标基线为 0.01214，阈值距离约 4.35%、约 3.64 个 1m ATR；
+7. 复核明确说明该值对应刚失守的 5m 区域，普通一两根 1m 不会满足，又早于 15m 正式失效；
+8. 新规则 READY 并以紧急 analysis ID 提交，旧 scheduled GPS 规则不再作为活跃版本。
 
-处理：
+这验证了 crossing 只是重新分析请求；模型可以维持原方向，并重新决定后续阈值。存在合格结构时提交全新规则；没有合格结构时提交正常零规则版本。
 
-1. 受控停止唯一服务实例；
-2. 为文件日志加入 Telegram Token 正则脱敏 filter；
-3. 把 `httpx`/`httpcore` 日志降为 WARNING；
-4. 添加日志脱敏回归测试；
-5. 精确删除唯一含 Token 的旧 `service.log`，不删除数据库；
-6. 重启服务并再次扫描 runtime logs，确认无 Token 或 `/bot<id>:...`。
+## 6. 失败与 Telegram 灰盒
 
-修复后专项 Ruff、mypy 和 16 项日志/Telegram/键盘/安全测试通过，正式轮次和投递再次成功。
+自动化场景验证：
 
-## 6. 2026-08-18 信号质量与流动性优化复测
+- 模型超时、Schema/合同错误、扫描/采集错误、freshness 错误分别映射到真实步骤；
+- 监测复核数据、模型阈值审核、机械激活是独立三步；
+- 监测失败通知不把全局分析状态改为失败，也不删除两个方向信号；
+- 摘要显示具体直接原因；详情页显示完整因果链和安全诊断；
+- “重试失败步骤”只重跑 scheduled、emergency 或单币 monitoring 对应流程；
+- callback 立即 ACK，耗时工作放入后台；重复按钮不会启动第二份任务；
+- 所有主导航仍使用 ReplyKeyboard，InlineKeyboard 编辑不会发送键盘移除指令。
 
-针对低成交额候选偏多和 FHEUSDT 方向误判，完成以下复测：
+## 7. 部署验收
 
-| 检查 | 结果 |
-|---|---|
-| 新准入门槛 | 150 万 USDT/24h、5 万 USDT/最近完成 30m、25 bps spread |
-| 实时 universe | 713 |
-| ticker 初筛合格 | 196，门槛未导致候选枯竭 |
-| 完成 5m 深筛 | 60 |
-| 新 Top 10 | AIO、FHE、TUT、HFT、ACE、VELVET、GPS、CYS、CBR、HEMI |
-| 低成交额样本 | GUN 被排除；FHE 档位仍保留 |
-| pytest | 49 项通过 |
-| Ruff / mypy / config-check | 全部通过；mypy 覆盖 31 个源文件，0 issue |
+生产部署必须满足：
 
-使用数据库保存的 FHEUSDT 真实证据进行两次 no-notify 模型回放，未写库、未发送 Telegram：
+1. 先停止旧 Python 服务并备份 SQLite；
+2. 配置检查与 Telegram preflight 通过；
+3. 恢复 `monitoring.enabled=true` 后启动单实例服务；
+4. 启动即冻结旧规则并运行新的权威定时轮；
+5. 新轮两个信号先通知，监测 review 成功后才恢复 WebSocket 规则；
+6. 日志无孤儿 Codex、重复调度器、泛化 `ANALYSIS_FAILED` 或连续旧阈值提醒。
 
-- `cycle_20260817T162038Z_1a58d9e6`：旧结果为错误的强多；新结果降为 `INDETERMINATE`，没有继续给多。回放发生在原证据窗口之后，模型明确以时点错位为理由拒绝强行判断。
-- `cycle_20260817T170000Z_a072946e`：旧结果仍偏多；新结果为 `WATCH / SHORT_BIAS`，市场状态识别为“急拉后的冲击衰竭与近端回落确认”。
-- 两次均在模型第一次输出通过，耗时分别为 24.406 秒和 60.519 秒；没有依赖程序硬编码生成空头方向。
+### 7.1 当前生产实况
 
-自动化回归另行覆盖：FHE 式衰竭追多会被宿主拒绝并重试、仍保持正向动量的 TUT 样本不会被误伤、定时强信号后插入紧急 WATCH 轮次仍能在下一定时轮被正确追踪。
+- 13:00 权威周期 `cycle_20260819T050000Z_db62c94d` 成功生成 GPS 偏空与 JCT 偏多；JCT 在 13:06 按“两根完成 1m + 完成 5m confirmation”完整条件触发紧急复核。GPS 第二根 5m 完成柱恰逢旧版 13:25 预冻结而未被接收；这不是 WebSocket 失效，但证明旧调度存在最后五分钟盲区，现已改为 `:00/:30` 任务开始时才冻结。
+- 用当时冻结证据运行 v7 定向复核：GPS 的两根 5m 确认被判过迟，改为单根已确认 5m 枢轴；JCT 原规则及紧急新规则因缺少可验证的中间结构锚点/确认时间过迟被拒绝。该结果修正阈值，不改写历史方向。
+- 13:30 没有自然定时轮不是调度挂死：服务在 13:25 冻结后处于本次代码部署停机窗口；13:42 新服务启动即执行了权威补跑 `cycle_20260819T054246Z_6970d805`，Top2 为 ACE/TRIA，v7 主分析和独立 review 均完成。
+- 该轮进一步暴露激活时静默重基线风险：TRIA 的 review 基线为 0.008477，激活时已换成新的完成 5m 基线 0.007840。已增加保护，今后此类规则逐币拒绝并要求重审，不会在未审阅的新完成柱上激活。
+- Windows 服务脚本已改为停止、识别和报告完整项目进程树，修复只停虚拟环境 launcher 而留下 worker 的旧程序遗留。部署前备份为 `runtime/backups/pre-v7-baseline-20260819-135436/signal.db`。
+- 13:54:57 新进程树启动（launcher `928676`、worker `930500`），启动轮 `cycle_20260819T055459Z_3f78cf7e` 主分析 SUCCESS、恰好两个信号（GPS 偏空、HEMI 偏多）。GPS 规则基于完成 5m 收复 0.012490；HEMI 因当前完成 5m、候选近端位和正式失效之间没有合格中间结构锚点，被模型明确 REJECTED，主信号仍保留。
+- 启动轮 review 后系统在 13:56:56 立即为 14:00 自然周期重新冻结，证明启动补跑与自然半小时调度按同一串行调度器运行，没有重复调度器或监测抢跑。
+- 14:00:00 自然周期 `cycle_20260819T060000Z_ec47cc24` 准点启动并于 14:01:49 完成，Top5 为 UNITREE/TRIA/GPS/ACE/HEMI，Top2 为 TRIA 偏空与 HEMI 偏多；两条主信号 SUCCESS。Top5 的 24h 成交额约 1,031 万–1.31 亿 USDT，最近完成 30m 成交额约 74 万–524 万 USDT，符合当前成交额优先但不过度抬高山寨币门槛的过滤要求。
+- 该轮 TRIA/HEMI 候选阈值均因“正常波动即可触达，且到正式失效剩余空间不足、无已确认中间结构锚点”被独立模型复核拒绝；系统保持定时冻结、未加载勉强规则，同时 Telegram 方向通知不受影响。该行为符合“系统逻辑正确就不硬改”的验收原则。
 
-部署新版本后，正式周期 `cycle_20260817T174042Z_9705c3e0` 完成并真实投递：
+### 7.2 Prompt v8 与按币自动纠错灰盒
 
-- 实时 universe 713、ticker 初筛合格 197、完成 5m 深筛 60；Top 5 为 AIO、FHE、TUT、HFT、VELVET，全部满足三项流动性准入条件。
-- FHE 24h 成交额约 244.7 万 USDT、最近完成 30m 成交额约 46.9 万 USDT，仍被保留；GUN 没有进入 Top 5，只因旧定时周期曾是强信号而额外复核一次，随后降为 `WATCH / WEAKENED`。
-- FHE 新鲜行情结论为 `WATCH / SHORT_BIAS`，市场状态为“高周期急拉后的短周期反转下挫”；本轮没有为满足配额而强行生成 STRONG。
-- SQLite 对该周期只有 1 条 `cycle` 投递记录，Telegram preflight 成功且 no-send 检查没有额外发送测试消息。
-- MCP stdio 实机列出并成功调用全部 6 个只读工具；health、最新信号、FHE 详情、FHE 市场快照、动态阈值和 FHE 历史均返回有效结果。
-- 服务重启后保持单实例存活，部署后日志未发现 Bot Token 或私有交易能力。
+- 用 14:00 周期 `cycle_20260819T060000Z_ec47cc24` 的 TRIA/HEMI 冻结证据回放新状态机：两币首次及三轮纠错均保持 `REJECTED`，总计 4 次模型调用；每轮收到前次完整原因，没有平移阈值或编造锚点。这证明纠错不会强迫不安全规则通过。
+- 完整 shadow 周期 `cycle_20260819T063739Z_48416224` 重新运行 Top5→Top2→候选→审核。UNITREE 的完成5m反向收复规则首轮 `ACCEPTED`；GPS 因旧 Prompt 对跨周期锚点表述不清而拒绝。
+- 修正为“结构锚点周期与执行观察周期可不同”后，使用完全相同的 GPS 冻结证据首轮 `REWRITTEN`：完成1m重新站上0.012610，锚定已完成15m反弹/随后5m回落起点，距当前约2.61个1m ATR，且早于0.012737正式失效。
+- UNITREE 首轮通过后，审核耗时跨过完成5m边界，暴露旧激活层把任何基线变化都报错。现已区分安全侧移动与威胁侧移动，并补充“只重试失败币、最多3次、其他币不重审”的成功与耗尽测试。
+- 正式 v8 启动轮 `cycle_20260819T070029Z_a922bc31` 于 15:00:29 启动，Top5 为 UNITREE/HEMI/ACE/GPS/TRIA，Top2 为 HEMI 偏多与 ACE 偏空；方向轮 SUCCESS，Telegram 主通知只投递一次。HEMI 的完成1m跌破0.008595规则首轮激活，交付基线距阈值约3.29个1m ATR。
+- ACE 首轮候选0.23127在审核时已满足，模型改写到0.23601；激活时完成1m基线从0.23144升至0.23263，使距离缩至约1.53个1m ATR。系统仅对ACE重采/重审3次，HEMI保持激活；三轮均找不到其它已确认中间锚点后，只创建1条最终failure event，没有中间失败通知。监测整体按PARTIAL恢复。
+- 正式灰盒同时发现最终卡片曾把“activation repair耗尽”标成第2步模型审核。现已把该原因归入第3/3步机械激活/交付纠错，并补充回归；Decimal字段末尾逗号导致的内部技术重试也通过Prompt JSON数值自检约束修正。
+- 当时全量为150项；Ruff、strict mypy（60个 Python 文件）、pip check、compileall、三套配置、PowerShell AST、键盘移除运行时代码扫描、私有交易 MCP 扫描和 `git diff --check` 均通过。
 
-## 7. 固定双主信号与 FHE 方向修复
+### 7.3 HEMI 多转空漏提醒与首轮阈值修复
 
-本轮不是通过抬高门槛把结果压成全 `WATCH`，而是修复决策链：旧版模型过度优先 1h/4h 方向，短周期冲击衰竭只作为次要风险；Prompt 又允许用 `WATCH` 回避相对择优，宿主仅校验格式和价位几何，未校验“追涨/抄底”与已完成 5m/15m 证据的冲突。当前版本要求模型同时检验延续与反转假设，用已完成 5m/15m 决定超短线近端方向，30m/1h/4h 只作结构背景；宿主对两条可见结论统一执行方向冲突与价格几何校验。
+- 15:00 周期 `cycle_20260819T070029Z_a922bc31` 的 HEMI 为偏多，旧规则是 `COMPLETED_1M_CLOSE < 0.008595`；系统于 15:25:00 预冻结，15:25 这根 1m 在 15:26 完成并收于 0.008580，首次满足规则，因此提醒确实落入旧调度制造的五分钟盲区。15:30 周期才重新判断为空。
+- 调度已改为旧规则持续到自然半小时任务真正开始，在 `:00/:30` 边界原子冻结。边界前已接受的紧急复核继续，定时任务不等待，版本 CAS 防止迟到结果覆盖新周期。
+- 15:00 冻结证据中其实已有确认 1m pivot low `0.008739`，距完成1m基线 `0.008937` 约 2.09 个 1m ATR。更新后的默认模型方向重放仍认为当时完成结构略偏多，但把急拉延伸明确列为主要反证，并首轮生成 `COMPLETED_1M_CLOSE < 0.008739`；该规则按后续真实路径可在约 15:19 唤醒，而不是等到 15:26。
+- 15:30 HEMI 偏空的正式 5m 结构价为 `0.008583`。旧合同强迫在当前完成柱与该价格之间再找一个独立中间锚点，狭窄走廊导致四次同因 `REJECTED`。回放证明模型可在首次调用输出 `COMPLETED_1M_CLOSE > 0.008583` 并通过技术校验，但用户最终确认阈值只是辅助参考，因此当前 v9 不再强迫使用正式结构价：只有更快完成柱确有提前复核价值时才启用，否则正常无阈值。
+- 交付时基线只要尚未满足固定 threshold，无论向哪侧移动都机械重基线；只有已穿越/不可执行才重采重审。重审仍找不到高质量规则时以 `NO_QUALIFIED_RULE` 正常结束，不进入失败通知链。
+- 自动化新增 HEMI 等值正式结构价、越界拒绝、生成时已满足、威胁侧但未满足机械重基线和自然半小时边界回归。最终全量与质量门禁见本报告最新执行记录。
 
-当前规则及验证结果：
+当前结论：阈值可用性与方向通知已经解耦；模型优先使用最近合格真实锚点，没有足够提前量的可靠结构时允许零规则，不再因同一理由循环异常或刷失败通知。HEMI 的漏提醒由移除定时前五分钟盲区修复，而不是靠普遍拉近阈值补偿。实际方向准确率仍需更多后续行情样本，不能由单个 HEMI 工程回放替代。
 
-- 每个成功的定时周期必须恰好产出排名 1、2 的两条相对最佳主信号，不要求伪装成 `STRONG`；
-- 非入选候选的 `WATCH/NO_STRONG` 只保留在 SQLite 供诊断，不通知、不订阅实时阈值；
-- 上一轮主信号退出时发送独立 `EXITED/INVALIDATED/REVERSED` 状态更新，随后停止监测；
-- 紧急复核不会污染“上一轮定时双信号”，可见紧急结论执行同一方向校验；
-- FHE 历史证据按 v3 Prompt 重放得到 `SHORT_BIAS`，没有再次出现原来的错误追多；旧证据缺少 30m 时明确降为低置信度，不伪造数据；
-- Telegram 主通知固定两张卡；详情消息与“返回本轮”Inline 按钮、ReplyKeyboard 生命周期、失败去重与恢复均有场景测试。
+### 7.4 Prompt v9 方向优先与宽松阈值灰盒
 
-## 8. 多周期预测与正式环境灰盒
+- 完整 shadow 周期 `cycle_20260819T082240Z_6f1f3bbe` 跑满全市场过滤、Top5 深采、五币分析、Top2、freshness、独立 review 和交付激活；Top5 为 TRIA/HEMI/BTW/ACE/GPS，Top2 恰好为 HEMI 偏空与 GPS 偏空，方向周期 `SUCCESS`，失败事件为 0。
+- HEMI 的方向理由使用完成 5m/1m 从 0.008896 冲高失败后的反转结构，明确压过较旧的 15m/30m 上行；GPS 使用完成 5m/30m/1h 同向下降压过弱 1m 反弹。阈值没有参与方向投票。
+- 独立阈值 review 首次技术调用一次通过，两币均 `REWRITTEN`。GPS 的两根连续 1m 条件在交付时已有一根越线，旧激活检查误把它当作完整条件满足并内部重审；现已按结构化 `required_consecutive_observations` 修复，连续两/三根规则不会再凭一根新柱产生伪异常。
+- 使用 15:00 周期 `cycle_20260819T070029Z_a922bc31` 的五币冻结证据、固定原时钟并禁止当前行情工具进行方向回放。v9 首轮通过：HEMI 仍为 LONG_BIAS（当时尚无完成反转），但因没有“回踩守住真实 pivot 后由完成柱重新加速”或“突破被后续完成柱接受”的重置证据而退出 Top2；Top2 改为 TRIA 偏空与 ACE 偏空。这修复的是极端延伸币的追涨排名错误，而不是用后见之明强迫反向。
+- 当前合同允许每币 0–3 条阈值；明确 `REJECTED` 为正常零规则结果，不语义重试、不进入 `errors`、不发失败通知。宿主机械校正基线、距离和有效期，并以结构化执行字段为准；同向条件、已满足的单根条件、目标引用、越过正式失效后才报警和未知证据仍会拦截。
+- 最终门禁：159 项 pytest、Ruff、strict mypy（61 个 Python 文件）、pip check、compileall、三套配置、PowerShell AST、键盘移除/私有交易端点扫描与 `git diff --check` 全部通过。
 
-当前证据包采集已完成的 5m、15m、30m、1h、4h K 线。每条主信号固定输出形成中 15m、形成中 30m、形成中 1h、下一根完整 15m 四项预测，每项包含方向、强度和宿主计算的自然时间窗口；程序不要求模型猜精确 OHLC。非入选候选四项预测必须全部为空。
+### 7.5 v9 生产部署验收
 
-### 真实 no-notify 周期
+- 部署前备份生产 SQLite 至 `runtime/backups/pre-v9-deploy-20260819-163600/signal.db`，完整停止旧 launcher/worker 后启动新进程树；生产通过工作区 editable 源码运行。
+- 新进程于 16:36:41 UTC+8 启动权威周期 `cycle_20260819T083641Z_64fa3937`，约 154 秒完成主分析与后置阈值阶段；`prompt_version=signal-analysis-v9`、周期 `SUCCESS`、Top2 恰好两个、监测 `READY`、failure event 为 0。
+- 本轮 Top2 为 TRIA 偏空（MEDIUM）与 HEMI 偏多（LOW）。HEMI 明确是急跌后完成 1m/最新 5m 回升形成的低置信度修复，不是继续追随此前高位上涨；形成中 1h 仍给出偏空/较弱，保留周期冲突。
+- 两币阈值 review 首次模型调用一次通过，均为两根完成 1m 的反向结构确认；激活没有 initial error，也没有语义重试。Telegram cycle delivery 已持久化成功，stderr 为空，服务保持 launcher/worker 单实例运行。
 
-分析 `cycle_20260818T032506Z_b4c6559b` 一次模型调用成功，耗时 132704 ms：
+## 8. Debian VPS 可复现发布门禁
 
-- `PORTALUSDT SHORT_BIAS` 排名 1、中等置信度；
-- `TUTUSDT LONG_BIAS` 排名 2、中等置信度；
-- 两条主信号均有四项预测和两条受支持的监测指令；
-- BMT、ACU 作为退出状态更新；其他非入选候选无预测、无监测；
-- 消息 HTML 和长度约束通过，重复投递调用仍只有一条 delivery 记录。
-
-已收盘样本的方向核验：PORTAL 与 TUT 的形成中 15m 分别实际为 `-0.294%`、`+3.813%`，下一根 15m 分别为 `-0.370%`、`+2.160%`，均与当时预测方向一致。该样本仅用于验证时间窗口、数据无未来泄漏和方向结算流程，数量不足以声称策略胜率。
-
-### 正式 24/7 部署
-
-正式周期 `cycle_20260818T033816Z_8257f94a` 成功：
-
-- `PORTALUSDT SHORT_BIAS` 排名 1、中等置信度；
-- `ACUUSDT LONG_BIAS` 排名 2、中等置信度；
-- TUT 生成独立退出更新，BMT/GPS 保持内部状态；
-- Telegram 真实投递一次，当前活跃实时监测集合仅含 PORTAL、ACU；
-- 该周期形成中 15m 收盘后，PORTAL 实际 `-0.370%`、ACU 实际 `+1.008%`，均与预测方向一致；
-- MCP stdio 实机列出并成功调用全部 6 个只读工具，最新信号为 PORTAL/ACU，详情含四项预测，市场快照含 `PA.30M`；
-- 服务以 Windows 隐藏单实例持续运行，Telegram 启动 ReplyKeyboard 和正式信号均已真实发送；runtime 日志无 Token，stderr 无异常。
-
-正式续跑时灰盒发现一次已退出 TUT 的旧阈值唤醒。根因是旧 WebSocket 循环仅在连续 30 秒没有任何行情消息时刷新监测指令；活跃行情持续到达时不会触发超时，内存订阅因而滞后。修复后指令按独立墙钟刷新，不再依赖行情静默；事件在合并后、调用模型前还会再次核对 `analysis_id + symbol + family_id`，已退出或已换代事件直接丢弃。新增“持续繁忙 WebSocket 仍刷新”和“退出后待处理事件不唤醒”两项回归测试。
-
-修复版于上海时间 11:54 重新部署，启动周期 `cycle_20260818T035425Z_bf870ce2` 成功产生 GPS 多、PORTAL 空两条主信号并真实投递。随后服务没有按重启时刻顺延，而是在 `12:00:00.003` 准时启动自然墙钟周期 `cycle_20260818T040000Z_c008f355`，于 `12:02:03.642` 成功完成：
-
-- `ACUUSDT LONG_BIAS` 排名 1、`PORTALUSDT SHORT_BIAS` 排名 2，均为中等置信度；
-- 两条主信号均有四项预测、两条监测指令；
-- GPS 仅生成 `EXITED` 更新且监测为 0，BMT/TUT 内部候选的预测和监测均为 0；
-- SQLite 对本周期仅有一条 Telegram `cycle` delivery；
-- 修复版启动后未再生成任何旧币紧急周期或无意义通知，服务进程继续存活。
-
-最终自动化结果为 pytest 62 项、Ruff 全仓、mypy strict（31 个源文件）、pip check、配置校验、PowerShell 脚本语法、`git diff --check` 全部通过。生产源码没有账户、仓位、杠杆、下单或撤单能力；真实凭据只存在于 Git 忽略的 `.env`。
-
-## 9. 结论
-
-当前版本符合确认后的信号系统：公开市场多源辅助、Bybit USDT 永续主口径、每 30 分钟恰好两条相对最佳主信号、四项超短周期预测、上一轮退出更新、Telegram 通知、只服务当前主信号的轻量阈值紧急复核、只读 MCP 和 24/7 服务均已实现。系统不接触账户、仓位或自动交易。
-
-实时阈值是否发生市场穿越取决于后续行情；穿越、迟滞、冷却、小时上限、紧急旁路和退出后取消监测已通过确定性测试。短期实盘样本用于核对系统行为，不构成收益率或胜率保证。
+- 默认部署基线改为 Debian 13 stable/Python 3.13，并保留 Debian 12/Python 3.12 兼容边界；仓库根目录 `VPS_CODEX_HANDOFF.md` 是无本地会话上下文的 VPS Codex 第一入口，`AGENTS.md` 自动约束其不得重写策略或引入自动交易。
+- Windows 与 Debian 依赖约束分离。VPS/CI 使用 `requirements-debian.lock.txt`，明确去除 Windows-only `pywin32`；Windows 本地仍使用原 dev/runtime constraints。
+- POSIX 模型进程使用独立 session/process group；300 秒超时会结束完整 Codex 进程组，而不是只结束直接子进程。新增平台选项和进程组终止回归测试，目标测试与全量测试均通过。
+- systemd unit 显式包含服务用户 Codex PATH、`KillMode=control-group`、`UMask=0077`，项目目录只读，只开放 runtime 和 `.codex` 认证目录的必要写权限。
+- `.github/workflows/ci.yml` 在每次 `main` push/PR 的干净 Debian 13 容器中重新安装锁定依赖，执行 Ruff、strict mypy、159 项 pytest、compileall、示例配置和 systemd unit 校验。远端 CI 结果必须在推送后回读，未通过时不得认定 VPS 交付完成。
+- 本机没有运行中的 Docker Linux engine，因此没有把 Windows 的 cross-platform pip marker 模拟冒充真实 Debian 安装；真实 Debian 依赖解析由上述干净容器 CI 和目标 VPS Codex 的启动前验收共同完成。

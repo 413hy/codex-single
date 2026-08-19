@@ -7,6 +7,7 @@ from itertools import pairwise
 
 from bybit_signal.domain.enums import PriceType, ToolStatus
 from bybit_signal.domain.models import (
+    CandidateContext,
     Candle,
     CanonicalPrice,
     EvidenceBundle,
@@ -15,14 +16,19 @@ from bybit_signal.domain.models import (
 )
 from bybit_signal.providers.bybit import BybitBookLevel, BybitOpenInterest
 from bybit_signal.providers.deep_market import DeepTimeframe, NativeMarketSnapshot
+from bybit_signal.selection.scanner import RankedCandidate
 
 
 class EvidenceBuilder:
     """Derive neutral, reproducible facts from this project's public data snapshot."""
 
-    _TIMEFRAMES: tuple[DeepTimeframe, ...] = ("5m", "15m", "30m", "1h", "4h")
+    _TIMEFRAMES: tuple[DeepTimeframe, ...] = ("1m", "5m", "15m", "30m", "1h", "4h")
 
-    def build(self, snapshot: NativeMarketSnapshot) -> EvidenceBundle:
+    def build(
+        self,
+        snapshot: NativeMarketSnapshot,
+        candidate: RankedCandidate | None = None,
+    ) -> EvidenceBundle:
         ticker = snapshot.ticker
         if ticker.mark_price is None:
             raise ValueError("canonical Bybit mark price is unavailable")
@@ -48,15 +54,22 @@ class EvidenceBuilder:
                 item = self._price_action(snapshot.symbol, timeframe, candles)
                 items.append(item)
                 price_action_ids.append(item.evidence_id)
+        raw_sequences = self._raw_sequences(snapshot)
+        items.extend(raw_sequences)
+        price_action_ids.extend(item.evidence_id for item in raw_sequences)
+        core_timeframes: tuple[DeepTimeframe, ...] = ("5m", "15m", "30m", "1h", "4h")
         core_status = (
             ToolStatus.AVAILABLE
-            if len(price_action_ids) == len(self._TIMEFRAMES)
+            if all(snapshot.candles.get(timeframe) for timeframe in core_timeframes)
             else ToolStatus.PARTIAL
         )
         core_ids = (
             f"{snapshot.symbol}.NATIVE.QUALITY",
             f"{snapshot.symbol}.BYBIT.TICKER",
             *price_action_ids,
+        )
+        qualified_timeframes = sum(
+            bool(snapshot.candles.get(timeframe)) for timeframe in self._TIMEFRAMES
         )
         tools.append(
             ToolAssessment(
@@ -65,10 +78,24 @@ class EvidenceBuilder:
                 version="native-v1",
                 reason=(
                     "self-contained public REST collector; last and mark remain separate; "
-                    f"{len(price_action_ids)}/{len(self._TIMEFRAMES)} "
+                    f"{qualified_timeframes}/{len(self._TIMEFRAMES)} "
                     "completed-candle timeframes qualified"
                 ),
                 evidence_ids=core_ids,
+            )
+        )
+        one_minute_ids = tuple(
+            item.evidence_id
+            for item in items
+            if item.evidence_id in {f"{snapshot.symbol}.PA.1M", f"{snapshot.symbol}.RAW.1M"}
+        )
+        tools.append(
+            ToolAssessment(
+                tool="BYBIT_NATIVE_ULTRASHORT_1M",
+                status=ToolStatus.AVAILABLE if len(one_minute_ids) == 2 else ToolStatus.PARTIAL,
+                version="native-v2",
+                reason="completed 1m history and compact raw rows support ultra-short timing",
+                evidence_ids=one_minute_ids,
             )
         )
 
@@ -112,6 +139,45 @@ class EvidenceBuilder:
                 evidence_ids=tuple(item.evidence_id for item in references),
             )
         )
+        context_items = self._market_context(snapshot)
+        items.extend(context_items)
+        tools.append(
+            ToolAssessment(
+                tool="MARKET_WIDE_CONTEXT",
+                status=ToolStatus.AVAILABLE if context_items else ToolStatus.UNAVAILABLE,
+                version="native-v2",
+                reason="BTC/ETH and Bybit-wide breadth are bounded public context",
+                evidence_ids=tuple(item.evidence_id for item in context_items),
+            )
+        )
+        candidate_context = None
+        if candidate is not None:
+            candidate_context = CandidateContext(
+                rank=candidate.rank,
+                opportunity_score=candidate.opportunity_score,
+                tradability_score=candidate.tradability_score,
+                final_score=candidate.score,
+                risk_tags=candidate.risk_tags,
+                raw_features=candidate.features.model_dump(),
+            )
+            candidate_item = EvidenceItem(
+                evidence_id=f"{snapshot.symbol}.FILTER.CONTEXT",
+                category="candidate_filter",
+                source="NATIVE_TWO_SCORE_FILTER",
+                observed_at=candidate.observed_at,
+                summary="Filter rank is opportunity/tradability context, never trade direction",
+                values=candidate_context.model_dump(mode="json"),
+            )
+            items.append(candidate_item)
+            tools.append(
+                ToolAssessment(
+                    tool="NATIVE_CANDIDATE_FILTER",
+                    status=ToolStatus.AVAILABLE,
+                    version="two-score-v2",
+                    reason="opportunity and tradability are preserved independently",
+                    evidence_ids=(candidate_item.evidence_id,),
+                )
+            )
         return EvidenceBundle(
             symbol=snapshot.symbol,
             generated_at=snapshot.generated_at,
@@ -120,6 +186,8 @@ class EvidenceBuilder:
             canonical_mark=mark,
             evidence_items=tuple(items),
             tool_assessments=tuple(tools),
+            market_context=snapshot.market_context,
+            candidate_context=candidate_context,
         )
 
     @staticmethod
@@ -137,8 +205,7 @@ class EvidenceBuilder:
             values={
                 "qualified_timeframe_count": len(snapshot.candles),
                 "collection_duration_ms": round(
-                    (snapshot.generated_at - snapshot.collection_started_at).total_seconds()
-                    * 1000
+                    (snapshot.generated_at - snapshot.collection_started_at).total_seconds() * 1000
                 ),
                 "evidence_cutoff_utc": snapshot.generated_at.isoformat(),
                 "missing_source_count": len(missing),
@@ -146,6 +213,12 @@ class EvidenceBuilder:
                 "orderbook_available": snapshot.orderbook is not None,
                 "public_trade_count": len(snapshot.recent_trades),
                 "open_interest_points": len(snapshot.open_interest),
+                "long_short_ratio_points": len(snapshot.long_short_ratios),
+                "liquidation_status": (
+                    snapshot.liquidation_window.status.value
+                    if snapshot.liquidation_window is not None
+                    else ToolStatus.UNAVAILABLE.value
+                ),
             },
         )
 
@@ -223,24 +296,20 @@ class EvidenceBuilder:
             "rolling_high_20": rolling_high,
             "rolling_low_20": rolling_low,
             "range_mid_20": (rolling_high + rolling_low) / 2,
-            "drawdown_from_rolling_high_atr": max(
-                0.0, (rolling_high - closes[-1]) / atr14
-            ),
-            "rebound_from_rolling_low_atr": max(
-                0.0, (closes[-1] - rolling_low) / atr14
-            ),
+            "drawdown_from_rolling_high_atr": max(0.0, (rolling_high - closes[-1]) / atr14),
+            "rebound_from_rolling_low_atr": max(0.0, (closes[-1] - rolling_low) / atr14),
             "directional_efficiency_12": _directional_efficiency(closes[-lookback:]),
+            "absolute_directional_efficiency_12": abs(_directional_efficiency(closes[-lookback:])),
             "overlap_ratio_12": _overlap_ratio(highs[-lookback:], lows[-lookback:]),
             "bull_body_ratio_12": sum(
                 close > open_
-                for close, open_ in zip(
-                    closes[-lookback:], opens[-lookback:], strict=True
-                )
+                for close, open_ in zip(closes[-lookback:], opens[-lookback:], strict=True)
             )
             / lookback,
             "turnover_ratio_6_vs_6": (
                 recent_turnover / prior_turnover if prior_turnover > 0 else None
             ),
+            "latest_turnover": turnovers[-1],
             "recent_30m_turnover_usdt": recent_turnover,
             "confirmed_pivot_high": pivot_high,
             "pivot_high_open_time": pivot_high_at,
@@ -262,6 +331,50 @@ class EvidenceBuilder:
             ),
             values=evidence_values,
         )
+
+    @staticmethod
+    def _raw_sequences(snapshot: NativeMarketSnapshot) -> list[EvidenceItem]:
+        limits: dict[DeepTimeframe, int] = {"1m": 30, "5m": 24, "15m": 16}
+        items: list[EvidenceItem] = []
+        for timeframe, limit in limits.items():
+            candles = snapshot.candles.get(timeframe)
+            if not candles:
+                continue
+            values = candles[-limit:]
+            items.append(
+                EvidenceItem(
+                    evidence_id=f"{snapshot.symbol}.RAW.{timeframe.upper()}",
+                    category="compact_raw_candles",
+                    source="BYBIT_NATIVE_COMPLETED_CANDLES",
+                    observed_at=values[-1].close_time,
+                    summary=f"Latest {len(values)} completed {timeframe} OHLCV rows",
+                    values={
+                        "timeframe": timeframe,
+                        "columns": [
+                            "open_time",
+                            "open",
+                            "high",
+                            "low",
+                            "close",
+                            "volume",
+                            "turnover",
+                        ],
+                        "rows": [
+                            [
+                                candle.open_time.isoformat(),
+                                float(candle.open),
+                                float(candle.high),
+                                float(candle.low),
+                                float(candle.close),
+                                float(candle.volume),
+                                float(candle.turnover),
+                            ]
+                            for candle in values
+                        ],
+                    },
+                )
+            )
+        return items
 
     def _microstructure(self, snapshot: NativeMarketSnapshot) -> list[EvidenceItem]:
         items: list[EvidenceItem] = []
@@ -296,13 +409,18 @@ class EvidenceBuilder:
                 )
             )
         if snapshot.recent_trades:
-            for minutes in (1, 5):
-                items.append(self._trade_window(snapshot, minutes))
+            for seconds, label in ((30, "30S"), (60, "1M"), (300, "5M")):
+                items.append(self._trade_window(snapshot, seconds=seconds, label=label))
         return items
 
     @staticmethod
-    def _trade_window(snapshot: NativeMarketSnapshot, minutes: int) -> EvidenceItem:
-        cutoff = snapshot.generated_at - timedelta(minutes=minutes)
+    def _trade_window(
+        snapshot: NativeMarketSnapshot,
+        *,
+        seconds: int,
+        label: str,
+    ) -> EvidenceItem:
+        cutoff = snapshot.generated_at - timedelta(seconds=seconds)
         trades = [trade for trade in snapshot.recent_trades if trade.timestamp >= cutoff]
         oldest = snapshot.recent_trades[0].timestamp
         newest = snapshot.recent_trades[-1].timestamp
@@ -311,14 +429,14 @@ class EvidenceBuilder:
         sell = sum(float(trade.notional) for trade in trades if trade.side == "Sell")
         total = buy + sell
         return EvidenceItem(
-            evidence_id=f"{snapshot.symbol}.MICRO.TRADES.{minutes}M",
+            evidence_id=f"{snapshot.symbol}.MICRO.TRADES.{label}",
             category="order_flow",
             source="BYBIT_PUBLIC_RECENT_TRADES",
             observed_at=newest,
             summary=(
-                f"{minutes}m trade window is fully covered"
+                f"{label.lower()} trade window is fully covered"
                 if qualified
-                else f"{minutes}m trade window coverage is incomplete; delta excluded"
+                else f"{label.lower()} trade window coverage is incomplete; delta excluded"
             ),
             values={
                 "qualified": qualified,
@@ -327,6 +445,7 @@ class EvidenceBuilder:
                 "newest_trade_time": newest.isoformat(),
                 "buy_notional": buy if qualified else None,
                 "sell_notional": sell if qualified else None,
+                "signed_delta_notional": buy - sell if qualified else None,
                 "normalized_delta": (buy - sell) / total if qualified and total else None,
                 "buy_sell_ratio": buy / sell if qualified and sell > 0 else None,
             },
@@ -339,8 +458,9 @@ class EvidenceBuilder:
             ticker.funding_rate is None
             and ticker.open_interest is None
             and not snapshot.open_interest
+            and not snapshot.long_short_ratios
         ):
-            return []
+            return EvidenceBuilder._liquidations(snapshot)
         points = snapshot.open_interest
         return [
             EvidenceItem(
@@ -354,9 +474,7 @@ class EvidenceBuilder:
                         float(ticker.funding_rate) if ticker.funding_rate is not None else None
                     ),
                     "current_open_interest": (
-                        float(ticker.open_interest)
-                        if ticker.open_interest is not None
-                        else None
+                        float(ticker.open_interest) if ticker.open_interest is not None else None
                     ),
                     "current_open_interest_value": (
                         float(ticker.open_interest_value)
@@ -371,7 +489,65 @@ class EvidenceBuilder:
                         if ticker.next_funding_time is not None
                         else None
                     ),
+                    "account_ratio_points": len(snapshot.long_short_ratios),
+                    "latest_buy_ratio": (
+                        float(snapshot.long_short_ratios[-1].buy_ratio)
+                        if snapshot.long_short_ratios
+                        else None
+                    ),
+                    "latest_sell_ratio": (
+                        float(snapshot.long_short_ratios[-1].sell_ratio)
+                        if snapshot.long_short_ratios
+                        else None
+                    ),
+                    "latest_long_short_ratio": (
+                        float(value)
+                        if snapshot.long_short_ratios
+                        and (value := snapshot.long_short_ratios[-1].long_short_ratio) is not None
+                        else None
+                    ),
                 },
+            ),
+            *EvidenceBuilder._liquidations(snapshot),
+        ]
+
+    @staticmethod
+    def _liquidations(snapshot: NativeMarketSnapshot) -> list[EvidenceItem]:
+        items: list[EvidenceItem] = []
+        for label, window in (
+            ("1M", snapshot.liquidation_window_1m),
+            ("5M", snapshot.liquidation_window),
+        ):
+            if window is None:
+                continue
+            items.append(
+                EvidenceItem(
+                    evidence_id=f"{snapshot.symbol}.LIQUIDATIONS.{label}",
+                    category="liquidations",
+                    source="BYBIT_PUBLIC_ALL_LIQUIDATION_STREAM",
+                    observed_at=window.generated_at,
+                    summary=(
+                        "Liquidation zero is valid only when stream coverage is complete; "
+                        f"current status is {window.status.value}"
+                    ),
+                    values=window.model_dump(mode="json"),
+                )
+            )
+        return items
+
+    @staticmethod
+    def _market_context(snapshot: NativeMarketSnapshot) -> list[EvidenceItem]:
+        context = snapshot.market_context
+        if context is None:
+            return []
+        return [
+            EvidenceItem(
+                evidence_id=f"{snapshot.symbol}.MARKET.CONTEXT",
+                category="market_context",
+                source="BYBIT_NATIVE_MARKET_CONTEXT",
+                observed_at=context.generated_at,
+                summary="BTC/ETH short-term context and Bybit linear-perpetual breadth",
+                values=context.model_dump(mode="json"),
             )
         ]
 
@@ -478,10 +654,7 @@ def _last_pivot(
     field = "high" if high else "low"
     for index in range(len(candles) - 3, 1, -1):
         value = getattr(candles[index], field)
-        neighbors = [
-            getattr(candles[position], field)
-            for position in range(index - 2, index + 3)
-        ]
+        neighbors = [getattr(candles[position], field) for position in range(index - 2, index + 3)]
         if (high and value == max(neighbors)) or (not high and value == min(neighbors)):
             return (
                 float(value),

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import hashlib
 import json
 import math
@@ -11,23 +12,44 @@ import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, Protocol, TypeVar
 
-from pydantic import ValidationError
+from pydantic import BaseModel, ValidationError
 
-from bybit_signal.config import AnalysisConfig
-from bybit_signal.domain.enums import CycleMode, Direction, MonitoringMetric
+from bybit_signal.analysis.tool_registry import ReadOnlyAnalysisToolRegistry
+from bybit_signal.config import AnalysisConfig, MonitoringConfig
+from bybit_signal.domain.enums import (
+    Comparator,
+    CycleMode,
+    Direction,
+    MonitoringMetric,
+    MonitoringReviewDecision,
+)
 from bybit_signal.domain.models import (
+    AnalysisToolResult,
     CandidateAssessment,
     EvidenceBundle,
     ModelAnalysisResponse,
+    ModelMonitoringReviewResponse,
+    ModelTurnResponse,
+    MonitoringDirective,
+    MonitoringRuleReview,
+    ToolAssessment,
 )
 
 
 class CodexAnalysisError(RuntimeError):
-    def __init__(self, code: str, message: str) -> None:
+    def __init__(
+        self,
+        code: str,
+        message: str,
+        *,
+        diagnostics: tuple[dict[str, Any], ...] = (),
+    ) -> None:
         self.code = code
+        self.diagnostics = diagnostics
         super().__init__(message)
 
 
@@ -46,6 +68,29 @@ class CodexAnalysisResult:
     latency_ms: int
     attempts: int
     usage: dict[str, int]
+    evidence_bundles: tuple[EvidenceBundle, ...] = ()
+    tool_results: tuple[AnalysisToolResult, ...] = ()
+    attempt_diagnostics: tuple[dict[str, Any], ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class CodexMonitoringReviewResult:
+    response: ModelMonitoringReviewResponse
+    context_sha256: str
+    latency_ms: int
+    usage: dict[str, int]
+    attempts: int = 1
+    attempt_diagnostics: tuple[dict[str, Any], ...] = ()
+    repair_diagnostics: tuple[dict[str, Any], ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class MonitoringActivationResult:
+    assessment: CandidateAssessment
+    bundle_generated_at: datetime
+    source_snapshot_sha256: str
+    current_values: dict[str, str]
+    dropped_directives: tuple[dict[str, str], ...]
 
 
 class CodexProcessRunner(Protocol):
@@ -58,15 +103,39 @@ class CodexProcessRunner(Protocol):
     ) -> CodexProcessResult: ...
 
 
+SchemaModel = TypeVar("SchemaModel", bound=BaseModel)
+_STRUCTURAL_MONITORING_METRICS = frozenset(
+    {
+        MonitoringMetric.COMPLETED_1M_CLOSE,
+        MonitoringMetric.COMPLETED_5M_CLOSE,
+        MonitoringMetric.COMPLETED_15M_CLOSE,
+        MonitoringMetric.COMPLETED_30M_CLOSE,
+        MonitoringMetric.COMPLETED_1H_CLOSE,
+    }
+)
+_SUPPORTED_MONITORING_METRICS = frozenset(
+    {
+        MonitoringMetric.LAST_PRICE,
+        MonitoringMetric.MARK_PRICE,
+        *_STRUCTURAL_MONITORING_METRICS,
+        MonitoringMetric.TURNOVER_1M,
+        MonitoringMetric.TRADE_DELTA_30S,
+        MonitoringMetric.SPREAD_BPS,
+        MonitoringMetric.ORDERBOOK_IMBALANCE_L5,
+        MonitoringMetric.OPEN_INTEREST,
+        MonitoringMetric.FUNDING_RATE,
+        MonitoringMetric.LIQUIDATION_NOTIONAL_1M,
+    }
+)
+
+
 async def run_codex_process(
     command: Sequence[str],
     cwd: Path,
     timeout_seconds: int,
     stdin: str,
 ) -> CodexProcessResult:
-    creationflags = 0
-    if os.name == "nt":
-        creationflags = 0x08000000  # CREATE_NO_WINDOW
+    process_options = _subprocess_platform_options(os.name)
     started = time.monotonic()
     process: asyncio.subprocess.Process | None = None
     last_start_error: OSError | None = None
@@ -78,7 +147,7 @@ async def run_codex_process(
                 stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
-                creationflags=creationflags,
+                **process_options,
             )
             break
         except OSError as error:
@@ -95,9 +164,11 @@ async def run_codex_process(
             process.communicate(stdin.encode("utf-8")),
             timeout=timeout_seconds,
         )
+    except asyncio.CancelledError:
+        await _terminate_process_tree(process)
+        raise
     except TimeoutError as error:
-        process.kill()
-        await process.communicate()
+        await _terminate_process_tree(process)
         raise CodexAnalysisError(
             "CODEX_TIMEOUT",
             f"Codex analysis exceeded {timeout_seconds}s",
@@ -110,6 +181,52 @@ async def run_codex_process(
     )
 
 
+def _subprocess_platform_options(platform_name: str) -> dict[str, Any]:
+    if platform_name == "nt":
+        return {
+            "creationflags": 0x08000000
+            | 0x00000200  # CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP
+        }
+    # Give every Codex invocation its own POSIX process group. On a timeout the
+    # service must terminate the whole tree, not leave helper processes behind.
+    return {"start_new_session": True}
+
+
+async def _terminate_process_tree(
+    process: asyncio.subprocess.Process,
+    *,
+    platform_name: str | None = None,
+    kill_process_group: Callable[[int, int], None] | None = None,
+) -> None:
+    if process.returncode is not None:
+        return
+    platform_name = platform_name or os.name
+    if platform_name == "nt":
+        killer = await asyncio.create_subprocess_exec(
+            "taskkill",
+            "/PID",
+            str(process.pid),
+            "/T",
+            "/F",
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
+            creationflags=0x08000000,
+        )
+        await killer.communicate()
+    else:
+        if kill_process_group is None:
+            candidate = getattr(os, "killpg", None)
+            if not callable(candidate):
+                process.kill()
+                candidate = None
+            kill_process_group = candidate
+        with contextlib.suppress(ProcessLookupError):
+            if kill_process_group is not None:
+                kill_process_group(process.pid, 9)
+    with contextlib.suppress(ProcessLookupError):
+        await process.wait()
+
+
 class CodexAnalyzer:
     def __init__(
         self,
@@ -118,17 +235,36 @@ class CodexAnalyzer:
         workspace: Path,
         runtime_root: Path,
         prompt_path: Path,
+        monitoring_config: MonitoringConfig | None = None,
         process_runner: CodexProcessRunner = run_codex_process,
         codex_executable: str = "codex",
         clock: Callable[[], datetime] | None = None,
+        tool_registry: ReadOnlyAnalysisToolRegistry | None = None,
+        monitoring_review_prompt_path: Path | None = None,
+        model_skill_path: Path | None = None,
     ) -> None:
         self._config = config
         self._workspace = workspace.resolve()
         self._runtime_root = runtime_root.resolve()
         self._prompt_path = prompt_path.resolve()
+        self._monitoring_config = monitoring_config or MonitoringConfig()
         self._process_runner = process_runner
         self._codex_command_prefix = _codex_command_prefix(codex_executable)
         self._clock = clock or (lambda: datetime.now(UTC))
+        self._tool_registry = tool_registry
+        self._monitoring_review_prompt_path = (
+            monitoring_review_prompt_path.resolve()
+            if monitoring_review_prompt_path is not None
+            else self._prompt_path.with_name("monitoring_review_zh.md")
+        )
+        self._model_skill_path = (
+            model_skill_path.resolve()
+            if model_skill_path is not None
+            else Path(__file__).resolve().parents[3]
+            / ".agents"
+            / "skills"
+            / "analyze-bybit-ultrashort-signals"
+        )
 
     async def analyze(
         self,
@@ -136,6 +272,7 @@ class CodexAnalyzer:
         analysis_id: str,
         bundles: Sequence[EvidenceBundle],
         tracked_symbols: Sequence[str] = (),
+        trigger_reasons: Sequence[str] = (),
         mode: CycleMode = CycleMode.SCHEDULED,
     ) -> CodexAnalysisResult:
         if not bundles:
@@ -148,22 +285,35 @@ class CodexAnalyzer:
         symbols = [bundle.symbol for bundle in bundles]
         if len(symbols) != len(set(symbols)):
             raise CodexAnalysisError("DUPLICATE_SYMBOL", "analysis bundles contain duplicates")
+        if self._tool_registry is not None and self._config.tool_protocol_enabled:
+            return await self._analyze_with_tools(
+                analysis_id=analysis_id,
+                bundles=tuple(bundles),
+                tracked_symbols=tracked_symbols,
+                trigger_reasons=trigger_reasons,
+                mode=mode,
+            )
         requested_at = self._clock()
         outlook_windows = _candle_outlook_windows(requested_at)
         context = self._context(
             analysis_id=analysis_id,
             bundles=bundles,
             tracked_symbols=tracked_symbols,
+            trigger_reasons=trigger_reasons,
             mode=mode,
             primary_signal_count=self._config.primary_signal_count,
-            max_target_distance_percent=self._config.max_target_distance_percent,
             requested_at=requested_at,
+            monitoring_config=self._monitoring_config,
         )
         context_json = json.dumps(
             context, ensure_ascii=False, sort_keys=True, separators=(",", ":")
         )
         context_sha256 = hashlib.sha256(context_json.encode("utf-8")).hexdigest()
-        base_prompt = self._prompt_path.read_text(encoding="utf-8")
+        base_prompt = (
+            self._model_handbook()
+            + "\n\n"
+            + self._prompt_path.read_text(encoding="utf-8")
+        )
         validation_feedback = ""
         total_latency = 0
         last_error = "no model attempt completed"
@@ -172,10 +322,7 @@ class CodexAnalyzer:
 
         for attempt in range(1, self._config.max_attempts + 1):
             prompt = base_prompt + "\n\n# 本轮输入\n" + context_json + validation_feedback
-            with tempfile.TemporaryDirectory(
-                prefix="codex-analysis-",
-                dir=self._runtime_root,
-            ) as temporary:
+            with tempfile.TemporaryDirectory(prefix="bybit-signal-codex-analysis-") as temporary:
                 temporary_root = Path(temporary)
                 schema_path = temporary_root / "response.schema.json"
                 output_path = temporary_root / "last-message.json"
@@ -185,10 +332,10 @@ class CodexAnalyzer:
                     json.dumps(schema, ensure_ascii=False),
                     encoding="utf-8",
                 )
-                command = self._command(schema_path, output_path)
+                command = self._command(schema_path, output_path, temporary_root)
                 process = await self._process_runner(
                     command,
-                    self._workspace,
+                    temporary_root,
                     self._config.timeout_seconds,
                     prompt,
                 )
@@ -213,6 +360,9 @@ class CodexAnalyzer:
                     response = ModelAnalysisResponse.model_validate_json(
                         output_path.read_text(encoding="utf-8")
                     )
+                    response = _annotate_monitoring_metadata(
+                        response, bundles
+                    )
                     self._validate_response(
                         response=response,
                         analysis_id=analysis_id,
@@ -230,21 +380,662 @@ class CodexAnalyzer:
                     latency_ms=total_latency,
                     attempts=attempt,
                     usage=usage,
+                    evidence_bundles=tuple(bundles),
+                    attempt_diagnostics=(
+                        {
+                            "call": attempt,
+                            "status": "FINAL_ACCEPTED",
+                            "latency_ms": process.latency_ms,
+                        },
+                    ),
                 )
         raise CodexAnalysisError(
             "INVALID_MODEL_OUTPUT",
             f"Codex failed after {self._config.max_attempts} attempt(s): {last_error}",
         )
 
-    def _command(self, schema_path: Path, output_path: Path) -> tuple[str, ...]:
+    async def _analyze_with_tools(
+        self,
+        *,
+        analysis_id: str,
+        bundles: tuple[EvidenceBundle, ...],
+        tracked_symbols: Sequence[str],
+        trigger_reasons: Sequence[str],
+        mode: CycleMode,
+    ) -> CodexAnalysisResult:
+        if self._tool_registry is None:
+            raise CodexAnalysisError("TOOL_REGISTRY_MISSING", "tool registry is unavailable")
+        requested_at = self._clock()
+        outlook_windows = _candle_outlook_windows(requested_at)
+        base_prompt = (
+            self._model_handbook()
+            + "\n\n"
+            + self._prompt_path.read_text(encoding="utf-8")
+        )
+        current_bundles = bundles
+        tool_results: list[AnalysisToolResult] = []
+        seen_requests: set[tuple[str, str | None, str]] = set()
+        validation_feedback = ""
+        total_latency = 0
+        usage: dict[str, int] = {}
+        model_calls = 0
+        tool_rounds = 0
+        failed_model_calls = 0
+        last_error = "tool protocol did not produce a final response"
+        attempt_diagnostics: list[dict[str, Any]] = []
+        maximum_model_calls = self._config.max_tool_rounds + self._config.max_attempts + 1
+        self._runtime_root.mkdir(parents=True, exist_ok=True)
+
+        while model_calls < maximum_model_calls:
+            context = self._context(
+                analysis_id=analysis_id,
+                bundles=current_bundles,
+                tracked_symbols=tracked_symbols,
+                trigger_reasons=trigger_reasons,
+                mode=mode,
+                primary_signal_count=self._config.primary_signal_count,
+                requested_at=requested_at,
+                monitoring_config=self._monitoring_config,
+            )
+            context["tool_protocol"] = {
+                "enabled": True,
+                "remaining_rounds": max(0, self._config.max_tool_rounds - tool_rounds),
+                "remaining_calls": max(0, self._config.max_tool_calls - len(tool_results)),
+                "allowed_tools": [
+                    "latest_market",
+                    "short_candles",
+                    "market_context",
+                    "depth_and_trades",
+                    "derivatives",
+                    "cross_exchange",
+                    "extended_candles",
+                ],
+                "contract": (
+                    "Return action=FINAL with final response when evidence is sufficient. "
+                    "Otherwise return action=TOOL_REQUESTS with only bounded read-only "
+                    "requests. Never request shell, files, arbitrary URLs, accounts or orders."
+                ),
+            }
+            context["completed_tool_results"] = [
+                result.model_dump(mode="json") for result in tool_results
+            ]
+            context_json = json.dumps(
+                context, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+            )
+            prompt = (
+                base_prompt
+                + "\n\n# 宿主管理工具轮次\n"
+                + "本轮只能按 tool_protocol 返回 TOOL_REQUESTS 或 FINAL。"
+                + "工具由宿主执行, 模型自身不得访问外部环境。\n\n# 本轮输入\n"
+                + context_json
+                + validation_feedback
+            )
+            try:
+                turn, process = await self._invoke_structured(ModelTurnResponse, prompt)
+            except CodexAnalysisError as error:
+                if error.code in {
+                    "CODEX_CREDITS_EXHAUSTED",
+                    "CODEX_AUTH_REQUIRED",
+                    "CODEX_MODEL_UNAVAILABLE",
+                }:
+                    raise
+                last_error = self._concise_error(error)
+                attempt_diagnostics.append(
+                    {
+                        "call": model_calls + 1,
+                        "status": "PROCESS_ERROR",
+                        "code": error.code,
+                        "message": last_error,
+                    }
+                )
+                validation_feedback = self._feedback(last_error)
+                model_calls += 1
+                failed_model_calls += 1
+                if failed_model_calls >= self._config.max_attempts:
+                    break
+                continue
+            except (ValidationError, ValueError) as error:
+                last_error = self._concise_error(error)
+                attempt_diagnostics.append(
+                    {
+                        "call": model_calls + 1,
+                        "status": "SCHEMA_REJECTED",
+                        "message": last_error,
+                    }
+                )
+                validation_feedback = self._feedback(last_error)
+                model_calls += 1
+                failed_model_calls += 1
+                if failed_model_calls >= self._config.max_attempts:
+                    break
+                continue
+            model_calls += 1
+            total_latency += process.latency_ms
+            usage = self._usage(process.stdout) or usage
+            if turn.action.value == "FINAL":
+                if turn.final is None:
+                    last_error = "FINAL turn omitted final response"
+                    attempt_diagnostics.append(
+                        {
+                            "call": model_calls,
+                            "status": "FINAL_REJECTED",
+                            "latency_ms": process.latency_ms,
+                            "message": last_error,
+                        }
+                    )
+                    validation_feedback = self._feedback(last_error)
+                    failed_model_calls += 1
+                    if failed_model_calls >= self._config.max_attempts:
+                        break
+                    continue
+                try:
+                    final = _annotate_monitoring_metadata(
+                        turn.final, current_bundles
+                    )
+                    self._validate_response(
+                        response=final,
+                        analysis_id=analysis_id,
+                        bundles=current_bundles,
+                        mode=mode,
+                        outlook_windows=outlook_windows,
+                    )
+                except (ValidationError, ValueError) as error:
+                    last_error = self._concise_error(error)
+                    attempt_diagnostics.append(
+                        {
+                            "call": model_calls,
+                            "status": "FINAL_REJECTED",
+                            "latency_ms": process.latency_ms,
+                            "message": last_error,
+                        }
+                    )
+                    validation_feedback = self._feedback(last_error)
+                    failed_model_calls += 1
+                    if failed_model_calls >= self._config.max_attempts:
+                        break
+                    continue
+                final_context_sha256 = hashlib.sha256(context_json.encode("utf-8")).hexdigest()
+                accepted_diagnostic: dict[str, Any] = {
+                    "call": model_calls,
+                    "status": "FINAL_ACCEPTED",
+                    "latency_ms": process.latency_ms,
+                }
+                attempt_diagnostics.append(accepted_diagnostic)
+                return CodexAnalysisResult(
+                    response=final,
+                    context_sha256=final_context_sha256,
+                    latency_ms=total_latency,
+                    attempts=model_calls,
+                    usage=usage,
+                    evidence_bundles=current_bundles,
+                    tool_results=tuple(tool_results),
+                    attempt_diagnostics=tuple(attempt_diagnostics),
+                )
+            if tool_rounds >= self._config.max_tool_rounds:
+                last_error = "tool round limit reached; return FINAL using available evidence"
+                attempt_diagnostics.append(
+                    {
+                        "call": model_calls,
+                        "status": "TOOL_REQUEST_REJECTED",
+                        "latency_ms": process.latency_ms,
+                        "message": last_error,
+                    }
+                )
+                validation_feedback = self._feedback(last_error)
+                failed_model_calls += 1
+                if failed_model_calls >= self._config.max_attempts:
+                    break
+                continue
+            remaining = self._config.max_tool_calls - len(tool_results)
+            if remaining <= 0 or len(turn.requests) > remaining:
+                last_error = "tool call limit exceeded"
+                attempt_diagnostics.append(
+                    {
+                        "call": model_calls,
+                        "status": "TOOL_REQUEST_REJECTED",
+                        "latency_ms": process.latency_ms,
+                        "message": last_error,
+                    }
+                )
+                validation_feedback = self._feedback(last_error)
+                failed_model_calls += 1
+                if failed_model_calls >= self._config.max_attempts:
+                    break
+                continue
+            unique_requests = []
+            duplicate = False
+            for request in turn.requests:
+                identity = (
+                    request.tool,
+                    request.symbol,
+                    request.arguments.model_dump_json(),
+                )
+                if identity in seen_requests:
+                    duplicate = True
+                    break
+                seen_requests.add(identity)
+                unique_requests.append(request)
+            if duplicate:
+                last_error = "duplicate tool request; use prior result and return FINAL"
+                attempt_diagnostics.append(
+                    {
+                        "call": model_calls,
+                        "status": "TOOL_REQUEST_REJECTED",
+                        "latency_ms": process.latency_ms,
+                        "message": last_error,
+                    }
+                )
+                validation_feedback = self._feedback(last_error)
+                failed_model_calls += 1
+                if failed_model_calls >= self._config.max_attempts:
+                    break
+                continue
+            results = await self._tool_registry.execute_many(
+                unique_requests,
+                allowed_symbols=frozenset(bundle.symbol for bundle in current_bundles),
+            )
+            tool_results.extend(results)
+            attempt_diagnostics.append(
+                {
+                    "call": model_calls,
+                    "status": "TOOL_REQUESTS_EXECUTED",
+                    "latency_ms": process.latency_ms,
+                    "requests": [request.request_id for request in unique_requests],
+                }
+            )
+            current_bundles = _augment_bundles(current_bundles, results)
+            tool_rounds += 1
+            validation_feedback = ""
+        raise CodexAnalysisError(
+            "INVALID_MODEL_OUTPUT",
+            f"Codex tool protocol failed after {model_calls} model call(s): {last_error}",
+            diagnostics=tuple(attempt_diagnostics),
+        )
+
+    async def review_monitoring(
+        self,
+        *,
+        analysis_id: str,
+        assessments: Sequence[CandidateAssessment],
+        bundles: Sequence[EvidenceBundle],
+        repair_reasons: Mapping[str, Sequence[str]] | None = None,
+        maximum_repair_attempts: int | None = None,
+    ) -> CodexMonitoringReviewResult:
+        if not assessments or not bundles:
+            raise CodexAnalysisError(
+                "EMPTY_MONITORING_REVIEW",
+                "monitoring review requires selected assessments and fresh evidence",
+            )
+        if not self._monitoring_review_prompt_path.is_file():
+            raise CodexAnalysisError(
+                "MONITORING_PROMPT_MISSING",
+                f"monitoring review prompt is missing: {self._monitoring_review_prompt_path}",
+            )
+        bundle_by_symbol = {bundle.symbol: bundle for bundle in bundles}
+        expected = {assessment.symbol for assessment in assessments}
+        if expected != set(bundle_by_symbol):
+            raise CodexAnalysisError(
+                "MONITORING_CONTEXT_MISMATCH",
+                "monitoring review assessments and evidence symbols differ",
+            )
+        assessment_by_symbol = {
+            assessment.symbol: assessment for assessment in assessments
+        }
+        ordered_symbols = tuple(assessment.symbol for assessment in assessments)
+        handbook = self._model_handbook()
+        review_prompt = self._monitoring_review_prompt_path.read_text(encoding="utf-8")
+        requested_repair_budget = (
+            0 if maximum_repair_attempts is None else maximum_repair_attempts
+        )
+        if not 0 <= requested_repair_budget <= self._config.monitoring_review_repair_attempts:
+            raise CodexAnalysisError(
+                "MONITORING_REPAIR_BUDGET_INVALID",
+                "monitoring repair budget must be within the configured maximum",
+            )
+        # A valid REJECTED review means that no useful, non-noise threshold exists.
+        # It is a normal no-monitoring outcome and must not be turned into repeated
+        # semantic model calls. Delivery-time activation failures are re-collected
+        # and retried by SignalCycleService, while malformed output is retried by
+        # the technical-attempt loop below.
+        maximum_repairs = 0
+        supplied_reasons = repair_reasons or {}
+        unknown_reason_symbols = set(supplied_reasons) - expected
+        if unknown_reason_symbols:
+            raise CodexAnalysisError(
+                "MONITORING_REPAIR_CONTEXT_MISMATCH",
+                "monitoring repair reasons contain unknown symbols: "
+                + ", ".join(sorted(unknown_reason_symbols)),
+            )
+        pending_symbols = ordered_symbols
+        final_reviews: dict[str, MonitoringRuleReview] = {}
+        repair_state: dict[str, dict[str, Any]] = {
+            symbol: {
+                "symbol": symbol,
+                "initial_decision": None,
+                "repair_attempts": 0,
+                "repair_history": [],
+                "final_decision": None,
+                "exhausted": False,
+            }
+            for symbol in ordered_symbols
+        }
+        rejection_history: dict[str, list[str]] = {
+            symbol: [str(reason) for reason in supplied_reasons.get(symbol, ())]
+            for symbol in ordered_symbols
+        }
+        context_documents: list[str] = []
+        total_latency = 0
+        total_usage: dict[str, int] = {}
+        total_calls = 0
+        diagnostics: list[dict[str, Any]] = []
+        for repair_attempt in range(0, maximum_repairs + 1):
+            current_assessments = tuple(
+                assessment_by_symbol[symbol] for symbol in pending_symbols
+            )
+            current_bundles = tuple(bundle_by_symbol[symbol] for symbol in pending_symbols)
+            context: dict[str, Any] = {
+                "schema_version": 1,
+                "analysis_id": analysis_id,
+                "review_mode": "MONITORING_REVIEW",
+                "reviewed_at": self._clock().isoformat(),
+                "policy": {
+                    "rules_per_symbol": {"minimum": 0, "maximum": 3},
+                    "purpose": "counter_direction_structure_threat_reanalysis_wake",
+                    "microstructure_requires_price_conjunction": True,
+                    "take_profit_is_display_only": True,
+                    "automatic_repair_attempts": maximum_repairs,
+                },
+                # The approximate take-profit is deliberately absent here. It is useful
+                # in the delivered signal but has no role in direction-threat rules.
+                "signals": [
+                    assessment.model_dump(mode="json", exclude={"take_profit"})
+                    for assessment in current_assessments
+                ],
+                "fresh_evidence_bundles": [
+                    _model_bundle_payload(bundle, self._monitoring_config)
+                    for bundle in current_bundles
+                ],
+            }
+            if repair_attempt or any(rejection_history[symbol] for symbol in pending_symbols):
+                context["repair_context"] = {
+                    "is_automatic_repair": True,
+                    "repair_attempt": max(1, repair_attempt),
+                    "maximum_repair_attempts": maximum_repairs,
+                    "remaining_after_this": maximum_repairs - repair_attempt,
+                    "instruction": (
+                        "Only repair the listed rejected symbols. Address each prior "
+                        "model rejection or activation error using the fresh baselines "
+                        "in this request and a different evidence-grounded structure; "
+                        "do not merely move a threshold. REJECTED remains valid when no "
+                        "rule is safe and useful."
+                    ),
+                    "symbols": [
+                        {
+                            "symbol": symbol,
+                            "previous_rejections": rejection_history[symbol],
+                        }
+                        for symbol in pending_symbols
+                    ],
+                }
+            context_json = json.dumps(
+                context, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+            )
+            context_documents.append(context_json)
+            base_prompt = (
+                handbook
+                + "\n\n"
+                + review_prompt
+                + "\n\n# 本轮输入\n"
+                + context_json
+            )
+            feedback = ""
+            batch_response: ModelMonitoringReviewResponse | None = None
+            batch_latency = 0
+            last_code = "MONITORING_REVIEW_INVALID"
+            last_error = "monitoring review did not produce a valid response"
+            for technical_attempt in range(1, self._config.max_attempts + 1):
+                attempt_code = "MONITORING_REVIEW_NOT_EXECUTABLE"
+                total_calls += 1
+                try:
+                    response, process = await self._invoke_structured(
+                        ModelMonitoringReviewResponse,
+                        base_prompt + feedback,
+                    )
+                    total_latency += process.latency_ms
+                    batch_latency = process.latency_ms
+                    for key, value in self._usage(process.stdout).items():
+                        total_usage[key] = total_usage.get(key, 0) + value
+                    if response.analysis_id != analysis_id:
+                        attempt_code = "MONITORING_REVIEW_ID_MISMATCH"
+                        raise ValueError(
+                            "monitoring review analysis_id differs from the request"
+                        )
+                    actual = {review.symbol for review in response.reviews}
+                    expected_batch = set(pending_symbols)
+                    if actual != expected_batch:
+                        attempt_code = "MONITORING_REVIEW_SYMBOL_MISMATCH"
+                        raise ValueError(
+                            f"expected {sorted(expected_batch)}, got {sorted(actual)}"
+                        )
+                    response = response.model_copy(
+                        update={
+                            "reviews": tuple(
+                                _normalize_reviewed_baselines(
+                                    review, bundle_by_symbol[review.symbol]
+                                )
+                                for review in response.reviews
+                            )
+                        }
+                    )
+                    for review in response.reviews:
+                        _validate_reviewed_directives(
+                            review.directives,
+                            bundle_by_symbol[review.symbol],
+                            assessment_by_symbol[review.symbol],
+                        )
+                except CodexAnalysisError as error:
+                    last_code = error.code
+                    last_error = self._concise_error(error)
+                    diagnostics.append(
+                        {
+                            "call": total_calls,
+                            "repair_attempt": repair_attempt,
+                            "technical_attempt": technical_attempt,
+                            "symbols": pending_symbols,
+                            "status": "PROCESS_ERROR",
+                            "code": error.code,
+                            "message": last_error,
+                        }
+                    )
+                    if error.code in {
+                        "CODEX_CREDITS_EXHAUSTED",
+                        "CODEX_AUTH_REQUIRED",
+                        "CODEX_MODEL_UNAVAILABLE",
+                    }:
+                        raise CodexAnalysisError(
+                            error.code,
+                            last_error,
+                            diagnostics=tuple(diagnostics),
+                        ) from error
+                except (ValidationError, ValueError) as error:
+                    last_code = attempt_code
+                    last_error = self._concise_error(error)
+                    diagnostics.append(
+                        {
+                            "call": total_calls,
+                            "repair_attempt": repair_attempt,
+                            "technical_attempt": technical_attempt,
+                            "symbols": pending_symbols,
+                            "status": "REVIEW_REJECTED",
+                            "code": last_code,
+                            "message": last_error,
+                        }
+                    )
+                else:
+                    batch_response = response
+                    diagnostics.append(
+                        {
+                            "call": total_calls,
+                            "repair_attempt": repair_attempt,
+                            "technical_attempt": technical_attempt,
+                            "symbols": pending_symbols,
+                            "status": "REVIEW_ACCEPTED",
+                            "latency_ms": process.latency_ms,
+                            "decisions": {
+                                review.symbol: review.decision.value
+                                for review in response.reviews
+                            },
+                        }
+                    )
+                    break
+                feedback = self._feedback(last_error)
+            if batch_response is None:
+                raise CodexAnalysisError(
+                    last_code,
+                    (
+                        "Codex monitoring review failed after "
+                        f"{self._config.max_attempts} technical attempt(s): {last_error}"
+                    ),
+                    diagnostics=tuple(diagnostics),
+                )
+
+            next_pending: list[str] = []
+            review_by_symbol = {
+                review.symbol: review for review in batch_response.reviews
+            }
+            for symbol in pending_symbols:
+                review = review_by_symbol[symbol]
+                state = repair_state[symbol]
+                history = state["repair_history"]
+                if not isinstance(history, list):
+                    raise RuntimeError("monitoring repair history is not mutable")
+                if state["initial_decision"] is None:
+                    state["initial_decision"] = review.decision.value
+                if repair_attempt:
+                    state["repair_attempts"] = repair_attempt
+                history.append(
+                    {
+                        "repair_attempt": repair_attempt,
+                        "decision": review.decision.value,
+                        "rationale": review.rationale,
+                        "latency_ms": batch_latency,
+                    }
+                )
+                if (
+                    review.decision is MonitoringReviewDecision.REJECTED
+                    and repair_attempt < maximum_repairs
+                ):
+                    rejection_history[symbol].append(review.rationale)
+                    next_pending.append(symbol)
+                    continue
+                final_reviews[symbol] = review
+                state["final_decision"] = review.decision.value
+                state["exhausted"] = False
+            if not next_pending:
+                break
+            pending_symbols = tuple(
+                symbol for symbol in ordered_symbols if symbol in next_pending
+            )
+
+        if set(final_reviews) != expected:
+            missing = sorted(expected - set(final_reviews))
+            raise CodexAnalysisError(
+                "MONITORING_REPAIR_INCOMPLETE",
+                f"monitoring repair did not finalize symbols: {missing}",
+                diagnostics=tuple(diagnostics),
+            )
+        combined_context = "\n".join(context_documents)
+        return CodexMonitoringReviewResult(
+            response=ModelMonitoringReviewResponse(
+                analysis_id=analysis_id,
+                reviews=tuple(final_reviews[symbol] for symbol in ordered_symbols),
+            ),
+            context_sha256=hashlib.sha256(
+                combined_context.encode("utf-8")
+            ).hexdigest(),
+            latency_ms=total_latency,
+            usage=total_usage,
+            attempts=total_calls,
+            attempt_diagnostics=tuple(diagnostics),
+            repair_diagnostics=tuple(repair_state[symbol] for symbol in ordered_symbols),
+        )
+
+    def _model_handbook(self) -> str:
+        skill_path = self._model_skill_path / "SKILL.md"
+        contract_path = self._model_skill_path / "references" / "operating-contract.md"
+        if not skill_path.is_file() or not contract_path.is_file():
+            raise CodexAnalysisError(
+                "MODEL_HANDBOOK_MISSING",
+                f"model operating handbook is incomplete under {self._model_skill_path}",
+            )
+        return (
+            "# 模型操作手册 (运行时显式注入)\n"
+            + skill_path.read_text(encoding="utf-8")
+            + "\n\n"
+            + contract_path.read_text(encoding="utf-8")
+        )
+
+    async def _invoke_structured(
+        self,
+        model: type[SchemaModel],
+        prompt: str,
+    ) -> tuple[SchemaModel, CodexProcessResult]:
+        with tempfile.TemporaryDirectory(prefix="bybit-signal-codex-tool-turn-") as temporary:
+            temporary_root = Path(temporary)
+            schema_path = temporary_root / "response.schema.json"
+            output_path = temporary_root / "last-message.json"
+            schema = model.model_json_schema()
+            _strict_output_schema(schema)
+            schema_path.write_text(json.dumps(schema, ensure_ascii=False), encoding="utf-8")
+            process = await self._process_runner(
+                self._command(schema_path, output_path, temporary_root),
+                temporary_root,
+                self._config.timeout_seconds,
+                prompt,
+            )
+            if process.return_code != 0:
+                message = self._process_failure(process)
+                permanent_code = self._permanent_failure_code(process)
+                raise CodexAnalysisError(permanent_code or "CODEX_PROCESS_FAILED", message)
+            if not output_path.is_file():
+                raise CodexAnalysisError(
+                    "CODEX_OUTPUT_MISSING", "Codex did not create its last-message output"
+                )
+            if output_path.stat().st_size > 2 * 1024 * 1024:
+                raise CodexAnalysisError(
+                    "CODEX_OUTPUT_TOO_LARGE", "Codex last-message output exceeds 2 MiB"
+                )
+            value = model.model_validate_json(output_path.read_text(encoding="utf-8"))
+            return value, process
+
+    def _command(
+        self,
+        schema_path: Path,
+        output_path: Path,
+        working_directory: Path,
+    ) -> tuple[str, ...]:
         return (
             *self._codex_command_prefix,
             "exec",
             "--json",
             "--ephemeral",
             "--ignore-user-config",
+            "--ignore-rules",
+            "--skip-git-repo-check",
             "--sandbox",
             "read-only",
+            "--disable",
+            "skill_search",
+            "--disable",
+            "shell_tool",
+            "--disable",
+            "plugins",
+            "--disable",
+            "apps",
+            "--disable",
+            "browser_use",
+            "--disable",
+            "computer_use",
             "--model",
             self._config.model,
             "-c",
@@ -254,7 +1045,7 @@ class CodexAnalyzer:
             "--output-last-message",
             str(output_path),
             "--cd",
-            str(self._workspace),
+            str(working_directory),
             "-",
         )
 
@@ -264,22 +1055,25 @@ class CodexAnalyzer:
         analysis_id: str,
         bundles: Sequence[EvidenceBundle],
         tracked_symbols: Sequence[str],
+        trigger_reasons: Sequence[str],
         mode: CycleMode,
         primary_signal_count: int,
-        max_target_distance_percent: float,
         requested_at: datetime,
+        monitoring_config: MonitoringConfig,
     ) -> dict[str, Any]:
         outlook_windows = _candle_outlook_windows(requested_at)
         cutoffs = [bundle.generated_at for bundle in bundles]
+        market_context = next(
+            (bundle.market_context for bundle in bundles if bundle.market_context is not None),
+            None,
+        )
         return {
             "schema_version": 1,
             "analysis_id": analysis_id,
             "analysis_mode": mode.value,
             "requested_at": requested_at.isoformat(),
             "batch_evidence_cutoff_utc": max(cutoffs).isoformat(),
-            "bundle_cutoff_skew_seconds": (
-                max(cutoffs) - min(cutoffs)
-            ).total_seconds(),
+            "bundle_cutoff_skew_seconds": (max(cutoffs) - min(cutoffs)).total_seconds(),
             "candle_outlook_windows_utc": {
                 name: {"start": start.isoformat(), "end": end.isoformat()}
                 for name, (start, end) in outlook_windows.items()
@@ -288,11 +1082,24 @@ class CodexAnalyzer:
                 "required_primary_signals": (
                     primary_signal_count if mode is CycleMode.SCHEDULED else 0
                 ),
-                "max_target_distance_percent": max_target_distance_percent,
                 "monitoring_valid_for_seconds": {"minimum": 1800, "maximum": 3600},
+                "monitoring_directives_per_primary": {"minimum": 0, "maximum": 3},
             },
             "tracked_symbols_without_prior_direction": sorted(set(tracked_symbols)),
-            "evidence_bundles": [bundle.model_dump(mode="json") for bundle in bundles],
+            "emergency_trigger_reasons": (
+                [
+                    str(reason).replace("\r", " ").replace("\n", " ")[:1000]
+                    for reason in trigger_reasons[:8]
+                ]
+                if mode is CycleMode.EMERGENCY
+                else []
+            ),
+            "batch_market_context": (
+                market_context.model_dump(mode="json") if market_context is not None else None
+            ),
+            "evidence_bundles": [
+                _model_bundle_payload(bundle, monitoring_config) for bundle in bundles
+            ],
         }
 
     def _validate_response(
@@ -327,6 +1134,8 @@ class CodexAnalyzer:
                 raise ValueError("scheduled analysis must select exactly ranks 1 and 2")
         elif selected:
             raise ValueError("emergency analysis cannot select scheduled primary signals")
+        elif len(response.assessments) != 1:
+            raise ValueError("emergency analysis requires exactly one assessment")
         bundle_by_symbol = {bundle.symbol: bundle for bundle in bundles}
         for assessment in response.assessments:
             bundle = bundle_by_symbol[assessment.symbol]
@@ -341,14 +1150,13 @@ class CodexAnalyzer:
             visible = assessment.selection_rank is not None or mode is CycleMode.EMERGENCY
             if visible and (
                 assessment.direction is None
-                or assessment.take_profit is None
                 or assessment.invalidation is None
                 or not assessment.evidence_ids
                 or any(outlook is None for outlook in outlooks.values())
             ):
                 raise ValueError(
-                    f"{assessment.symbol} visible signal requires direction, target, "
-                    "invalidation, evidence and all four candle outlooks"
+                    f"{assessment.symbol} visible signal requires direction, invalidation, "
+                    "evidence and all four candle outlooks"
                 )
             if not visible and any(outlook is not None for outlook in outlooks.values()):
                 raise ValueError(
@@ -357,19 +1165,18 @@ class CodexAnalyzer:
             for name, outlook in outlooks.items():
                 expected_start, expected_end = outlook_windows[name]
                 if outlook is not None and (
-                    outlook.window_start != expected_start
-                    or outlook.window_end != expected_end
+                    outlook.window_start != expected_start or outlook.window_end != expected_end
                 ):
                     raise ValueError(
                         f"{assessment.symbol} {name} window differs from the requested window"
                     )
-            if assessment.take_profit is not None:
-                referenced.update(assessment.take_profit.evidence_ids)
             if assessment.invalidation is not None:
                 referenced.update(assessment.invalidation.evidence_ids)
             family_ids: set[str] = set()
             for directive in assessment.monitoring_directives:
                 referenced.update(directive.evidence_ids)
+                for confirmation in directive.confirmations:
+                    referenced.update(confirmation.evidence_ids)
                 if directive.family_id in family_ids:
                     raise ValueError(
                         f"{assessment.symbol} contains duplicate monitoring family "
@@ -381,157 +1188,27 @@ class CodexAnalyzer:
                         f"{assessment.symbol} monitoring directive validity must be "
                         "between 1800 and 3600 seconds"
                     )
-                if directive.metric not in {
-                    MonitoringMetric.LAST_PRICE,
-                    MonitoringMetric.MARK_PRICE,
-                    MonitoringMetric.COMPLETED_5M_CLOSE,
-                    MonitoringMetric.COMPLETED_15M_CLOSE,
-                    MonitoringMetric.COMPLETED_1H_CLOSE,
-                    MonitoringMetric.SPREAD_BPS,
-                    MonitoringMetric.OPEN_INTEREST,
-                    MonitoringMetric.FUNDING_RATE,
-                }:
+                if directive.metric not in _SUPPORTED_MONITORING_METRICS:
                     raise ValueError(
                         f"{assessment.symbol} requested unsupported realtime metric "
                         f"{directive.metric.value}"
                     )
             if mode is CycleMode.SCHEDULED:
                 if assessment.selection_rank is None and assessment.monitoring_directives:
+                    raise ValueError(f"{assessment.symbol} non-selected assessment cannot monitor")
+                if assessment.selection_rank is not None and len(
+                    assessment.monitoring_directives
+                ) > 3:
                     raise ValueError(
-                        f"{assessment.symbol} non-selected assessment cannot monitor"
+                        f"{assessment.symbol} selected signal allows at most 3 candidate directives"
                     )
-                if assessment.selection_rank is not None and not (
-                    1 <= len(assessment.monitoring_directives) <= 2
-                ):
-                    raise ValueError(
-                        f"{assessment.symbol} selected signal requires 1-2 monitoring directives"
-                    )
-            elif len(assessment.monitoring_directives) > 2:
+            elif len(assessment.monitoring_directives) > 3:
                 raise ValueError(
-                    f"{assessment.symbol} emergency review allows at most 2 directives"
+                    f"{assessment.symbol} emergency review allows at most 3 candidate directives"
                 )
             if not referenced <= known:
                 unknown = sorted(referenced - known)
                 raise ValueError(f"{assessment.symbol} references unknown evidence: {unknown}")
-            if assessment.selection_rank is not None or mode is CycleMode.EMERGENCY:
-                self._validate_direction_consistency(assessment, bundle)
-                self._validate_strong_price_geometry(assessment, bundle)
-
-    def _validate_direction_consistency(
-        self,
-        assessment: CandidateAssessment,
-        bundle: EvidenceBundle,
-    ) -> None:
-        direction = assessment.direction
-        if direction is None:
-            return
-        five = _evidence_values(bundle, ".PA.5M")
-        fifteen = _evidence_values(bundle, ".PA.15M")
-        if five is None or fifteen is None:
-            return
-
-        five_return = _number(five, "return_3_percent")
-        fifteen_return = _number(fifteen, "return_3_percent")
-        fifteen_atr_percent = _number(fifteen, "atr_14_percent")
-        if five_return is None or fifteen_return is None or fifteen_atr_percent is None:
-            return
-
-        impulse_threshold = max(12.0, 3 * fifteen_atr_percent)
-        drawdown = _atr_distance(five, high=True)
-        rebound = _atr_distance(five, high=False)
-        pivot_high_age = _pivot_age_bars(five, high=True, timeframe_minutes=5)
-        pivot_low_age = _pivot_age_bars(five, high=False, timeframe_minutes=5)
-
-        upward_exhaustion = (
-            fifteen_return >= impulse_threshold
-            and five_return <= 0
-            and drawdown is not None
-            and drawdown >= 1.5
-            and pivot_high_age is not None
-            and pivot_high_age <= 3
-        )
-        downward_exhaustion = (
-            fifteen_return <= -impulse_threshold
-            and five_return >= 0
-            and rebound is not None
-            and rebound >= 1.5
-            and pivot_low_age is not None
-            and pivot_low_age <= 3
-        )
-        if direction is Direction.LONG_BIAS and upward_exhaustion:
-            raise ValueError(
-                f"{assessment.symbol} LONG_BIAS conflicts with completed-candle "
-                "upward exhaustion: 15m impulse, confirmed 5m pivot high, "
-                "negative 5m return and >=1.5 ATR drawdown"
-            )
-        if direction is Direction.SHORT_BIAS and downward_exhaustion:
-            raise ValueError(
-                f"{assessment.symbol} SHORT_BIAS conflicts with completed-candle "
-                "downward exhaustion: 15m impulse, confirmed 5m pivot low, "
-                "positive 5m return and >=1.5 ATR rebound"
-            )
-
-        fifteen_close = _number(fifteen, "latest_close")
-        fifteen_mid = _number(fifteen, "range_mid_20")
-        five_macd = _number(five, "macd_histogram_12_26_9")
-        five_efficiency = _number(five, "directional_efficiency_12")
-        if (
-            fifteen_close is None
-            or fifteen_mid is None
-            or five_macd is None
-            or five_efficiency is None
-        ):
-            return
-        confirmed_downswing = (
-            not downward_exhaustion
-            and fifteen_return <= -1.5 * fifteen_atr_percent
-            and fifteen_close < fifteen_mid
-            and five_macd < 0
-            and five_efficiency < 0
-        )
-        confirmed_upswing = (
-            not upward_exhaustion
-            and fifteen_return >= 1.5 * fifteen_atr_percent
-            and fifteen_close > fifteen_mid
-            and five_macd > 0
-            and five_efficiency > 0
-        )
-        if direction is Direction.LONG_BIAS and confirmed_downswing:
-            raise ValueError(
-                f"{assessment.symbol} LONG_BIAS conflicts with a confirmed near-term "
-                "downswing across completed 15m structure and 5m momentum"
-            )
-        if direction is Direction.SHORT_BIAS and confirmed_upswing:
-            raise ValueError(
-                f"{assessment.symbol} SHORT_BIAS conflicts with a confirmed near-term "
-                "upswing across completed 15m structure and 5m momentum"
-            )
-
-    def _validate_strong_price_geometry(
-        self,
-        assessment: CandidateAssessment,
-        bundle: EvidenceBundle,
-    ) -> None:
-        if assessment.take_profit is None or assessment.invalidation is None:
-            raise ValueError(f"{assessment.symbol} strong signal lacks target or invalidation")
-        current = bundle.canonical_last.value
-        target = assessment.take_profit.value
-        invalidation = assessment.invalidation.reference_price
-        if assessment.direction is Direction.LONG_BIAS:
-            if target <= current or invalidation >= current:
-                raise ValueError(
-                    f"{assessment.symbol} long target/invalidation geometry is invalid"
-                )
-        elif assessment.direction is Direction.SHORT_BIAS and (
-            target >= current or invalidation <= current
-        ):
-            raise ValueError(f"{assessment.symbol} short target/invalidation geometry is invalid")
-        distance_percent = abs(target / current - 1) * 100
-        if distance_percent > self._config.max_target_distance_percent:
-            raise ValueError(
-                f"{assessment.symbol} target distance {distance_percent:.2f}% "
-                "exceeds configured limit"
-            )
 
     @staticmethod
     def _usage(stdout: str) -> dict[str, int]:
@@ -658,49 +1335,429 @@ def _evidence_values(
 
 def _number(values: Mapping[str, Any], key: str) -> float | None:
     value = values.get(key)
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
+    if isinstance(value, bool) or not isinstance(value, (int, float, Decimal, str)):
         return None
-    result = float(value)
+    try:
+        result = float(value)
+    except (InvalidOperation, ValueError):
+        return None
     return result if math.isfinite(result) else None
 
 
-def _atr_distance(values: Mapping[str, Any], *, high: bool) -> float | None:
-    explicit_key = (
-        "drawdown_from_rolling_high_atr"
-        if high
-        else "rebound_from_rolling_low_atr"
+def _model_bundle_payload(
+    bundle: EvidenceBundle,
+    monitoring_config: MonitoringConfig,
+) -> dict[str, Any]:
+    """Deduplicate batch-global context without changing frozen audit bundles."""
+
+    payload = bundle.model_dump(mode="json", exclude={"market_context"})
+    evidence = payload.get("evidence_items")
+    if isinstance(evidence, list):
+        for item in evidence:
+            if isinstance(item, dict) and item.get("category") == "market_context":
+                item["values"] = {"batch_market_context_ref": "batch_market_context"}
+                item["summary"] = (
+                    "Use the single batch_market_context object; this evidence id remains "
+                    "available for symbol-level citations"
+                )
+    payload["monitoring_observable_baselines"] = {
+        metric.value: str(value)
+        for metric, value in sorted(
+            _monitoring_current_values(bundle).items(), key=lambda item: item[0].value
+        )
+    }
+    return payload
+
+
+def _annotate_monitoring_metadata(
+    response: ModelAnalysisResponse,
+    bundles: Sequence[EvidenceBundle],
+) -> ModelAnalysisResponse:
+    """Attach current observable baselines without accepting or rejecting strategy values."""
+
+    bundle_by_symbol = {bundle.symbol: bundle for bundle in bundles}
+    assessments: list[CandidateAssessment] = []
+    for assessment in response.assessments:
+        bundle = bundle_by_symbol.get(assessment.symbol)
+        if bundle is None:
+            assessments.append(assessment)
+            continue
+        current_values = _monitoring_current_values(bundle)
+        atr1 = _number(_evidence_values(bundle, ".PA.1M") or {}, "atr_14")
+        directives = []
+        for directive in assessment.monitoring_directives:
+            current = current_values.get(directive.metric)
+            distance_percent = None
+            distance_atr = None
+            if current is not None and directive.metric in {
+                MonitoringMetric.LAST_PRICE,
+                MonitoringMetric.MARK_PRICE,
+                *_STRUCTURAL_MONITORING_METRICS,
+            }:
+                distance = abs(directive.threshold - current)
+                distance_percent = distance / current * 100 if current else None
+                if atr1 is not None and atr1 > 0:
+                    distance_atr = distance / Decimal(str(atr1))
+            confirmations = tuple(
+                confirmation.model_copy(
+                    update={
+                        "current_value": current_values.get(
+                            confirmation.metric, confirmation.current_value
+                        )
+                    }
+                )
+                for confirmation in directive.confirmations
+            )
+            directives.append(
+                directive.model_copy(
+                    update={
+                        "current_value": current,
+                        "distance_percent": distance_percent,
+                        "distance_atr": distance_atr,
+                        "confirmations": confirmations,
+                    }
+                )
+            )
+        assessments.append(
+            assessment.model_copy(update={"monitoring_directives": tuple(directives)})
+        )
+    return response.model_copy(update={"assessments": tuple(assessments)})
+
+
+def revalidate_monitoring_assessment(
+    assessment: CandidateAssessment,
+    bundle: EvidenceBundle,
+    config: MonitoringConfig,
+) -> MonitoringActivationResult:
+    del config
+    current_values = _monitoring_current_values(bundle)
+    atr1 = _number(_evidence_values(bundle, ".PA.1M") or {}, "atr_14")
+    directives: list[MonitoringDirective] = []
+    for directive in assessment.monitoring_directives:
+        if directive.metric not in _STRUCTURAL_MONITORING_METRICS:
+            raise ValueError(
+                f"{bundle.symbol} {directive.family_id} must use a completed-candle "
+                "price structure as its primary condition"
+            )
+        current = current_values.get(directive.metric)
+        if current is None:
+            raise ValueError(
+                f"{bundle.symbol} {directive.family_id} primary metric has no "
+                "delivery-time baseline"
+            )
+        if directive.current_value is None:
+            raise ValueError(
+                f"{bundle.symbol} {directive.family_id} reviewed completed-candle "
+                "baseline is missing before activation; rerun model monitoring review"
+            )
+        # The model owns the structural threshold; the host owns the observable
+        # delivery baseline. A newer completed candle may safely rebase in either
+        # direction while the reviewed condition remains unmet. The executable
+        # validation below still rejects a rule that crossed before activation.
+        distance_percent = None
+        distance_atr = None
+        distance = abs(directive.threshold - current)
+        distance_percent = distance / current * 100 if current else None
+        if atr1 is not None and atr1 > 0:
+            distance_atr = distance / Decimal(str(atr1))
+        confirmations = tuple(
+            confirmation.model_copy(
+                update={
+                    "current_value": current_values.get(
+                        confirmation.metric, confirmation.current_value
+                    )
+                }
+            )
+            for confirmation in directive.confirmations
+        )
+        directives.append(
+            directive.model_copy(
+                update={
+                    "current_value": current,
+                    "distance_percent": distance_percent,
+                    "distance_atr": distance_atr,
+                    "confirmations": confirmations,
+                }
+            )
+        )
+    normalized = assessment.model_copy(
+        update={"monitoring_directives": tuple(directives)}
     )
-    explicit = _number(values, explicit_key)
-    if explicit is not None:
-        return explicit
-    close = _number(values, "latest_close")
-    atr = _number(values, "atr_14")
-    boundary = _number(values, "rolling_high_20" if high else "rolling_low_20")
-    if close is None or atr is None or atr <= 0 or boundary is None:
-        return None
-    return max(0.0, (boundary - close) / atr if high else (close - boundary) / atr)
+    _validate_reviewed_directives(
+        normalized.monitoring_directives,
+        bundle,
+        normalized,
+        allow_partial_consecutive_crossing=True,
+    )
+    return MonitoringActivationResult(
+        assessment=normalized,
+        bundle_generated_at=bundle.generated_at,
+        source_snapshot_sha256=bundle.source_snapshot_sha256,
+        current_values={
+            metric.value: str(value)
+            for metric, value in sorted(
+                _monitoring_current_values(bundle).items(),
+                key=lambda item: item[0].value,
+            )
+        },
+        dropped_directives=(),
+    )
 
 
-def _pivot_age_bars(
-    values: Mapping[str, Any],
+def _is_target_monitoring_directive(directive: MonitoringDirective) -> bool:
+    family_parts = directive.family_id.replace(":", ".").split(".")
+    if any(part in {"target", "tp", "takeprofit", "take_profit"} for part in family_parts):
+        return True
+    reason = directive.reason.lower()
+    return "take-profit" in reason or "take profit" in reason or any(
+        marker in directive.reason for marker in ("止盈", "目标已", "目标价", "目标结构")
+    )
+
+
+def _augment_bundles(
+    bundles: tuple[EvidenceBundle, ...],
+    results: Sequence[AnalysisToolResult],
+) -> tuple[EvidenceBundle, ...]:
+    augmented = []
+    for bundle in bundles:
+        related = [
+            result for result in results if result.symbol is None or result.symbol == bundle.symbol
+        ]
+        if not related:
+            augmented.append(bundle)
+            continue
+        items = list(bundle.evidence_items)
+        assessments = list(bundle.tool_assessments)
+        known = {item.evidence_id for item in items}
+        for result in related:
+            new_items = [item for item in result.evidence_items if item.evidence_id not in known]
+            items.extend(new_items)
+            known.update(item.evidence_id for item in new_items)
+            assessments.append(
+                ToolAssessment(
+                    tool=f"CODEX_TOOL:{result.tool}",
+                    status=result.status,
+                    version="host-registry-v1",
+                    reason=(result.error or "host-managed read-only tool completed")[:500],
+                    latency_ms=result.latency_ms,
+                    evidence_ids=tuple(item.evidence_id for item in new_items),
+                )
+            )
+        augmented.append(
+            bundle.model_copy(
+                update={
+                    "evidence_items": tuple(items),
+                    "tool_assessments": tuple(assessments),
+                }
+            )
+        )
+    return tuple(augmented)
+
+
+def _monitoring_current_values(
+    bundle: EvidenceBundle,
+) -> dict[MonitoringMetric, Decimal]:
+    values: dict[MonitoringMetric, Decimal] = {
+        MonitoringMetric.LAST_PRICE: bundle.canonical_last.value,
+        MonitoringMetric.MARK_PRICE: bundle.canonical_mark.value,
+    }
+    timeframe_metrics = {
+        ".PA.1M": MonitoringMetric.COMPLETED_1M_CLOSE,
+        ".PA.5M": MonitoringMetric.COMPLETED_5M_CLOSE,
+        ".PA.15M": MonitoringMetric.COMPLETED_15M_CLOSE,
+        ".PA.30M": MonitoringMetric.COMPLETED_30M_CLOSE,
+        ".PA.1H": MonitoringMetric.COMPLETED_1H_CLOSE,
+    }
+    for suffix, metric in timeframe_metrics.items():
+        item = _evidence_values(bundle, suffix)
+        number = _number(item or {}, "latest_close")
+        if number is not None:
+            values[metric] = Decimal(str(number))
+        if suffix == ".PA.1M":
+            turnover = _number(item or {}, "latest_turnover")
+            if turnover is not None:
+                values[MonitoringMetric.TURNOVER_1M] = Decimal(str(turnover))
+    ticker = _evidence_values(bundle, ".BYBIT.TICKER")
+    spread = _number(ticker or {}, "spread_bps")
+    if spread is not None:
+        values[MonitoringMetric.SPREAD_BPS] = Decimal(str(spread))
+    derivatives = _evidence_values(bundle, ".DERIVATIVES")
+    for key, metric in (
+        ("current_open_interest", MonitoringMetric.OPEN_INTEREST),
+        ("funding_rate", MonitoringMetric.FUNDING_RATE),
+    ):
+        number = _number(derivatives or {}, key)
+        if number is not None:
+            values[metric] = Decimal(str(number))
+    book = _evidence_values(bundle, ".MICRO.BOOK")
+    imbalance = _number(book or {}, "imbalance_top5")
+    if imbalance is not None:
+        values[MonitoringMetric.ORDERBOOK_IMBALANCE_L5] = Decimal(str(imbalance))
+    trades_30s = _evidence_values(bundle, ".MICRO.TRADES.30S")
+    if trades_30s is not None and trades_30s.get("qualified") is True:
+        trade_delta = _number(trades_30s, "signed_delta_notional")
+        if trade_delta is not None:
+            values[MonitoringMetric.TRADE_DELTA_30S] = Decimal(str(trade_delta))
+    liquidation = _evidence_values(bundle, ".LIQUIDATIONS.1M")
+    if liquidation is not None and liquidation.get("coverage_complete") is True:
+        long_notional = _number(liquidation, "long_notional") or 0
+        short_notional = _number(liquidation, "short_notional") or 0
+        values[MonitoringMetric.LIQUIDATION_NOTIONAL_1M] = Decimal(
+            str(long_notional + short_notional)
+        )
+    return values
+
+
+def _normalize_reviewed_baselines(
+    review: MonitoringRuleReview,
+    bundle: EvidenceBundle,
+) -> MonitoringRuleReview:
+    """Use host-observed baselines while leaving model strategy values untouched."""
+
+    current_values = _monitoring_current_values(bundle)
+    atr1 = _number(_evidence_values(bundle, ".PA.1M") or {}, "atr_14")
+    directives: list[MonitoringDirective] = []
+    for directive in review.directives:
+        current = current_values.get(directive.metric)
+        distance_percent = None
+        distance_atr = None
+        if current is not None:
+            distance = abs(directive.threshold - current)
+            distance_percent = distance / current * 100 if current else None
+            if atr1 is not None and atr1 > 0:
+                distance_atr = distance / Decimal(str(atr1))
+        confirmations = tuple(
+            confirmation.model_copy(
+                update={
+                    "current_value": current_values.get(
+                        confirmation.metric, confirmation.current_value
+                    )
+                }
+            )
+            for confirmation in directive.confirmations
+        )
+        directives.append(
+            directive.model_copy(
+                update={
+                    "current_value": current,
+                    "distance_percent": distance_percent,
+                    "distance_atr": distance_atr,
+                    "valid_for_seconds": min(
+                        max(directive.valid_for_seconds, 1800), 3600
+                    ),
+                    "confirmations": confirmations,
+                }
+            )
+        )
+    return review.model_copy(update={"directives": tuple(directives)})
+
+
+def _validate_reviewed_directives(
+    directives: Sequence[MonitoringDirective],
+    bundle: EvidenceBundle,
+    assessment: CandidateAssessment,
     *,
-    high: bool,
-    timeframe_minutes: int,
-) -> int | None:
-    prefix = "pivot_high" if high else "pivot_low"
-    explicit = _number(values, f"{prefix}_age_bars")
-    if explicit is not None and explicit >= 0:
-        return round(explicit)
-    confirmed = values.get(f"{prefix}_confirmed_at")
-    latest = values.get("latest_completed_close_time")
-    if not isinstance(confirmed, str) or not isinstance(latest, str):
-        return None
-    try:
-        confirmed_at = datetime.fromisoformat(confirmed)
-        latest_at = datetime.fromisoformat(latest)
-    except ValueError:
-        return None
-    seconds = (latest_at - confirmed_at).total_seconds()
-    if seconds < 0:
-        return None
-    return round(seconds / (timeframe_minutes * 60))
+    allow_partial_consecutive_crossing: bool = False,
+) -> None:
+    if len(directives) > 3:
+        raise ValueError(f"{bundle.symbol} monitoring review exceeds three rules")
+    known = {item.evidence_id for item in bundle.evidence_items}
+    current_values = _monitoring_current_values(bundle)
+    family_ids: set[str] = set()
+    semantic_keys: set[tuple[MonitoringMetric, Comparator, Decimal]] = set()
+    for directive in directives:
+        if directive.family_id in family_ids:
+            raise ValueError(f"{bundle.symbol} duplicate monitoring family {directive.family_id}")
+        family_ids.add(directive.family_id)
+        if directive.metric not in _STRUCTURAL_MONITORING_METRICS:
+            raise ValueError(
+                f"{bundle.symbol} {directive.family_id} must use a completed-candle "
+                "price structure as its primary condition"
+            )
+        if _is_target_monitoring_directive(directive):
+            raise ValueError(
+                f"{bundle.symbol} {directive.family_id} cannot reference take-profit or target"
+            )
+        _validate_counter_direction_threat(directive, assessment, bundle.symbol)
+        key = (directive.metric, directive.comparator, directive.threshold)
+        if key in semantic_keys:
+            raise ValueError(f"{bundle.symbol} contains duplicate monitoring expressions")
+        semantic_keys.add(key)
+        current = current_values.get(directive.metric)
+        if current is None:
+            raise ValueError(
+                f"{bundle.symbol} {directive.family_id} primary metric has no current baseline"
+            )
+        if directive.current_value is None or not _baseline_matches(
+            directive.current_value, current
+        ):
+            raise ValueError(
+                f"{bundle.symbol} {directive.family_id} primary baseline is stale or missing"
+            )
+        if _condition_met(current, directive.comparator, directive.threshold) and not (
+            allow_partial_consecutive_crossing
+            and directive.required_consecutive_observations > 1
+        ):
+            raise ValueError(
+                f"{bundle.symbol} {directive.family_id} complete primary condition is already met"
+            )
+        referenced = set(directive.evidence_ids)
+        for confirmation in directive.confirmations:
+            if confirmation.metric not in _SUPPORTED_MONITORING_METRICS:
+                raise ValueError(
+                    f"{bundle.symbol} {directive.family_id} confirmation metric is unsupported"
+                )
+            confirmation_current = current_values.get(confirmation.metric)
+            if confirmation_current is None or not _baseline_matches(
+                confirmation.current_value, confirmation_current
+            ):
+                raise ValueError(
+                    f"{bundle.symbol} {directive.family_id} confirmation baseline is unavailable"
+                )
+            referenced.update(confirmation.evidence_ids)
+        if not referenced <= known:
+            raise ValueError(
+                f"{bundle.symbol} {directive.family_id} references unknown evidence IDs"
+            )
+
+
+def _validate_counter_direction_threat(
+    directive: MonitoringDirective,
+    assessment: CandidateAssessment,
+    symbol: str,
+) -> None:
+    direction = assessment.direction
+    invalidation = assessment.invalidation
+    if direction is None or invalidation is None:
+        raise ValueError(f"{symbol} monitoring review lacks direction invalidation context")
+    if direction is Direction.LONG_BIAS:
+        if directive.comparator is not Comparator.LESS_THAN:
+            raise ValueError(
+                f"{symbol} {directive.family_id} is not a counter-direction LONG threat"
+            )
+        if directive.threshold < invalidation.reference_price:
+            raise ValueError(
+                f"{symbol} {directive.family_id} crosses beyond the formal LONG "
+                "direction invalidation level"
+            )
+    else:
+        if directive.comparator is not Comparator.GREATER_THAN:
+            raise ValueError(
+                f"{symbol} {directive.family_id} is not a counter-direction SHORT threat"
+            )
+        if directive.threshold > invalidation.reference_price:
+            raise ValueError(
+                f"{symbol} {directive.family_id} crosses beyond the formal SHORT "
+                "direction invalidation level"
+            )
+
+
+def _baseline_matches(given: Decimal, actual: Decimal) -> bool:
+    tolerance = max(abs(actual) * Decimal("0.001"), Decimal("0.00000001"))
+    return abs(given - actual) <= tolerance
+
+
+def _condition_met(value: Decimal, comparator: Comparator, threshold: Decimal) -> bool:
+    if comparator is Comparator.GREATER_THAN:
+        return value > threshold
+    return value < threshold

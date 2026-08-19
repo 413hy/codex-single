@@ -10,8 +10,9 @@ from typing import Any, ClassVar, Literal, TypeVar
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from bybit_signal.domain.models import Candle, Symbol
+from bybit_signal.domain.models import Candle, MarketContext, Symbol
 from bybit_signal.providers.bybit import (
+    BybitLongShortRatio,
     BybitOpenInterest,
     BybitOrderBook,
     BybitPublicClient,
@@ -22,8 +23,10 @@ from bybit_signal.providers.cross_exchange import (
     CrossExchangePublicClient,
     ReferenceTicker,
 )
+from bybit_signal.providers.market_context import MarketContextCollector
+from bybit_signal.providers.public_streams import LiquidationWindow, PublicStreamCache
 
-DeepTimeframe = Literal["5m", "15m", "30m", "1h", "4h"]
+DeepTimeframe = Literal["1m", "5m", "15m", "30m", "1h", "4h"]
 DeepCandleSet = dict[DeepTimeframe, tuple[Candle, ...]]
 T = TypeVar("T")
 
@@ -42,7 +45,11 @@ class NativeMarketSnapshot(BaseModel):
     orderbook: BybitOrderBook | None = None
     recent_trades: tuple[BybitPublicTrade, ...] = ()
     open_interest: tuple[BybitOpenInterest, ...] = ()
+    long_short_ratios: tuple[BybitLongShortRatio, ...] = ()
+    liquidation_window: LiquidationWindow | None = None
+    liquidation_window_1m: LiquidationWindow | None = None
     reference_tickers: tuple[ReferenceTicker, ...] = ()
+    market_context: MarketContext | None = None
     collection_failures: dict[str, str] = Field(default_factory=dict)
 
     @model_validator(mode="after")
@@ -59,6 +66,7 @@ class NativeMarketSnapshot(BaseModel):
             self.ticker,
             *self.recent_trades,
             *self.open_interest,
+            *self.long_short_ratios,
             *self.reference_tickers,
             *(candle for values in self.candles.values() for candle in values),
         )
@@ -66,11 +74,7 @@ class NativeMarketSnapshot(BaseModel):
             related = (*related, self.orderbook)
         if any(getattr(item, "symbol", None) != self.symbol for item in related):
             raise ValueError("native market snapshot contains another symbol")
-        if any(
-            not candle.completed
-            for candles in self.candles.values()
-            for candle in candles
-        ):
+        if any(not candle.completed for candles in self.candles.values() for candle in candles):
             raise ValueError("native market snapshot contains a forming candle")
         timestamps = [
             self.ticker.observed_at,
@@ -94,8 +98,9 @@ class NativeMarketSnapshot(BaseModel):
 class BybitDeepMarketCollector:
     """Build a compact, auditable evidence snapshot from Bybit public endpoints."""
 
-    _TIMEFRAMES: tuple[DeepTimeframe, ...] = ("5m", "15m", "30m", "1h", "4h")
+    _TIMEFRAMES: tuple[DeepTimeframe, ...] = ("1m", "5m", "15m", "30m", "1h", "4h")
     _MINIMUM_CANDLES: ClassVar[dict[DeepTimeframe, int]] = {
+        "1m": 180,
         "5m": 120,
         "15m": 96,
         "30m": 72,
@@ -103,6 +108,7 @@ class BybitDeepMarketCollector:
         "4h": 30,
     }
     _DURATIONS: ClassVar[dict[DeepTimeframe, timedelta]] = {
+        "1m": timedelta(minutes=1),
         "5m": timedelta(minutes=5),
         "15m": timedelta(minutes=15),
         "30m": timedelta(minutes=30),
@@ -117,11 +123,17 @@ class BybitDeepMarketCollector:
         reference_client: CrossExchangePublicClient | None = None,
         candle_limit: int = 240,
         request_concurrency: int = 8,
+        market_context_collector: MarketContextCollector | None = None,
+        stream_cache: PublicStreamCache | None = None,
     ) -> None:
         self._client = client
         self._reference_client = reference_client
         self._candle_limit = candle_limit
         self._semaphore = asyncio.Semaphore(request_concurrency)
+        self._stream_cache = stream_cache
+        self._market_context_collector = market_context_collector or MarketContextCollector(
+            client, stream_cache=stream_cache
+        )
 
     async def collect_many(
         self, symbols: Sequence[str]
@@ -141,6 +153,27 @@ class BybitDeepMarketCollector:
                 failures[symbol] = f"{type(error).__name__}: {error}"
 
         await asyncio.gather(*(collect_one(symbol) for symbol in symbols))
+        candidate_candles = {
+            symbol: snapshot.candles.get("5m", ()) for symbol, snapshot in snapshots.items()
+        }
+        try:
+            context = await self._market_context_collector.collect(
+                tickers=tickers,
+                candidate_candles=candidate_candles,
+            )
+        except Exception as error:
+            context = None
+            failures["MARKET_CONTEXT"] = f"{type(error).__name__}: {error}"
+        if context is not None:
+            snapshots = {
+                symbol: snapshot.model_copy(
+                    update={
+                        "market_context": context,
+                        "generated_at": max(snapshot.generated_at, context.generated_at),
+                    }
+                )
+                for symbol, snapshot in snapshots.items()
+            }
         return snapshots, failures
 
     async def collect(
@@ -172,9 +205,7 @@ class BybitDeepMarketCollector:
             self._safe("orderbook", lambda: self._client.orderbook(symbol, limit=50))
         )
         trades_task = asyncio.create_task(
-            self._safe(
-                "recent_trades", lambda: self._client.recent_trades(symbol, limit=1000)
-            )
+            self._safe("recent_trades", lambda: self._client.recent_trades(symbol, limit=1000))
         )
         oi_task = asyncio.create_task(
             self._safe(
@@ -182,6 +213,16 @@ class BybitDeepMarketCollector:
                 lambda: self._client.open_interest_history(
                     symbol,
                     interval="5min",
+                    limit=48,
+                ),
+            )
+        )
+        ratio_task = asyncio.create_task(
+            self._safe(
+                "long_short_ratio",
+                lambda: self._client.long_short_ratio(
+                    symbol,
+                    period="5min",
                     limit=48,
                 ),
             )
@@ -199,19 +240,33 @@ class BybitDeepMarketCollector:
             if error is not None or value is None:
                 failures[f"candles.{timeframe}"] = error or "empty candle result"
                 continue
-            values = tuple(value)
+            # A request can finish just after a natural candle boundary. Preserve
+            # the collection-start cutoff by trimming newly completed rows instead
+            # of discarding the entire timeframe as internally inconsistent.
+            values = tuple(candle for candle in value if candle.close_time <= started_at)
             quality_error = self._candle_quality_error(timeframe, values, started_at)
             if quality_error is not None:
                 failures[f"candles.{timeframe}"] = quality_error
                 continue
             candles[timeframe] = values
 
-        orderbook_result, trades_result, oi_result = await asyncio.gather(
-            orderbook_task, trades_task, oi_task
+        orderbook_result, trades_result, oi_result, ratio_result = await asyncio.gather(
+            orderbook_task, trades_task, oi_task, ratio_task
         )
         orderbook = self._optional_value("orderbook", orderbook_result, failures)
         trades = self._optional_value("recent_trades", trades_result, failures) or ()
         open_interest = self._optional_value("open_interest", oi_result, failures) or ()
+        long_short_ratios = self._optional_value("long_short_ratio", ratio_result, failures) or ()
+        liquidation_window = (
+            self._stream_cache.liquidation_window(symbol, seconds=300)
+            if self._stream_cache is not None
+            else None
+        )
+        liquidation_window_1m = (
+            self._stream_cache.liquidation_window(symbol, seconds=60)
+            if self._stream_cache is not None
+            else None
+        )
         reference_tickers: tuple[ReferenceTicker, ...] = ()
         if reference_task is not None:
             reference_tickers, reference_failures = await reference_task
@@ -235,6 +290,9 @@ class BybitDeepMarketCollector:
             orderbook=orderbook,
             recent_trades=tuple(trades),
             open_interest=tuple(open_interest),
+            long_short_ratios=tuple(long_short_ratios),
+            liquidation_window=liquidation_window,
+            liquidation_window_1m=liquidation_window_1m,
             reference_tickers=reference_tickers,
             collection_failures=failures,
         )

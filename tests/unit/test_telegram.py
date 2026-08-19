@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime, timedelta
@@ -18,6 +19,7 @@ from bybit_signal.domain.enums import (
     Direction,
     MonitoringMetric,
     PriceType,
+    RetryStatus,
     SignalConfidence,
     SignalStrength,
     ToolStatus,
@@ -34,9 +36,52 @@ from bybit_signal.domain.models import (
     SignalConclusion,
     ToolAssessment,
 )
-from bybit_signal.notifications.formatter import cycle_notification, detail_notification
+from bybit_signal.failures import failure_from_cycle
+from bybit_signal.monitoring.engine import ThresholdEvent, TriggeredCondition
+from bybit_signal.notifications.formatter import (
+    cycle_notification,
+    detail_notification,
+    threshold_trigger_notification,
+)
 from bybit_signal.notifications.telegram import TelegramBot, TelegramError
 from bybit_signal.storage.sqlite import SignalStore
+
+
+def test_threshold_notification_shows_every_matched_condition() -> None:
+    now = datetime.now(UTC)
+    event = ThresholdEvent(
+        analysis_id="analysis_01",
+        symbol="JCTUSDT",
+        family_id="jctusdt-long-1m-pivot-loss",
+        metric=MonitoringMetric.COMPLETED_1M_CLOSE,
+        observed_value=Decimal("0.001854"),
+        threshold=Decimal("0.001861"),
+        observed_at=now,
+        reason="price structure is under counter-direction pressure",
+        critical=False,
+        matched_conditions=(
+            TriggeredCondition(
+                metric=MonitoringMetric.COMPLETED_1M_CLOSE,
+                comparator=Comparator.LESS_THAN,
+                threshold=Decimal("0.001861"),
+                observed_value=Decimal("0.001854"),
+            ),
+            TriggeredCondition(
+                metric=MonitoringMetric.TRADE_DELTA_30S,
+                comparator=Comparator.LESS_THAN,
+                threshold=Decimal("0"),
+                observed_value=Decimal("-1500"),
+            ),
+        ),
+    )
+
+    text = threshold_trigger_notification(event)
+
+    assert "完整触发条件" in text
+    assert "COMPLETED_1M_CLOSE" in text
+    assert "TRADE_DELTA_30S" in text
+    assert "-1500" in text
+    assert "旧阈值已失效" in text
 
 
 def _cycle() -> AnalysisCycleResult:
@@ -201,9 +246,7 @@ def _failed_cycle(analysis_id: str = "analysis_fail_01") -> AnalysisCycleResult:
 
 def _all_keys(value: Any) -> set[str]:
     if isinstance(value, Mapping):
-        return set(value) | {
-            key for child in value.values() for key in _all_keys(child)
-        }
+        return set(value) | {key for child in value.values() for key in _all_keys(child)}
     if isinstance(value, Sequence) and not isinstance(value, (str, bytes)):
         return {key for child in value for key in _all_keys(child)}
     return set()
@@ -334,9 +377,10 @@ async def test_callback_is_answered_before_details_are_sent(tmp_path: Path) -> N
         "editMessageText",
     ]
     assert "CYSUSDT 分析详情" in recorder.calls[1][1]["text"]
-    assert recorder.calls[1][1]["reply_markup"]["inline_keyboard"][0][0][
-        "callback_data"
-    ] == "back:analysis_01"
+    assert (
+        recorder.calls[1][1]["reply_markup"]["inline_keyboard"][0][0]["callback_data"]
+        == "back:analysis_01"
+    )
 
     back = {
         "callback_query": {
@@ -356,7 +400,7 @@ async def test_callback_is_answered_before_details_are_sent(tmp_path: Path) -> N
     await bot.close()
 
 
-async def test_failure_notice_is_deduplicated_and_recovery_is_announced(
+async def test_distinct_failures_are_delivered_and_recovery_is_announced(
     tmp_path: Path,
 ) -> None:
     recorder = TelegramRecorder()
@@ -369,10 +413,107 @@ async def test_failure_notice_is_deduplicated_and_recovery_is_announced(
     await bot.deliver_cycle(_cycle())
 
     sends = [payload for method, payload in recorder.calls if method == "sendMessage"]
-    assert len(sends) == 3
-    assert "信号分析暂不可用" in sends[0]["text"]
-    assert "模型分析已经恢复" in sends[1]["text"]
-    assert "本轮主信号: <b>2</b> / 2" in sends[2]["text"]
+    assert len(sends) == 4
+    assert "流程异常 · 定时方向分析" in sends[0]["text"]
+    assert "流程异常 · 定时方向分析" in sends[1]["text"]
+    assert "模型分析已经恢复" in sends[2]["text"]
+    assert "本轮主信号: <b>2</b> / 2" in sends[3]["text"]
+    await bot.close()
+
+
+async def test_failure_card_explains_stage_and_supports_diagnostic_round_trip(
+    tmp_path: Path,
+) -> None:
+    recorder = TelegramRecorder()
+    bot, store = await _bot(tmp_path, recorder)
+    failed = _failed_cycle()
+    await store.save_cycle(failed, ())
+
+    await bot.deliver_cycle(failed)
+
+    sent = [payload for method, payload in recorder.calls if method == "sendMessage"][-1]
+    assert "第 3/4 步 · 模型方向分析" in sent["text"]
+    assert "直接原因: login required" in sent["text"]
+    assert "影响:" in sent["text"]
+    assert "解决方式:" in sent["text"]
+    buttons = sent["reply_markup"]["inline_keyboard"]
+    retry_callback = buttons[0][0]["callback_data"]
+    diagnostic_callback = buttons[1][0]["callback_data"]
+    token = retry_callback.split(":", 1)[1]
+    assert diagnostic_callback == f"failure:{token}"
+
+    await bot._handle_update(
+        {
+            "callback_query": {
+                "id": "failure-detail",
+                "from": {"id": 456},
+                "message": {"message_id": 10, "chat": {"id": 123}},
+                "data": diagnostic_callback,
+            }
+        }
+    )
+
+    assert [method for method, _ in recorder.calls[-2:]] == [
+        "answerCallbackQuery",
+        "editMessageText",
+    ]
+    detail = recorder.calls[-1][1]
+    assert "完整诊断链" in detail["text"]
+    assert detail["reply_markup"]["inline_keyboard"][-1][0]["callback_data"] == (
+        f"fback:{token}"
+    )
+    await bot.close()
+
+
+async def test_retry_callback_is_acknowledged_then_runs_once_in_background(
+    tmp_path: Path,
+) -> None:
+    recorder = TelegramRecorder()
+    bot, store = await _bot(tmp_path, recorder)
+    failed = _failed_cycle()
+    await store.save_cycle(failed, ())
+    started = asyncio.Event()
+    release = asyncio.Event()
+    calls = 0
+
+    async def retry_handler(_event: Any) -> str:
+        nonlocal calls
+        calls += 1
+        started.set()
+        await release.wait()
+        return "analysis_retry_success"
+
+    bot.set_retry_handler(retry_handler)
+    job = await bot.deliver_failure_event(failure_from_cycle(failed))
+    assert job is not None
+    callback = {
+        "callback_query": {
+            "id": "retry-1",
+            "from": {"id": 456},
+            "message": {"message_id": 10, "chat": {"id": 123}},
+            "data": f"retry:{job.token}",
+        }
+    }
+
+    before = len(recorder.calls)
+    await bot._handle_update(callback)
+    await asyncio.wait_for(started.wait(), timeout=1)
+
+    assert recorder.calls[before][0] == "answerCallbackQuery"
+    assert calls == 1
+    callback["callback_query"]["id"] = "retry-2"
+    await bot._handle_update(callback)
+    assert calls == 1
+
+    release.set()
+    for _ in range(50):
+        completed = await store.retry_job(job.token)
+        if completed is not None and completed.status is RetryStatus.SUCCEEDED:
+            break
+        await asyncio.sleep(0.01)
+    else:
+        raise AssertionError("background retry did not complete")
+    assert completed.result_analysis_id == "analysis_retry_success"
     await bot.close()
 
 

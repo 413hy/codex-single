@@ -1,5 +1,7 @@
 # 固定双主信号实施计划
 
+> 历史专题计划。固定 Top2 与 Telegram 导航仍有效；方向、阈值、并发、失败和部署以 [`2026-08-19-model-centered-signal-system-reliability-implementation.md`](2026-08-19-model-centered-signal-system-reliability-implementation.md) 为唯一实施依据。
+
 1. 扩展领域合同：周期模式、周期状态、selection rank、confidence、selected symbols/count 与新生命周期；保持旧 SQLite JSON 可读取。
 2. 重写定时分析合同：正常批次必须恰好选出两个相对最优主信号，非主信号不带监测指令；紧急单币分析使用独立校验模式。
 3. 调整方向策略：15m/5m 决定 30–60 分钟方向，双假设比较；宿主联合冲突校验只作用于主信号，不自动生成方向或降级 WATCH。

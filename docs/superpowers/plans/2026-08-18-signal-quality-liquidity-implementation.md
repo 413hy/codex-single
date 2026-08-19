@@ -1,5 +1,7 @@
 # 信号质量与流动性优化实施计划
 
+> 历史专题计划。流动性字段仍有参考价值，但方向、WATCH、阈值、模型和验收逻辑已由 [`2026-08-19-model-centered-signal-system-reliability-implementation.md`](2026-08-19-model-centered-signal-system-reliability-implementation.md) 取代，禁止据此恢复旧策略门槛。
+
 1. 扩展扫描配置与候选特征，应用 150 万 USDT/24h、5 万 USDT/30m、25 bps 三项准入条件。
 2. 扩展完成 K 线证据，提供 1 周期收益、滚动高低点 ATR 距离、pivot 年龄和 30m 绝对成交额。
 3. 调整分析 Prompt，使 15m/5m 决定近端方向，1h/4h 只提供背景，并加入急拉/急跌衰竭规则。

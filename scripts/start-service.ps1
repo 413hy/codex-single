@@ -18,6 +18,18 @@ if (-not (Test-Path -LiteralPath $configPath -PathType Leaf)) {
 }
 New-Item -ItemType Directory -Force -Path $stateRoot, $logRoot | Out-Null
 
+$running = @(
+    Get-CimInstance Win32_Process | Where-Object {
+        $_.Name -match '^python(w)?\.exe$' -and
+        $_.CommandLine -like "*$projectRoot*" -and
+        $_.CommandLine -like "*bybit_signal*serve*"
+    }
+)
+if ($running.Count -gt 0) {
+    $runningIds = ($running | Select-Object -ExpandProperty ProcessId) -join ", "
+    throw "Signal service process tree is already running: PID(s) $runningIds"
+}
+
 if (Test-Path -LiteralPath $pidPath -PathType Leaf) {
     $existingPid = [int](Get-Content -Raw -LiteralPath $pidPath)
     if (Get-Process -Id $existingPid -ErrorAction SilentlyContinue) {

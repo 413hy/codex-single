@@ -1,25 +1,36 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Mapping
+from collections.abc import Awaitable, Callable, Mapping
 from datetime import UTC, datetime
 from typing import Any, cast
 
 import httpx
 
 from bybit_signal.config import TelegramConfig
-from bybit_signal.domain.enums import CycleMode, CycleStatus
-from bybit_signal.domain.models import AnalysisCycleResult
+from bybit_signal.domain.enums import CycleMode, CycleStatus, FailureWorkflow, RetryStatus
+from bybit_signal.domain.models import AnalysisCycleResult, FailureEvent, RetryJob
+from bybit_signal.failures import (
+    RetrySuperseded,
+    failure_from_cycle,
+    redact_sensitive_text,
+)
+from bybit_signal.monitoring.engine import ThresholdEvent
 from bybit_signal.notifications.formatter import (
     cycle_notification,
     detail_notification,
     emergency_notification,
+    failure_diagnostic_notification,
     failure_notification,
+    retry_status_notification,
+    threshold_trigger_notification,
 )
 from bybit_signal.notifications.keyboards import (
     back_to_cycle_keyboard,
+    back_to_failure_keyboard,
     cycle_details_keyboard,
     details_keyboard,
+    failure_keyboard,
     main_reply_keyboard,
 )
 from bybit_signal.storage.sqlite import SignalStore
@@ -29,6 +40,9 @@ class TelegramError(RuntimeError):
     pass
 
 
+RetryHandler = Callable[[FailureEvent], Awaitable[str | None]]
+
+
 class TelegramBot:
     def __init__(
         self,
@@ -36,6 +50,7 @@ class TelegramBot:
         store: SignalStore,
         *,
         client: httpx.AsyncClient | None = None,
+        retry_handler: RetryHandler | None = None,
     ) -> None:
         if not config.enabled:
             raise ValueError("Telegram bot cannot start when notifications are disabled")
@@ -47,8 +62,17 @@ class TelegramBot:
             timeout=httpx.Timeout(60, connect=15),
             headers={"User-Agent": "bybit-multi-source-signal/0.1"},
         )
+        self._retry_handler = retry_handler
+        self._background_tasks: set[asyncio.Task[None]] = set()
+
+    def set_retry_handler(self, handler: RetryHandler) -> None:
+        self._retry_handler = handler
 
     async def close(self) -> None:
+        for task in tuple(self._background_tasks):
+            task.cancel()
+        if self._background_tasks:
+            await asyncio.gather(*self._background_tasks, return_exceptions=True)
         if self._owns_client:
             await self._client.aclose()
 
@@ -59,6 +83,8 @@ class TelegramBot:
         return cast(dict[str, Any], result)
 
     async def announce_started(self) -> None:
+        if not self._config.delivery_enabled:
+            return
         for chat_id in self._config.allowed_chat_ids:
             await self.send_message(
                 chat_id,
@@ -67,8 +93,10 @@ class TelegramBot:
             )
 
     async def deliver_cycle(self, cycle: AnalysisCycleResult) -> None:
+        if not self._config.delivery_enabled:
+            return
         if cycle.status is CycleStatus.FAILED:
-            await self._deliver_failure(cycle)
+            await self.deliver_failure_event(failure_from_cycle(cycle))
             return
         await self._deliver_recovery_if_needed()
         if cycle.mode is CycleMode.SCHEDULED:
@@ -90,24 +118,52 @@ class TelegramBot:
                 datetime.now(UTC).isoformat(),
             )
 
-    async def _deliver_failure(self, cycle: AnalysisCycleResult) -> None:
-        text, code = failure_notification(cycle)
-        state = f"FAILED:{code}"
-        if await self._store.bot_state("analysis_health_state") == state:
+    async def deliver_threshold_events(self, events: tuple[ThresholdEvent, ...]) -> None:
+        if not self._config.delivery_enabled:
             return
+        for event in events:
+            for chat_id in self._config.allowed_chat_ids:
+                if await self._store.event_delivery_exists(event.event_id, chat_id, "trigger"):
+                    continue
+                await self.send_message(
+                    chat_id,
+                    threshold_trigger_notification(event),
+                    reply_markup=details_keyboard(event.analysis_id, event.symbol),
+                )
+                await self._store.mark_event_delivered(
+                    event.event_id,
+                    chat_id,
+                    "trigger",
+                    datetime.now(UTC).isoformat(),
+                )
+
+    async def deliver_failure_event(self, event: FailureEvent) -> RetryJob | None:
+        if not self._config.delivery_enabled:
+            return None
+        job = await self._store.create_retry_job(event)
+        text = failure_notification(event)
         for chat_id in self._config.allowed_chat_ids:
+            if await self._store.event_delivery_exists(event.failure_id, chat_id, "failure"):
+                continue
             await self.send_message(
                 chat_id,
                 text,
-                reply_markup=main_reply_keyboard(),
+                reply_markup=failure_keyboard(
+                    job.token,
+                    retry_enabled=_retry_enabled(job),
+                ),
             )
-            await self._store.mark_delivered(
-                cycle.analysis_id,
+            await self._store.mark_event_delivered(
+                event.failure_id,
                 chat_id,
                 "failure",
                 datetime.now(UTC).isoformat(),
             )
-        await self._store.set_bot_state("analysis_health_state", state)
+        if event.workflow is not FailureWorkflow.MONITORING_SETUP:
+            await self._store.set_bot_state(
+                "analysis_health_state", f"FAILED:{event.failure_id}"
+            )
+        return job
 
     async def _deliver_recovery_if_needed(self) -> None:
         previous = await self._store.bot_state("analysis_health_state")
@@ -122,6 +178,7 @@ class TelegramBot:
             await self._store.set_bot_state("analysis_health_state", "HEALTHY")
 
     async def poll_forever(self, stop_event: asyncio.Event) -> None:
+        await self._store.interrupt_running_retry_jobs()
         offset_value = await self._store.bot_state("telegram_update_offset")
         offset = int(offset_value) if offset_value is not None else 0
         while not stop_event.is_set():
@@ -240,9 +297,7 @@ class TelegramBot:
             if isinstance(chat, Mapping) and isinstance(chat.get("id"), int):
                 chat_id = int(chat["id"])
             message_id_value = message.get("message_id")
-            message_id = (
-                int(message_id_value) if isinstance(message_id_value, int) else None
-            )
+            message_id = int(message_id_value) if isinstance(message_id_value, int) else None
         else:
             message_id = None
         if not isinstance(callback_id, str):
@@ -255,6 +310,73 @@ class TelegramBot:
             return
         await self._api("answerCallbackQuery", {"callback_query_id": callback_id})
         if not isinstance(data, str):
+            return
+        if data.startswith("failure:") or data.startswith("fback:"):
+            token = data.split(":", 1)[1]
+            job = await self._store.retry_job(token)
+            event = await self._failure_for_job(job)
+            if job is None or event is None:
+                await self.send_message(chat_id, "该异常诊断已不存在或已清理。")
+                return
+            if data.startswith("failure:"):
+                text = failure_diagnostic_notification(event, job)
+                markup = back_to_failure_keyboard(
+                    token,
+                    retry_enabled=_retry_enabled(job),
+                )
+            else:
+                text = failure_notification(event)
+                markup = failure_keyboard(
+                    token,
+                    retry_enabled=_retry_enabled(job),
+                )
+            await self._edit_or_send(chat_id, message_id, text, markup)
+            return
+        if data.startswith("retry:"):
+            token = data.split(":", 1)[1]
+            claimed = await self._store.claim_retry(token, user_id)
+            if claimed is None:
+                existing = await self._store.retry_job(token)
+                event = await self._failure_for_job(existing)
+                if existing is None or event is None:
+                    await self.send_message(chat_id, "该重试任务已不存在或已清理。")
+                    return
+                await self._edit_or_send(
+                    chat_id,
+                    message_id,
+                    retry_status_notification(
+                        event,
+                        existing,
+                        _non_claimed_retry_message(existing),
+                    ),
+                    failure_keyboard(
+                        token,
+                        retry_enabled=_retry_enabled(existing),
+                    ),
+                )
+                return
+            event = await self._failure_for_job(claimed)
+            if event is None:
+                await self._store.finish_retry(
+                    token,
+                    status=RetryStatus.FAILED,
+                    error="failure event missing",
+                )
+                await self.send_message(chat_id, "异常记录缺失, 无法安全重试。")
+                return
+            task = asyncio.create_task(self._run_retry(chat_id, token, event))
+            self._background_tasks.add(task)
+            task.add_done_callback(self._background_tasks.discard)
+            await self._edit_or_send(
+                chat_id,
+                message_id,
+                retry_status_notification(
+                    event,
+                    claimed,
+                    "已进入后台执行; Telegram 轮询和定时分析不会被阻塞。",
+                ),
+                failure_keyboard(token, retry_enabled=False),
+            )
             return
         if data.startswith("back:"):
             analysis_id = data.split(":", 1)[1]
@@ -288,6 +410,72 @@ class TelegramBot:
             detail_notification(conclusion),
             back_to_cycle_keyboard(conclusion.analysis_id),
         )
+
+    async def _failure_for_job(self, job: RetryJob | None) -> FailureEvent | None:
+        if job is None:
+            return None
+        return await self._store.failure(job.failure_id)
+
+    async def _run_retry(
+        self,
+        chat_id: int,
+        token: str,
+        event: FailureEvent,
+    ) -> None:
+        try:
+            if self._retry_handler is None:
+                raise RuntimeError("retry handler is not configured")
+            result_analysis_id = await self._retry_handler(event)
+            completed = await self._store.finish_retry(
+                token,
+                status=RetryStatus.SUCCEEDED,
+                result_analysis_id=result_analysis_id,
+            )
+            if completed is not None:
+                await self.send_message(
+                    chat_id,
+                    retry_status_notification(
+                        event,
+                        completed,
+                        "对应流程已完成; 新分析/监测结果已按正常通知流程发送。",
+                    ),
+                    reply_markup=main_reply_keyboard(),
+                )
+        except asyncio.CancelledError:
+            raise
+        except RetrySuperseded as error:
+            completed = await self._store.finish_retry(
+                token,
+                status=RetryStatus.SUPERSEDED,
+                error=redact_sensitive_text(error),
+            )
+            if completed is not None:
+                await self.send_message(
+                    chat_id,
+                    retry_status_notification(
+                        event,
+                        completed,
+                        "已有更新的权威分析, 本次旧重试已安全停止。",
+                    ),
+                    reply_markup=main_reply_keyboard(),
+                )
+        except Exception as error:
+            safe_error = redact_sensitive_text(f"{type(error).__name__}: {error}")
+            completed = await self._store.finish_retry(
+                token,
+                status=RetryStatus.FAILED,
+                error=safe_error,
+            )
+            if completed is not None:
+                await self.send_message(
+                    chat_id,
+                    retry_status_notification(
+                        event,
+                        completed,
+                        "重试流程仍未完成; 失败原因已写入完整诊断链, 可修复后再次重试。",
+                    ),
+                    reply_markup=failure_keyboard(token, retry_enabled=True),
+                )
 
     async def _edit_or_send(
         self,
@@ -348,3 +536,19 @@ def _message_chunks(text: str, limit: int = 3900) -> tuple[str, ...]:
     if remaining:
         chunks.append(remaining)
     return tuple(chunks)
+
+
+def _retry_enabled(job: RetryJob) -> bool:
+    return job.status in {
+        RetryStatus.AVAILABLE,
+        RetryStatus.FAILED,
+        RetryStatus.INTERRUPTED,
+    }
+
+
+def _non_claimed_retry_message(job: RetryJob) -> str:
+    return {
+        RetryStatus.RUNNING: "同一异常的重试已经在后台运行, 本次点击不会重复启动。",
+        RetryStatus.SUCCEEDED: "该异常已经重试成功, 不会重复执行。",
+        RetryStatus.SUPERSEDED: "该异常已被更新版本取代, 不再执行旧重试。",
+    }.get(job.status, "该重试当前不可领取, 请查看完整诊断链。")

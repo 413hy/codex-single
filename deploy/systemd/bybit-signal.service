@@ -9,17 +9,20 @@ User=bybit-signal
 Group=bybit-signal
 WorkingDirectory=/opt/bybit-signal
 Environment=HOME=/home/bybit-signal
+Environment=PATH=/home/bybit-signal/.local/bin:/home/bybit-signal/bin:/usr/local/bin:/usr/bin:/bin
 Environment=PYTHONUNBUFFERED=1
 EnvironmentFile=/opt/bybit-signal/.env
 ExecStart=/opt/bybit-signal/.venv/bin/python -m bybit_signal serve --config /opt/bybit-signal/config/system.local.yaml
 Restart=always
 RestartSec=10
 TimeoutStopSec=30
+KillMode=control-group
+UMask=0077
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=full
 ProtectHome=read-only
-ReadWritePaths=/opt/bybit-signal/runtime
+ReadWritePaths=/opt/bybit-signal/runtime /home/bybit-signal/.codex
 
 [Install]
 WantedBy=multi-user.target

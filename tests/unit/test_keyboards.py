@@ -5,8 +5,10 @@ import pytest
 
 from bybit_signal.notifications.keyboards import (
     back_to_cycle_keyboard,
+    back_to_failure_keyboard,
     cycle_details_keyboard,
     details_keyboard,
+    failure_keyboard,
     main_reply_keyboard,
 )
 
@@ -44,8 +46,26 @@ def test_cycle_details_and_back_keyboard_form_a_bounded_round_trip() -> None:
     back = back_to_cycle_keyboard("analysis_01")
 
     assert len(cycle["inline_keyboard"]) == 2
-    assert cycle["inline_keyboard"][0][0]["callback_data"] == (
-        "detail:analysis_01:CYSUSDT"
-    )
+    assert cycle["inline_keyboard"][0][0]["callback_data"] == ("detail:analysis_01:CYSUSDT")
     assert back["inline_keyboard"][0][0]["callback_data"] == "back:analysis_01"
     assert "remove_keyboard" not in _all_keys((cycle, back))
+
+
+def test_failure_keyboards_are_bounded_and_never_remove_reply_keyboard() -> None:
+    summary = failure_keyboard("0123456789abcdef")
+    detail = back_to_failure_keyboard("0123456789abcdef")
+
+    callbacks = [
+        button["callback_data"]
+        for keyboard in (summary, detail)
+        for row in keyboard["inline_keyboard"]
+        for button in row
+    ]
+    assert callbacks == [
+        "retry:0123456789abcdef",
+        "failure:0123456789abcdef",
+        "retry:0123456789abcdef",
+        "fback:0123456789abcdef",
+    ]
+    assert all(len(value.encode("utf-8")) <= 64 for value in callbacks)
+    assert "remove_keyboard" not in _all_keys((summary, detail))

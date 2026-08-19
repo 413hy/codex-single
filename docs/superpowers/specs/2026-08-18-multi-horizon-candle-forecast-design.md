@@ -1,5 +1,7 @@
 # 多周期 K 线预测设计
 
+> 历史专题设计。四个预测窗口仍保留；其余方向、监测、失败和模型运行语义以 [`2026-08-19-model-centered-signal-system-reliability-design.md`](2026-08-19-model-centered-signal-system-reliability-design.md) 为准。
+
 日期：2026-08-18  
 状态：用户已确认，已部署并通过灰盒验证
 

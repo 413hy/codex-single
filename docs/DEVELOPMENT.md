@@ -2,140 +2,149 @@
 
 ## 1. 最终需求镜像
 
-系统面向人工手动交易判断，全天候运行：
+这是一个 24/7 公开行情分析与 Telegram 通知系统，服务人工判断，不自动交易。
 
-1. 每个整点和半点扫描 Bybit 全量 USDT 线性永续；服务启动后先立即运行一轮。
-2. 从新鲜且可交易的动态币池中，按完成 5m K 线波动、成交额、spread 和数据完整度选 Top 5；GPS、TUT、ALICE、AIO、PORTAL、CYS、BTW、HEMI、SNXX、H 等只是偏好示例，不是白名单。
-3. 对 Top 5 和上一轮两个主信号币重新采集公开市场数据。上一轮主信号本轮即使不再进入 Top 5，也必须复核；若退出或失效则单独提醒并停止监测。
-4. `gpt-5.6-sol`、`high` 在一次批调用中独立分析全部币种，并在成功定时周期恰好选出 2 个相对最优主信号；内部 `STRONG/WATCH` 只表示证据质量，不决定名额。
-5. Telegram 每 30 分钟发送两个主信号。每条包含形成中 15m、形成中 30m、形成中 1h 和下一根 15m 预测；内部 WATCH 不通知。按钮可查看完整详情并返回本轮。
-6. 两轮之间使用公开 WebSocket 观察模型指定的少量动态阈值。穿越后只触发重新采集和紧急 Codex 复核，不直接形成信号或执行交易。
-7. 主导航只使用 ReplyKeyboardMarkup：`resize_keyboard=true`、`is_persistent=false`、`one_time_keyboard=false`；任何流程都不移除键盘。详情使用 InlineKeyboardMarkup，不改变已有 ReplyKeyboard 状态。
-8. 服务可在 Windows 本机隐藏运行，也能把项目和本文档交给 VPS Codex，按 systemd 部署。
+1. 服务启动立即运行一轮，以后每个自然整点和半点运行。
+2. 从 Bybit USDT 线性永续全市场中过滤 5 个“5m 波动机会大且流动性可用”的币。示例币不是白名单，新鲜度不是硬偏好。
+3. 深采 Top5 与市场背景，交给默认模型逐币独立分析；成功定时轮固定选择并通知 2 个相对最值得参考的方向。
+4. 每条主信号包含参考价、方向、可信度、市场状态、大致止盈位、形成中 15m/30m/1h、下一根完整 15m、相比上一轮、方向失效结构和摘要。非 Top2 不发送 WATCH 通知。
+5. 上轮主信号本轮退出时单独提示并停止监测。
+6. 模型为主信号产生反向结构威胁规则。模型基于独立新采证据再审核一次，宿主只做机械可执行性检查，然后交给实时程序观察。
+7. 首个完整命中立即使整组旧规则失效，先通知，再重采触发币和市场背景，唤醒模型重新分析、通知，并产生全新规则。crossing 本身不是方向失效。
+8. 旧规则持续到 `:00/:30` 定时任务真正开始并在边界原子停止；已接受的紧急流程继续，定时任务各跑各的、不等待。
+9. 所有失败通知必须指出工作流、具体步骤、直接原因、因果链、影响和解决方式，并提供“精准重试”和“完整诊断”按钮。
 
-## 2. 强制边界
+系统不读取或讨论账户、余额、仓位、保证金、杠杆、下单量、订单、盈亏或收益承诺；没有私有交易所接口。
 
-生产系统只使用公开市场数据，不需要 Bybit/Binance/OKX API Key。代码和 Prompt 均不得出现：
+## 2. 数据与过滤
 
-- 账户、余额、仓位、保证金、杠杆、盈亏、费率账户等级；
-- 下单数量、入场价建议、开仓/加仓/减仓/平仓/撤单；
-- 收益保证、基于固定资金或目标利润反推价格；
-- 私有 REST/WS、签名、API Secret 或交易权限；
-- Telegram 一键下单按钮。
+### 2.1 前置 Top5
 
-系统给出的“止盈位”是方向前方唯一近端结构目标；“失效条件”是市场结构条件，都由用户自行判断，不能解释成受托执行。
+动态币池来自 Bybit 可交易 USDT 线性永续。默认硬门槛：
 
-## 3. 数据合同
+- 24h 成交额不少于 1,500,000 USDT；
+- 最近 6 根完成 5m（30 分钟）成交额不少于 50,000 USDT；
+- ticker spread 不高于 25 bps；
+- 至少 48 根有效完成 5m，缺口不超过 2；
+- median 5m range 至少 0.15%，最大绝对 5m return 至少 0.35%。
 
-### 3.1 动态候选
+排序综合完成 5m 波动、收益离散、成交额、点差、深度、K 线重叠和冲击延伸。排名只表示“值得让模型分析”，不能投票决定多空。2026-08-19 真实扫描覆盖 717 个合约、193 个 ticker 合格币与 39 个深筛币；Top5 的 24h 成交额约 666 万至 1.23 亿 USDT、近 30m 约 9 万至 770 万 USDT，当前门槛没有继续抬高。
 
-- 从 Bybit instruments/tickers 获取当前可交易 USDT 线性永续。
-- 默认准入要求 24h 成交额不低于 150 万 USDT、最近 6 根已完成 5m K 线的合计成交额不低于 5 万 USDT、ticker spread 不高于 25 bps。三项门槛均可配置，用于排除明显冷清或滑点风险过高的币，而不是把候选变成大币成交额排行榜。
-- 深筛继续排除完成 5m K 线不足、缺口过多或波动不达阈值的币。
-- 排名使用完成 5m K 线的 median range、最大绝对收益、近期收益离散度和 log turnover；分数只表示值得分析，不代表多空。
+### 2.2 五币深采
 
-### 3.2 深采
+每币采集并冻结到统一截止时间：
 
-每个待分析币种采集：
+- last、mark、index、bid/ask、24h 成交、funding；
+- 完成 1m/5m/15m/30m/1h/4h K 线，通常各保留 239 根；
+- 50 档盘口 REST 快照、最多 1000 条近期成交；
+- OI 5m 历史 48 点、多空账户比、公开强平；
+- BTC/ETH、市场宽度与全市场背景；
+- Binance USD-M、OKX Swap 可用时的来源独立旁证。
 
-- Bybit last、mark、index、bid/ask、24h turnover、funding、OI；
-- 完成 5m/15m/30m/1h/4h K 线，各周期验证身份、间隔、缺口、陈旧和形成中柱排除；
-- order book 50 档 REST 快照；
-- recent trades 最多 1000 条，仅在覆盖窗口完整时计算 delta；
-- OI 5m 历史 48 点；
-- 可选 Binance USD-M 与 OKX Swap ticker，分别保留来源和时间。
+缺失、PARTIAL、STALE、WARMING_UP、UNAVAILABLE 和 ERROR 都不能填成零。Bybit 始终是主口径；参考所不支持某币只写入可选来源失败。
 
-同批 ticker 只请求一次。深采并发由 `runtime.market_request_concurrency` 限制；可选来源失败写入 `collection_failures`，不能填零或覆盖 Bybit。
+证据构建包含多周期 OHLCV、ATR%、EMA9/20/50、RSI14、MACD histogram、rolling high/low、方向效率、bull ratio、turnover ratio、已确认 pivot、spread、深度、recent-trade delta、OI 变化和覆盖质量。所有结论只能引用当前证据包真实存在的 evidence ID。
 
-### 3.3 证据
+## 3. 模型中心合同
 
-证据包包含冻结截止时间、源快照哈希、canonical last/mark、证据 ID 和工具质量状态。主要字段：
+正式默认配置：
 
-- 5m/15m/30m/1h/4h OHLCV、returns、ATR%、EMA9/20/50、RSI14、MACD histogram；
-- rolling20 高低/中位、方向效率、K 线重叠、bull ratio、turnover ratio；
-- 已确认 pivot 的发生时间和确认时间，不能使用未来柱；
-- spread、top5/top20 深度与 imbalance（只声明 REST 快照）；
-- 有覆盖门槛的 1m/5m recent-trade delta；
-- funding、OI 与 OI 变化；
-- 可选跨所 price divergence，Bybit 始终是基准。
+```yaml
+analysis:
+  model: gpt-5.6-terra
+  reasoning_effort: medium
+  timeout_seconds: 300
+  max_attempts: 2
+  monitoring_review_repair_attempts: 3
+```
 
-## 4. Codex 分析合同
+该组合来自 `sol/terra × medium/high` 各 3 轮隔离全流程测试的最佳样本对比，token 不参与选择。模型在临时空工作目录运行，禁用用户规则、原生 Skill、shell、插件、Apps 与任意网页访问；项目内 Skill/操作合同作为版本化提示文本显式注入。需要补数时只能请求宿主白名单只读工具。
 
-- CLI 调用为 `codex exec --ephemeral --ignore-user-config --sandbox read-only`。
-- 模型和推理强度固定来自配置，默认 `gpt-5.6-sol` / `high`。
-- 输入是排序、压缩、哈希后的单批 JSON；市场文本是数据，不具备指令权限。
-- 输出必须通过 Pydantic 生成的严格 JSON Schema；最多重试 2 次。
-- 宿主继续校验币种集合、evidence ID、主信号目标/失效几何、目标最大距离、四项预测窗口、监测 metric、family ID 和 1800–3600 秒有效期。
-- 30–60 分钟综合方向由 15m 主导，5m 负责眼前时机，30m 连接短线摆动与小时背景；1h/4h 不能覆盖已完成 15m/5m 的明确反向结构。
-- STRONG 需要 5m 时机、15m 结构和 1h/4h 背景没有未解释强冲突；逆趋势不能只凭超买超卖。急拉后出现近端回落、滚动高点回撤和新近 pivot high 时禁止继续追多，急跌后的规则完全对称。
-- 宿主对模型输出做方向一致性复核：只拒绝与完成 K 线证据冲突的方向并触发重试，不自行生成交易方向。
-- 两个主信号无论内部强度如何，都必须有方向、目标、失效条件、可信度和四项预测；非主信号不得带预测或监测指令。
-- 四项预测分别对应宿主计算的自然窗口，只输出方向、强度、窗口与依据，不编造精确 OHLC。模型预测不能在同轮或下轮当作市场事实。
-- 上一轮方向不放入模型上下文，避免锚定；模型本轮结论完成后，宿主才比较方向、目标和失效状态。追踪基准只取最近一个成功定时周期的两个主信号，紧急阈值复核不能覆盖它。
+模型职责：
 
-完整 Prompt 见 `prompts/signal_analysis_zh.md`。
+- 独立分析全部五币，比较趋势延续与冲击衰竭/反转；1h/4h 只作背景，30m/15m 定义近端结构，5m 确认时机，1m 细化超短节奏。
+- RSI、OI、资金费率、成交差、盘口、成交额、强平或跨所数据不能单独定向。
+- 定时模式 assessments 恰好覆盖五币，rank 1/2 恰好各一次；即使只有 LOW/MEDIUM，也必须给出相对最优两条，不拿 WATCH 凑通知。
+- 四项 K 线展望使用宿主给出的自然窗口，可彼此不同向，不能机械复制综合方向。
+- 大致止盈位只展示；不得用于排序、freshness、监测、生命周期或实际失效。
+- 正式方向失效必须是可验证的已完成 K 线结构条件，不是用户止损。
 
-## 5. Telegram 合同
+宿主不再维护隐藏的方向一致性、ATR 距离上下限、微观噪声阈值或“必须复制正式失效位”等第二套策略。宿主只检查：JSON Schema、币种/窗口/evidence ID、同指标基线、完成柱 primary、规则生成时未满足、目标禁用、组合表达式、连续观察数字一致、有效期和版本权威性。
 
-- Token 只从 `.env` 的 `BYBIT_SIGNAL_TELEGRAM__TOKEN` 读取；chat/user 均需白名单。
-- 每轮只投递一次，SQLite `deliveries` 负责幂等。
-- 核心通知包括：时间、两个主信号、参考价、综合方向、市场状态、唯一目标、四项 K 线预测、相比上一轮和方向失效。
-- InlineKeyboard callback 只包含 `analysis_id + symbol`，最长 64 UTF-8 bytes；点击后从 SQLite 获取已落库详情，详情页提供返回本轮按钮并优先编辑原消息。
-- `/start`、`/menu`、`/latest`、`/status` 与虚拟键盘均返回白名单用户；未知和未授权消息不响应。
-- 不发送 ReplyKeyboardRemove，不设置 `remove_keyboard`，不使用 one-time 或 persistent 常驻模式。
+## 4. 交付新鲜度
 
-## 6. 实时监测合同
+方向分析通过后，freshness 只复查模型明确写出的“完成 K 线正式失效条件”在模型运行期间是否已经成立。last/mark 瞬时刺穿、大致止盈到达、价格漂移、spread 或深度变化不能让合格方向自动失败。
 
-支持的指标只有 last、mark、spread、OI、funding 和完成 5m/15m/1h close。模型只为当前两个主信号生成 1–2 条动态阈值；内部 WATCH、退出币和历史残留不监测：
+正式失效已成立时，重采完整 Top5 并允许模型修复一次；仍不合格才关闭本轮。监测配置完全是后置独立阶段，失败不能清空已经成功的两个主信号。
 
-- 首次观测只武装，不把已经满足的条件当作新穿越；
-- crossing 后必须离开 hysteresis 区域才重新武装；
-- 同币 60 秒事件合并，10 分钟冷却；
-- 普通唤醒滚动 1 小时最多 10 次；family ID 含 invalidation 的紧急事件可绕过小时软上限，但不绕过单币冷却；
-- 指令在下一次 30 分钟轮次附近过期，定时轮次会替换为新指令；
-- 紧急轮次与定时轮次共用异步锁，禁止并行调用模型。
+## 5. 实时阈值合同
 
-## 7. 存储、MCP 与运维
+每个主信号最终按需保留 0–3 条规则；没有合格规则时该币正常不启用实时阈值，不重试、不通知失败，也不凑近阈值。两个主方向信号始终正常保留。
 
-- SQLite WAL 保存 cycle、conclusion、evidence bundle、delivery 和 bot offset。
-- MCP 只通过 stdio 暴露六个只读工具：健康、最新信号、详情、市场证据、监测阈值和历史。
-- 服务日志 UTC 写入 `runtime/logs/service.log`，5 MiB 轮转 5 份。
-- `runtime/state/service.lock` 防止重复调度器；Windows PID 文件只辅助脚本显示和停止，不代替文件锁。
-- 正式服务遇到单轮失败会记录异常并按错误类型去重通知，下一整点/半点继续；失败轮次没有伪信号，模型恢复时只发一次恢复消息。
+- primary 必须是反方向的完成 1m/5m/15m/30m/1h 价格结构，优先 5m/15m。结构锚点周期可以与执行周期不同；例如完成 1m 可以监测重新越过已确认 5m/15m pivot 或接受边界，避免等待完成 5m 才与正式失效同柱。
+- 先选择距当前最近、已确认且脱离普通噪声的真实反向锚点；已确认且约两个 1m ATR 之外的 1m pivot 可以独立作为早期结构。若没有额外中间锚点，只在正式失效结构价仍能由更快完成 1m 提供实际提前复核窗口时使用；否则不生成阈值。阈值可等于正式失效参考价但不得越过，因为 crossing 只请求复核。
+- 完成 1m 必须锚定真实的 1m/5m/15m 结构、明显超过普通 1m 噪声，并在需要时带反向组合确认；不能把任意中间收盘当结构。
+- OI、trade delta、orderbook、turnover、spread、funding、liquidation 只能作同一规则 confirmation，不能独立唤醒。
+- LONG 的继续上涨/新高/买方增强和 SHORT 的继续下跌/新低/卖方增强禁止唤醒。
+- 规则不能引用 take-profit 或目标到达。
+- 独立模型复核必须审计当前完成柱、结构锚点、ATR、近期 1m/5m 波动、点差和流动性，说明为何普通下一两根 1m 不会触发、又为何早于完整失效。
+- `required_consecutive_observations` 与“连续 N 根完成柱”自然语言严格一致；重复 WebSocket 完成柱不会累计次数。
+- 同一 `(analysis_id, symbol)` 只持久化首个完整事件并暂停全部 sibling；服务重启也不会复活。
+- 每小时约 10 次仅为软异常告警，不能丢弃已确认 crossing。控制频率依靠阈值语义、完成柱、组合确认与一次性消费。
+- `hysteresis` 仅是触发后的安全侧 re-arm buffer，首次命中始终直接比较 observation 与 threshold；不得把迟滞加减到首次触发位。
+- 独立模型复核写入的完成柱 `current_value` 由宿主按同批证据机械校正，并在激活时复查。只要固定结构 threshold 仍未满足，新完成柱向任一方向移动都只更新基线；若交付前已经穿越或规则不可执行，才只重采/重审该币最多 3 次。模型明确拒绝代表正常无阈值，立即结束且不进入失败链。主方向信号始终保留。
+- 阈值事件必须持久化并展示 primary、连续观察和所有 confirmation 的实际命中值，便于从通知还原执行条件。
 
-## 8. 代码导航
+触发顺序固定为：`原子落库/整组退役 → 阈值通知 → 单币与市场重采 → 模型紧急复核 → 复核通知 → 独立阈值复核 → 新 analysis_id 覆盖`。任何失败都保持旧规则退役。
 
-| 目录/文件 | 职责 |
+并发版本规则：
+
+- `:00/:30` 定时分析开始前原子持久化冻结旧规则；此前规则持续有效，不存在五分钟盲区。
+- 紧急与定时模型调用可以并行，定时任务不等待已经接受的紧急复核。
+- 最新成功定时周期是 Top2 权威版本。
+- 迟到紧急分析可以完成并通知，但 CAS 提交会拒绝它覆盖更新的定时版本。
+
+## 6. Telegram 合同
+
+主导航统一使用：
+
+```json
+{"resize_keyboard": true, "is_persistent": false, "one_time_keyboard": false}
+```
+
+任何流程都不发送 `ReplyKeyboardRemove` 或 `{"remove_keyboard": true}`。分析详情、返回本轮、异常重试与完整诊断使用 InlineKeyboard；callback data 限制在 64 UTF-8 bytes 内，收到 callback 先立即 ACK，再处理工作。
+
+失败重试任务写入 SQLite，按 failure ID 幂等创建、事务认领、后台执行；重复点击不会重复运行。服务重启把 RUNNING 标为 INTERRUPTED，可再次点击。按钮只重跑失败组件并获取最新数据；更新的权威版本已替代旧任务时返回 SUPERSEDED。
+
+敏感信息只从环境变量读取。异常文本、URL 与安全诊断在落库/通知前脱敏。
+
+## 7. 存储、只读 MCP 与代码导航
+
+SQLite WAL 保存 cycle、五币证据、conclusion、freshness、阈值事件、投递、失败事件、重试任务、Bot offset 和运行状态。`commit_monitoring_version` 使用事务 CAS 防止旧 scheduled/emergency review 覆盖新版本。
+
+stdio MCP 只暴露公开市场、信号、证据、监测、审计与结果读取工具；测试会扫描禁止账户、余额、仓位、杠杆和订单能力。
+
+| 路径 | 职责 |
 |---|---|
-| `providers/bybit.py` | Bybit 公共 REST 与类型模型 |
-| `providers/cross_exchange.py` | Binance/OKX 公开 ticker 旁证 |
-| `providers/deep_market.py` | 多周期深采、冻结截止和质量验证 |
-| `selection/scanner.py` | 动态币池与 Top 5 初筛 |
-| `evidence/builder.py` | 自建指标、结构和 evidence bundle |
-| `analysis/codex.py` | ephemeral Codex、Schema 与宿主校验 |
-| `orchestration/cycle.py` | 定时/紧急分析、追踪比较、落库 |
-| `monitoring/` | 阈值状态机、WS、合并与限频 |
-| `notifications/` | Telegram 格式、键盘、轮询与详情 |
-| `mcp_server.py` | 本地只读 MCP |
-| `service.py` / `operations.py` | 24/7 调度、生命周期、日志和锁 |
+| `selection/` | 全市场 Top5 过滤 |
+| `providers/` | Bybit 主数据、市场背景与参考所旁证 |
+| `evidence/` | 冻结证据与指标构建 |
+| `analysis/` | Codex 调用、只读工具、freshness、模型阈值复核 |
+| `orchestration/cycle.py` | 定时/紧急分析与监测发布编排 |
+| `monitoring/` | WebSocket 观察、组合规则、整组一次性消费 |
+| `notifications/` | Telegram 格式、键盘、回调与后台重试 |
+| `failures.py` | 结构化失败因果与脱敏 |
+| `storage/sqlite.py` | 审计、幂等与版本 CAS |
+| `.agents/skills/analyze-bybit-ultrashort-signals/` | 项目模型操作合同 |
 
-## 9. 验收标准
+## 8. 验证命令
 
-- 静态源码没有私有交易端点、签名或键盘移除字段；
-- 扫描与深采使用真实公开网络，完成柱和时间截止检查通过；
-- 每轮通常只调用一次模型，输出覆盖全部候选和追踪币；成功定时周期恰好两个主信号，模型失败周期为零；
-- 上轮主信号退出或失效仍作为独立状态更新出现，并停止实时监测；
-- 模型格式、未知 evidence、错误目标方向、四项预测缺失/错窗和不支持监测指标均被拒绝或重试；
-- Telegram 主 ReplyKeyboard 参数逐项精确匹配需求，InlineKeyboard 不移除它；
-- 阈值 crossing、hysteresis、过期、冷却、合并和小时软上限有自动化测试；
-- Ruff、mypy、pytest、真实 market-capture、完整 no-notify、正式 notify、MCP handshake 和服务存活检查全部通过。
+```powershell
+.\.venv\Scripts\python.exe -m bybit_signal config-check --config config\system.local.yaml
+.\.venv\Scripts\python.exe -m ruff check .
+.\.venv\Scripts\python.exe -m mypy src tests
+.\.venv\Scripts\python.exe -m pytest
+.\.venv\Scripts\python.exe -m bybit_signal run-cycle --config config\system.local.yaml --no-notify
+```
 
-## 10. 官方接口依据
-
-- Telegram Bot API（ReplyKeyboard、InlineKeyboard、getUpdates）：https://core.telegram.org/bots/api
-- Bybit V5 Kline：https://bybit-exchange.github.io/docs/v5/market/kline
-- Bybit public WebSocket Kline：https://bybit-exchange.github.io/docs/v5/websocket/public/kline
-- Bybit WebSocket endpoints：https://bybit-exchange.github.io/docs/v5/ws/connect
-- MCP Python SDK：https://github.com/modelcontextprotocol/python-sdk
-- Binance USD-M Futures market data：https://developers.binance.com/en/docs/catalog/core-trading-derivatives-trading-usd-s-m-futures/api/rest-api/market-data
-- OKX V5 API：https://www.okx.com/docs-v5/en/
+首次部署或重大重构时先在 shadow 保持 `monitoring.enabled=false`；静态、全量自动化、真实 Top5 深采、定时/紧急模型灰盒和版本替换检查通过后再启用。当前生产已经完成该验收，`monitoring.enabled=true`。
