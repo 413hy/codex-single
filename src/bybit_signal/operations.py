@@ -19,6 +19,13 @@ class _FcntlModule(Protocol):
     def flock(self, file_descriptor: int, operation: int) -> None: ...
 
 
+class _MsvcrtModule(Protocol):
+    LK_NBLCK: int
+    LK_UNLCK: int
+
+    def locking(self, file_descriptor: int, mode: int, length: int) -> None: ...
+
+
 _TELEGRAM_SECRET = re.compile(r"(?<![A-Za-z0-9_-])\d{6,12}:[A-Za-z0-9_-]{20,}")
 
 
@@ -66,8 +73,7 @@ class ServiceInstanceLock:
         handle.seek(0)
         try:
             if os.name == "nt":
-                import msvcrt
-
+                msvcrt = cast(_MsvcrtModule, importlib.import_module("msvcrt"))
                 msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
             else:
                 fcntl = cast(_FcntlModule, importlib.import_module("fcntl"))
@@ -94,8 +100,7 @@ class ServiceInstanceLock:
         try:
             handle.seek(0)
             if os.name == "nt":
-                import msvcrt
-
+                msvcrt = cast(_MsvcrtModule, importlib.import_module("msvcrt"))
                 msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
             else:
                 fcntl = cast(_FcntlModule, importlib.import_module("fcntl"))
