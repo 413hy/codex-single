@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import asyncio
+from pathlib import Path
 from typing import cast
 
 import pytest
 
 from bybit_signal.analysis.codex import (
+    _resolve_model_skill_path,
     _subprocess_platform_options,
     _terminate_process_tree,
 )
@@ -33,6 +35,41 @@ def test_posix_codex_process_starts_in_new_session() -> None:
 
     assert options == {"start_new_session": True}
     assert "creationflags" not in options
+
+
+def test_installed_package_finds_model_skill_in_checked_out_repository(
+    tmp_path: Path,
+) -> None:
+    repository = tmp_path / "checkout"
+    skill = (
+        repository
+        / ".agents"
+        / "skills"
+        / "analyze-bybit-ultrashort-signals"
+    )
+    (skill / "references").mkdir(parents=True)
+    (skill / "SKILL.md").write_text("skill", encoding="utf-8")
+    (skill / "references" / "operating-contract.md").write_text(
+        "contract",
+        encoding="utf-8",
+    )
+    installed_source = (
+        tmp_path
+        / "venv"
+        / "lib"
+        / "site-packages"
+        / "bybit_signal"
+        / "analysis"
+        / "codex.py"
+    )
+
+    resolved = _resolve_model_skill_path(
+        tmp_path / "runtime-workspace",
+        source_file=installed_source,
+        current_directory=repository,
+    )
+
+    assert resolved == skill.resolve()
 
 
 @pytest.mark.asyncio

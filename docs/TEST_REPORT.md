@@ -18,7 +18,7 @@
 | `git diff --check` | 通过 |
 | Ruff 全仓 | 通过 |
 | mypy strict（`src` + `tests`，61 个 Python 文件） | 通过，0 issue |
-| pytest 全量 | 通过，159 项 |
+| pytest 全量 | 通过，160 项 |
 | 项目 Skill 验证 | 通过 |
 | ReplyKeyboard 合同 | 通过：resize=true、persistent=false、one_time=false |
 | 键盘移除扫描 | 通过：无 ReplyKeyboardRemove / remove_keyboard |
@@ -174,7 +174,7 @@ Top5 深采验证：
 - 独立阈值 review 首次技术调用一次通过，两币均 `REWRITTEN`。GPS 的两根连续 1m 条件在交付时已有一根越线，旧激活检查误把它当作完整条件满足并内部重审；现已按结构化 `required_consecutive_observations` 修复，连续两/三根规则不会再凭一根新柱产生伪异常。
 - 使用 15:00 周期 `cycle_20260819T070029Z_a922bc31` 的五币冻结证据、固定原时钟并禁止当前行情工具进行方向回放。v9 首轮通过：HEMI 仍为 LONG_BIAS（当时尚无完成反转），但因没有“回踩守住真实 pivot 后由完成柱重新加速”或“突破被后续完成柱接受”的重置证据而退出 Top2；Top2 改为 TRIA 偏空与 ACE 偏空。这修复的是极端延伸币的追涨排名错误，而不是用后见之明强迫反向。
 - 当前合同允许每币 0–3 条阈值；明确 `REJECTED` 为正常零规则结果，不语义重试、不进入 `errors`、不发失败通知。宿主机械校正基线、距离和有效期，并以结构化执行字段为准；同向条件、已满足的单根条件、目标引用、越过正式失效后才报警和未知证据仍会拦截。
-- 最终门禁：159 项 pytest、Ruff、strict mypy（61 个 Python 文件）、pip check、compileall、三套配置、PowerShell AST、键盘移除/私有交易端点扫描与 `git diff --check` 全部通过。
+- 最终门禁：160 项 pytest、Ruff、strict mypy（61 个 Python 文件）、pip check、compileall、三套配置、PowerShell AST、键盘移除/私有交易端点扫描与 `git diff --check` 全部通过。
 
 ### 7.5 v9 生产部署验收
 
@@ -189,5 +189,5 @@ Top5 深采验证：
 - Windows 与 Debian 依赖约束分离。VPS/CI 使用 `requirements-debian.lock.txt`，明确去除 Windows-only `pywin32`；Windows 本地仍使用原 dev/runtime constraints。
 - POSIX 模型进程使用独立 session/process group；300 秒超时会结束完整 Codex 进程组，而不是只结束直接子进程。新增平台选项和进程组终止回归测试，目标测试与全量测试均通过。
 - systemd unit 显式包含服务用户 Codex PATH、`KillMode=control-group`、`UMask=0077`，项目目录只读，只开放 runtime 和 `.codex` 认证目录的必要写权限。
-- `.github/workflows/ci.yml` 在每次 `main` push/PR 的干净 Debian 13 容器中重新安装锁定依赖，执行 Ruff、strict mypy、159 项 pytest、compileall、示例配置和 systemd unit 校验。远端 CI 结果必须在推送后回读，未通过时不得认定 VPS 交付完成。
+- `.github/workflows/ci.yml` 在每次 `main` push/PR 的干净 Debian 13 容器中重新安装锁定依赖，执行 Ruff、strict mypy、160 项 pytest、compileall、示例配置和 systemd unit 校验。远端 CI 结果必须在推送后回读，未通过时不得认定 VPS 交付完成。
 - 本机没有运行中的 Docker Linux engine，因此没有把 Windows 的 cross-platform pip marker 模拟冒充真实 Debian 安装；真实 Debian 依赖解析由上述干净容器 CI 和目标 VPS Codex 的启动前验收共同完成。

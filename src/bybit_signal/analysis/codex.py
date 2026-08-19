@@ -104,6 +104,9 @@ class CodexProcessRunner(Protocol):
 
 
 SchemaModel = TypeVar("SchemaModel", bound=BaseModel)
+_MODEL_SKILL_RELATIVE_PATH = (
+    Path(".agents") / "skills" / "analyze-bybit-ultrashort-signals"
+)
 _STRUCTURAL_MONITORING_METRICS = frozenset(
     {
         MonitoringMetric.COMPLETED_1M_CLOSE,
@@ -227,6 +230,28 @@ async def _terminate_process_tree(
         await process.wait()
 
 
+def _resolve_model_skill_path(
+    workspace: Path,
+    *,
+    source_file: Path | None = None,
+    current_directory: Path | None = None,
+) -> Path:
+    source_file = source_file or Path(__file__)
+    current_directory = current_directory or Path.cwd()
+    candidates = (
+        workspace / _MODEL_SKILL_RELATIVE_PATH,
+        source_file.resolve().parents[3] / _MODEL_SKILL_RELATIVE_PATH,
+        current_directory / _MODEL_SKILL_RELATIVE_PATH,
+    )
+    for candidate in candidates:
+        resolved = candidate.resolve()
+        if (resolved / "SKILL.md").is_file() and (
+            resolved / "references" / "operating-contract.md"
+        ).is_file():
+            return resolved
+    return candidates[0].resolve()
+
+
 class CodexAnalyzer:
     def __init__(
         self,
@@ -260,10 +285,7 @@ class CodexAnalyzer:
         self._model_skill_path = (
             model_skill_path.resolve()
             if model_skill_path is not None
-            else Path(__file__).resolve().parents[3]
-            / ".agents"
-            / "skills"
-            / "analyze-bybit-ultrashort-signals"
+            else _resolve_model_skill_path(self._workspace)
         )
 
     async def analyze(
