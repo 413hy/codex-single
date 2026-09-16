@@ -239,7 +239,7 @@ async def test_results_are_published_individually_but_one_cycle_notification(pro
 
 
 async def test_automatic_long_cycle_does_not_immediately_run_again(producer, monkeypatch):
-    clock = [1000.0]
+    clock = [1200.0]
     monkeypatch.setattr('time.time', lambda: clock[0])
     original = producer.model.decide.side_effect
 
@@ -254,8 +254,9 @@ async def test_automatic_long_cycle_does_not_immediately_run_again(producer, mon
         return dict(symbol=symbol, observed_at=datetime.fromtimestamp(clock[0]+1300, UTC).isoformat())
 
     producer.markets.evidence.side_effect = evidence
+    producer.store.set('next_analysis_at', 1200)
     assert await producer.cycle()
     calls = producer.model.decide.await_count
-    assert producer.store.state('next_analysis_at') == clock[0] + 1200
+    assert producer.store.state('next_analysis_at') == 4800
     await producer.cycle()
     assert producer.model.decide.await_count == calls

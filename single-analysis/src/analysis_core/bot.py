@@ -8,6 +8,7 @@ from zoneinfo import ZoneInfo
 import httpx
 
 from analysis_core.notifications import cycle_keyboard, cycle_notice, signal_detail
+from analysis_core.scheduling import next_slot
 from analysis_core.store import encode, identity
 
 
@@ -168,14 +169,12 @@ class AnalysisBot:
                     markup = {"inline_keyboard": [[{"text": "重试失败通知", "callback_data": "retry_delivery"}]]}
             elif text in ("/pause", "/resume"):
                 if text == "/resume" and get("analysis_paused", False):
-                    running = db.execute("SELECT 1 FROM cycles WHERE status='RUNNING'").fetchone()
-                    if not running:
-                        put("next_analysis_at", time.time())
+                    put("next_analysis_at", next_slot(time.time(), get("analysis_interval", 20)))
                 put("analysis_paused", text == "/pause")
                 reply = (
                     "已暂停后续分析，当前分析会完成。"
                     if text == "/pause"
-                    else "已恢复分析；空闲时立即开始一轮，之后按设置间隔运行。"
+                    else "已恢复分析；按配置频率在下一个固定周期时间点运行。"
                 )
             elif text.startswith("/interval"):
                 parts = text.split()
@@ -183,7 +182,7 @@ class AnalysisBot:
                     token = identity(update["update_id"], time.time())[:12]
                     put("interval_preview", {"minutes": int(parts[1]), "token": token, "expires": time.time() + 600})
                     put("interval_input", None)
-                    reply = f"分析间隔将改为 {int(parts[1])} 分钟。保存后重新计时，当前分析不受影响。"
+                    reply = f"分析间隔将改为 {int(parts[1])} 分钟。保存后按固定周期时间点运行，当前分析不受影响。"
                     markup = {"inline_keyboard": [[
                         {"text": "✅ 保存", "callback_data": "confirm:" + token},
                         {"text": "取消", "callback_data": "cancel:" + token},
@@ -210,7 +209,7 @@ class AnalysisBot:
                     and type(preview["minutes"]) is int
                     and 10 <= preview["minutes"] <= 1440 and preview["minutes"] % 10 == 0
                 ):
-                    due = time.time() + preview["minutes"] * 60
+                    due = next_slot(time.time(), preview["minutes"])
                     put("analysis_interval", preview["minutes"])
                     put("next_analysis_at", due)
                     put("interval_effective_at", due)
@@ -218,7 +217,7 @@ class AnalysisBot:
                     put("interval_input", None)
                     db.execute("INSERT INTO events(created_at,kind,payload) VALUES (?,?,?)",
                                (time.time(), "INTERVAL_CHANGED", encode(preview)))
-                    reply = f"✅ 已保存：每 {preview['minutes']} 分钟分析一次。" + ("当前保持暂停。" if get("analysis_paused", False) else "下一轮从现在起重新计时。")
+                    reply = f"✅ 已保存：每 {preview['minutes']} 分钟分析一次。" + ("当前保持暂停。" if get("analysis_paused", False) else "下一轮按固定周期时间点运行。")
                 else:
                     reply = "这次设置已失效，请点击底部「分析频率」重新设置。"
             elif text == "/retry_delivery":

@@ -13,7 +13,7 @@ from analysis_core.config import Settings
 from analysis_core.market import Markets
 from analysis_core.model import DirectionModel, ModelServiceError
 from analysis_core.notifications import cycle_keyboard, cycle_notice
-from analysis_core.scheduling import claim_due
+from analysis_core.scheduling import claim_due, reset_schedule
 from analysis_core.screening import Screening
 from analysis_core.signals import HedgeSniffer, SignalBus
 from analysis_core.store import Store, encode, identity
@@ -29,9 +29,6 @@ class AnalysisApp:
         self.screening = screening or Screening(settings, self.store, runner=self.model)
         self.sniffer = sniffer or HedgeSniffer(settings.hedge_db)
         self.lock = asyncio.Lock()
-
-    def interval(self):
-        return self.store.state("analysis_interval", 20) * 60
 
     def incident(self, scope, error):
         self.store.incident(
@@ -197,9 +194,7 @@ class AnalysisApp:
                     ),
                 )
                 if cid.startswith("scheduled:"):
-                    now = time.time()
-                    if self.store.state("next_analysis_at", 0) <= now:
-                        self.store.set("next_analysis_at", now + self.interval())
+                    reset_schedule(self.store, time.time(), only_overdue=True)
                 self.store.queue("cycle:" + cid, cycle_notice(self.store, cid), cycle_keyboard(self.store, cid))
                 self.store.set("analysis_heartbeat", time.time())
 
@@ -226,6 +221,9 @@ async def run(settings, mode):
             "UPDATE cycles SET status='INTERRUPTED',completed_at=? WHERE status='RUNNING'",
             (time.time(),),
         )
+
+        # Startup skips downtime slots and migrates old start-relative schedules.
+        reset_schedule(app.store, time.time())
 
         async def scheduler():
             while not stop.is_set():
