@@ -1,0 +1,48 @@
+"""Full real-market/model cycle using independent validation DB and write-disabled API."""
+
+import asyncio
+import json
+import time
+from pathlib import Path
+
+from longtime.config import MODEL, REASONING, Settings
+from longtime.service import App, ProcessLock, logging_setup
+
+
+async def main():
+    settings = Settings(trading_enabled=False, runtime_dir=Path("runtime/live-full-cycle"))
+    logging_setup(settings.runtime_dir)
+    settings.runtime_dir.mkdir(parents=True, exist_ok=True)
+    lock = ProcessLock(settings.runtime_dir / "service.lock")
+    app = App(settings)
+    try:
+        start = time.time()
+        cid = "live-full:" + str(time.time_ns())
+        ok = await app.cycle(cid)
+        summary = {
+            "cycle_id": cid,
+            "model": MODEL,
+            "reasoning_effort": REASONING,
+            "success": ok,
+            "duration_seconds": time.time() - start,
+            "signals": app.store.rows(
+                "SELECT symbol,status,side FROM signals WHERE cycle_id=?", (cid,)
+            ),
+            "new_incidents": app.store.rows(
+                "SELECT scope,status,error FROM incidents WHERE created_at>=?", (start,)
+            ),
+            "incident_history": app.store.rows("SELECT scope,status,error FROM incidents"),
+            "order_count": len(app.store.rows("SELECT * FROM orders")),
+        }
+        await asyncio.to_thread(
+            (settings.runtime_dir / "result.json").write_text,
+            json.dumps(summary, ensure_ascii=False, indent=2),
+        )
+        print(json.dumps(summary, ensure_ascii=False))
+    finally:
+        await app.close()
+        lock.close()
+
+
+if __name__ == "__main__":
+    asyncio.run(main())

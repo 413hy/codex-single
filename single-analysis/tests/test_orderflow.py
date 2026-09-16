@@ -1,0 +1,169 @@
+from datetime import UTC, datetime, timedelta
+from decimal import Decimal as D
+
+import httpx
+import pytest
+
+from analysis_core.orderflow import collect_orderflow, orderflow_evidence
+from analysis_core.vendor.public import (
+    BybitOrderBook,
+    BybitPublicClient,
+    BybitPublicError,
+    BybitPublicTrade,
+)
+
+
+def samples():
+    now = datetime.now(UTC)
+    books = [
+        BybitOrderBook(
+            symbol="TESTUSDT",
+            observed_at=now - timedelta(seconds=3 - i),
+            sequence=i,
+            update_id=i,
+            bids=[{"price": str(100 - j), "size": "30" if j == 1 else "10"} for j in range(5)],
+            asks=[{"price": str(101 + j), "size": "10"} for j in range(5)],
+        )
+        for i in range(3)
+    ]
+
+    def trade(tid, side, size, seconds=2, price="100"):
+        return BybitPublicTrade(
+            symbol="TESTUSDT",
+            trade_id=tid,
+            side=side,
+            size=D(size),
+            price=D(price),
+            timestamp=now - timedelta(seconds=seconds),
+        )
+
+    trades = [trade("a", "Buy", "7"), trade("b", "Sell", "3", 1), trade("old", "Buy", "99", 301)]
+    return now, books, trades
+
+
+def test_sample_math_dedup_windows_and_wall_are_not_continuity():
+    now, books, trades = samples()
+    evidence = orderflow_evidence("TESTUSDT", books, trades + [trades[0]], now)
+    assert evidence["trade_received_count"] == 4
+    assert evidence["trade_unique_count"] == 3
+    assert evidence["trade_excluded_outside_300s"] == 1
+    assert evidence["sample_windows"][0]["delta_size"] == 4
+    assert evidence["sample_volume_at_price"][0]["delta_size"] == 4
+    assert evidence["sample_volume_at_price"][0]["count"] == 2
+    assert not evidence["coverage_complete"]
+    assert all(not w["coverage_complete"] for w in evidence["sample_windows"])
+    wall = evidence["large_displayed_levels"][0]
+    assert wall["size_ratio"] == 3
+    assert wall["visible_in_all_samples"]
+    assert evidence["book_sample_span_seconds"] == 2
+    # Disappearance in a snapshot cannot be labelled a verified cancellation.
+    books[0] = books[0].model_copy(
+        update={"bids": tuple(x for x in books[0].bids if x.price != 99)}
+    )
+    evidence = orderflow_evidence("TESTUSDT", books, trades, now)
+    assert not evidence["large_displayed_levels"][0]["visible_in_all_samples"]
+
+
+@pytest.mark.parametrize(
+    "case", ["stale", "future", "symbol", "crossed", "duplicate", "order", "sequence"]
+)
+def test_bad_book_rejected(case):
+    now, books, trades = samples()
+    book = books[-1]
+    changes = {
+        "stale": {"observed_at": now - timedelta(seconds=31)},
+        "future": {"observed_at": now + timedelta(seconds=6)},
+        "symbol": {"symbol": "OTHERUSDT"},
+        "crossed": {"asks": book.bids},
+        "duplicate": {"bids": (book.bids[0], *book.bids)},
+        "order": {"bids": tuple(reversed(book.bids))},
+        "sequence": {"sequence": 0},
+    }
+    books[-1] = book.model_copy(update=changes[case])
+    with pytest.raises(ValueError):
+        orderflow_evidence("TESTUSDT", books, trades, now)
+
+
+@pytest.mark.parametrize(
+    "change", [{"symbol": "OTHERUSDT"}, {"side": "LONG"}, {"size": D("NaN")}, {"price": D(0)}]
+)
+def test_bad_trade_rejected(change):
+    now, books, trades = samples()
+    trades[0] = trades[0].model_copy(update=change)
+    with pytest.raises(ValueError):
+        orderflow_evidence("TESTUSDT", books, trades, now)
+
+
+def test_conflicting_exec_id_rejected_and_empty_not_inferred_as_sell():
+    now, books, trades = samples()
+    with pytest.raises(ValueError, match="Conflicting"):
+        orderflow_evidence(
+            "TESTUSDT", books, [trades[0], trades[0].model_copy(update={"size": D(9)})], now
+        )
+    evidence = orderflow_evidence("TESTUSDT", books, [], now)
+    assert evidence["sample_volume_at_price"] == []
+    assert evidence["sample_windows"][0]["first_price"] is None
+    assert evidence["sample_windows"][0]["count"] == 0
+
+
+async def test_collection_errors_propagate_without_retry():
+    class Client:
+        calls = 0
+
+        async def orderbook(self, symbol, limit):
+            self.calls += 1
+            raise RuntimeError("book unavailable")
+
+    client = Client()
+    with pytest.raises(RuntimeError, match="book unavailable"):
+        await collect_orderflow(client, "TESTUSDT")
+    assert client.calls == 1
+
+
+async def test_http_trade_identity_and_book_event_time():
+    now = datetime.now(UTC)
+    stamp = int(now.timestamp() * 1000)
+
+    async def handler(request):
+        if request.url.path.endswith("orderbook"):
+            result = {
+                "s": "TESTUSDT",
+                "ts": stamp - 10000,
+                "u": 1,
+                "seq": 1,
+                "b": [["100", "1"]],
+                "a": [["101", "1"]],
+            }
+        else:
+            result = {
+                "list": [
+                    {
+                        "symbol": "OTHERUSDT",
+                        "execId": "1",
+                        "time": str(stamp),
+                        "side": "Buy",
+                        "price": "100",
+                        "size": "1",
+                    }
+                ]
+            }
+        return httpx.Response(200, json={"retCode": 0, "time": stamp, "result": result})
+
+    async with httpx.AsyncClient(
+        base_url="https://api.bybit.com", transport=httpx.MockTransport(handler)
+    ) as http:
+        client = BybitPublicClient(client=http, max_attempts=1)
+        book = await client.orderbook("TESTUSDT")
+        assert int(book.observed_at.timestamp() * 1000) == stamp - 10000
+        with pytest.raises(BybitPublicError, match="symbol"):
+            await client.recent_trades("TESTUSDT")
+
+
+
+
+def test_equal_sequence_is_disclosed_not_counted_as_new_update():
+    now, books, trades = samples()
+    books = [book.model_copy(update={"sequence": 1}) for book in books]
+    evidence = orderflow_evidence("TESTUSDT", books, trades, now)
+    assert evidence["distinct_book_sequences"] == 1
+    assert not evidence["coverage_complete"]

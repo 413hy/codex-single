@@ -1,0 +1,140 @@
+"""Cycle recovery checks distinguish a validated abstention from missing/invalid analysis."""
+
+from datetime import UTC, datetime
+from types import SimpleNamespace
+
+import pytest
+
+from longtime.model import Decision, ModelServiceError
+from longtime.service import App
+
+
+@pytest.mark.parametrize("failure", ["筛选失败", "方向Schema错误", "零币成功", "方向SKIP"])
+async def test_recovery_requires_successful_validated_cycle(setup, failure):
+    e, store, exchange, markets, _ = setup
+    iid = store.incident("MODEL_SERVICE", "cycle", {}, "capacity")
+
+    async def scan(excluded):
+        return SimpleNamespace(candidates=[], failures={}, model_dump=lambda **kwargs: {})
+
+    async def evidence(symbol, candidate):
+        return {"symbol": symbol, "observed_at": datetime.now(UTC).isoformat()}
+
+    class Selector:
+        async def select(self, *args):
+            if failure == "筛选失败":
+                raise ValueError("invalid screening schema")
+            return [] if failure == "零币成功" else [{"symbol": "TESTUSDT"}]
+
+    class Model:
+        async def decide(self, *args):
+            if failure == "方向Schema错误":
+                raise ValueError("invalid direction schema")
+            return Decision(symbol="TESTUSDT", decision="SKIP", reason="validated abstention")
+
+    markets.scan, markets.evidence = scan, evidence
+    app = App(
+        e.settings,
+        store=store,
+        exchange=exchange,
+        markets=markets,
+        screening=Selector(),
+        model=Model(),
+    )
+    ok = await app.cycle("recovery-test")
+    assert ok == (failure in {"零币成功", "方向SKIP"})
+    state = store.rows("SELECT status FROM incidents WHERE incident_id=?", (iid,))[0]["status"]
+    assert state == ("RESOLVED" if ok else "OPEN")
+    assert not exchange.submissions
+
+
+@pytest.mark.parametrize("message", ["GPT认证失败(401)", "GPT分析超时(300秒)", "capacity"])
+async def test_shared_model_outage_across_cycles_recovers_without_duplicate_alert(setup, message):
+    e, store, exchange, markets, _ = setup
+    failing = [True]
+    calls = []
+
+    async def scan(excluded):
+        return SimpleNamespace(candidates=[], failures={}, model_dump=lambda **kwargs: {})
+
+    async def evidence(symbol, candidate):
+        return {"symbol": symbol, "observed_at": datetime.now(UTC).isoformat()}
+
+    class Selector:
+        async def select(self, *args):
+            return [{"symbol": f"C{i}USDT"} for i in range(3)]
+
+    class Model:
+        async def decide(self, sid, context):
+            calls.append(context)
+            if failing[0]:
+                raise ModelServiceError(message)
+            return Decision(symbol=context["symbol"], decision="SKIP", reason="new data")
+
+    markets.scan, markets.evidence = scan, evidence
+    app = App(
+        e.settings,
+        store=store,
+        exchange=exchange,
+        markets=markets,
+        screening=Selector(),
+        model=Model(),
+    )
+    for i in range(3):
+        assert not await app.cycle(f"failure-{i}")
+    assert len(calls) == 3
+    assert len(store.rows("SELECT * FROM incidents WHERE scope='MODEL_SERVICE'")) == 1
+    assert len(store.rows("SELECT * FROM outbox")) == 1
+    assert (
+        len(store.rows("SELECT * FROM signals WHERE status='SKIP_MODEL_SERVICE_UNAVAILABLE'")) == 6
+    )
+    failing[0] = False
+    assert await app.cycle("recovered")
+    assert len(calls) == 6
+    assert (
+        store.rows("SELECT status FROM incidents WHERE scope='MODEL_SERVICE'")[0]["status"]
+        == "RESOLVED"
+    )
+    assert await app.cycle("recovered")
+    assert len(calls) == 6  # no replay of the same cycle
+    assert not exchange.submissions
+
+
+async def test_screening_service_outage_never_reaches_direction_and_recovers_on_zero(setup):
+    e, store, exchange, markets, _ = setup
+    available = [False]
+    calls = []
+
+    async def scan(excluded):
+        return SimpleNamespace(candidates=[], failures={}, model_dump=lambda **kwargs: {})
+
+    class Selector:
+        async def select(self, cid, candidates):
+            calls.append(cid)
+            if not available[0]:
+                raise ModelServiceError("capacity")
+            return []  # a validated model abstention
+
+    class Model:
+        async def decide(self, *args):
+            raise AssertionError("screening must gate direction")
+
+    markets.scan = scan
+    app = App(
+        e.settings,
+        store=store,
+        exchange=exchange,
+        markets=markets,
+        screening=Selector(),
+        model=Model(),
+    )
+    for i in range(3):
+        assert not await app.cycle(f"screen-failure-{i}")
+    assert len(calls) == 3
+    assert len(store.rows("SELECT * FROM incidents")) == 1
+    assert len(store.rows("SELECT * FROM outbox")) == 1
+    available[0] = True
+    assert await app.cycle("screen-recovered")
+    assert store.rows("SELECT status FROM incidents")[0]["status"] == "RESOLVED"
+    assert not store.rows("SELECT * FROM signals WHERE cycle_id LIKE 'screen-%'")
+    assert not exchange.submissions

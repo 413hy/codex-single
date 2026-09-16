@@ -1,0 +1,41 @@
+"""Fresh public-market/scanner/model smoke test; no account credentials or order methods."""
+
+import asyncio
+import json
+from pathlib import Path
+
+from longtime.config import Settings
+from longtime.market import Markets
+from longtime.model import DirectionModel
+from longtime.store import Store, identity
+
+
+async def main():
+    settings = Settings(trading_enabled=False)
+    store = Store(Path("runtime/public-smoke/trader.db"))
+    markets = Markets()
+    try:
+        scan = await markets.scan(set())
+        store.event("SCAN", scan.model_dump(mode="json"))
+        result = {
+            "universe": scan.universe_size,
+            "candidates": len(scan.candidates),
+            "failures": scan.failures,
+        }
+        if scan.candidates:
+            c = scan.candidates[0]
+            evidence = await markets.evidence(c.symbol, c.model_dump(mode="json"))
+            decision = await DirectionModel(settings, store).decide(identity(evidence), evidence)
+            window = await markets.reachability(c.symbol)
+            result.update(decision=decision.model_dump(), recent_24h_candles=len(window))
+        await asyncio.to_thread(
+            Path("runtime/public-smoke/result.json").write_text,
+            json.dumps(result, ensure_ascii=False, indent=2),
+        )
+        print(json.dumps(result, ensure_ascii=False))
+    finally:
+        await markets.close()
+
+
+if __name__ == "__main__":
+    asyncio.run(main())

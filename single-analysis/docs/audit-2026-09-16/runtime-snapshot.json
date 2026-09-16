@@ -1,0 +1,391 @@
+{
+  "at": 1789516249.6288316,
+  "systems": {
+    "single-analysis": {
+      "integrity": "ok",
+      "status_counts": {
+        "signals": [
+          [
+            "ERROR_MODEL_SERVICE",
+            1
+          ],
+          [
+            "PUBLISHED",
+            26
+          ]
+        ],
+        "trades": [],
+        "outbox": [
+          [
+            "SENT",
+            36
+          ]
+        ],
+        "incidents": [
+          [
+            "RESOLVED",
+            1
+          ]
+        ]
+      },
+      "pause": [
+        [
+          "analysis_paused",
+          "true"
+        ]
+      ]
+    },
+    "auto-trader-longtime": {
+      "integrity": "ok",
+      "status_counts": {
+        "signals": [
+          [
+            "ERROR",
+            9
+          ],
+          [
+            "ERROR_MODEL_SERVICE",
+            9
+          ],
+          [
+            "OPEN",
+            245
+          ],
+          [
+            "SKIP_EXISTING_POSITION",
+            1090
+          ],
+          [
+            "SKIP_FUNDS_OR_PAUSED",
+            70
+          ],
+          [
+            "SKIP_MODEL",
+            61
+          ],
+          [
+            "SKIP_MODEL_SERVICE_UNAVAILABLE",
+            85
+          ],
+          [
+            "SKIP_NOT_NORMAL_CANDIDATE",
+            7
+          ],
+          [
+            "SKIP_PAUSED",
+            21
+          ],
+          [
+            "SKIP_SIZE_LIMIT",
+            10
+          ],
+          [
+            "SKIP_TP_UNREACHABLE",
+            115
+          ],
+          [
+            "STOP_INSUFFICIENT_MARGIN",
+            1
+          ]
+        ],
+        "trades": [
+          [
+            "CLOSED",
+            245
+          ],
+          [
+            "UNFILLED",
+            5
+          ]
+        ],
+        "outbox": [
+          [
+            "FAILED",
+            1
+          ],
+          [
+            "SENT",
+            622
+          ]
+        ],
+        "incidents": [
+          [
+            "OPEN",
+            5
+          ],
+          [
+            "RESOLVED",
+            53
+          ]
+        ]
+      },
+      "pause": [
+        [
+          "entries_paused",
+          "true"
+        ]
+      ],
+      "live_readonly": {
+        "account_ok": true,
+        "positions": 0,
+        "open_orders": 0,
+        "integrity": "ok",
+        "state": {
+          "entries_paused": true,
+          "monitor_heartbeat": 10.71,
+          "signal_heartbeat": 0.07
+        },
+        "trades": [
+          [
+            "CLOSED",
+            245
+          ],
+          [
+            "UNFILLED",
+            5
+          ]
+        ],
+        "signals": [
+          [
+            "ERROR",
+            9
+          ],
+          [
+            "ERROR_MODEL_SERVICE",
+            9
+          ],
+          [
+            "OPEN",
+            245
+          ],
+          [
+            "SKIP_EXISTING_POSITION",
+            1090
+          ],
+          [
+            "SKIP_FUNDS_OR_PAUSED",
+            70
+          ],
+          [
+            "SKIP_MODEL",
+            61
+          ],
+          [
+            "SKIP_MODEL_SERVICE_UNAVAILABLE",
+            85
+          ],
+          [
+            "SKIP_NOT_NORMAL_CANDIDATE",
+            7
+          ],
+          [
+            "SKIP_PAUSED",
+            21
+          ],
+          [
+            "SKIP_SIZE_LIMIT",
+            10
+          ],
+          [
+            "SKIP_TP_UNREACHABLE",
+            115
+          ],
+          [
+            "STOP_INSUFFICIENT_MARGIN",
+            1
+          ]
+        ],
+        "outbox": [
+          [
+            "FAILED",
+            1
+          ],
+          [
+            "SENT",
+            622
+          ]
+        ],
+        "incidents": [
+          [
+            "OPEN",
+            5
+          ],
+          [
+            "RESOLVED",
+            53
+          ]
+        ],
+        "recent_receipts": [
+          [
+            "feed:a53813e8b67aa6e8f3e71969",
+            "SKIP_PAUSED"
+          ],
+          [
+            "feed:0a9e4c0df2e65036e2029c98",
+            "SKIP_PAUSED"
+          ],
+          [
+            "feed:eef7683a4ef94014fad6aecf",
+            "SKIP_PAUSED"
+          ],
+          [
+            "feed:0a13eec9a218d0e5291b375e",
+            "SKIP_PAUSED"
+          ],
+          [
+            "feed:8de4777652c4a3966636b990",
+            "SKIP_PAUSED"
+          ]
+        ]
+      }
+    },
+    "auto-trader-longtime-02": {
+      "integrity": "ok",
+      "status_counts": {
+        "signals": [
+          [
+            "ERROR_MODEL_SERVICE",
+            1
+          ],
+          [
+            "HEDGE_DIRECTION_APPLIED",
+            3
+          ],
+          [
+            "INTERRUPTED",
+            2
+          ],
+          [
+            "SKIP_MODEL",
+            10
+          ],
+          [
+            "SKIP_PAUSED",
+            20
+          ],
+          [
+            "SKIP_TP_UNREACHABLE",
+            5
+          ],
+          [
+            "UNFILLED",
+            1
+          ]
+        ],
+        "trades": [
+          [
+            "CLOSED",
+            11
+          ],
+          [
+            "UNFILLED",
+            6
+          ]
+        ],
+        "outbox": [
+          [
+            "SENT",
+            25
+          ]
+        ],
+        "incidents": [
+          [
+            "RESOLVED",
+            2
+          ]
+        ]
+      },
+      "pause": [
+        [
+          "entries_paused",
+          "true"
+        ]
+      ],
+      "live_readonly": {
+        "account_ok": true,
+        "positions": 0,
+        "open_orders": 0,
+        "integrity": "ok",
+        "state": {
+          "entries_paused": true,
+          "monitor_heartbeat": 2.07,
+          "signal_heartbeat": 0.48
+        },
+        "trades": [
+          [
+            "CLOSED",
+            11
+          ],
+          [
+            "UNFILLED",
+            6
+          ]
+        ],
+        "signals": [
+          [
+            "ERROR_MODEL_SERVICE",
+            1
+          ],
+          [
+            "HEDGE_DIRECTION_APPLIED",
+            3
+          ],
+          [
+            "INTERRUPTED",
+            2
+          ],
+          [
+            "SKIP_MODEL",
+            10
+          ],
+          [
+            "SKIP_PAUSED",
+            20
+          ],
+          [
+            "SKIP_TP_UNREACHABLE",
+            5
+          ],
+          [
+            "UNFILLED",
+            1
+          ]
+        ],
+        "outbox": [
+          [
+            "SENT",
+            25
+          ]
+        ],
+        "incidents": [
+          [
+            "RESOLVED",
+            2
+          ]
+        ],
+        "recent_receipts": [
+          [
+            "feed:a53813e8b67aa6e8f3e71969",
+            "SKIP_PAUSED"
+          ],
+          [
+            "feed:0a9e4c0df2e65036e2029c98",
+            "SKIP_PAUSED"
+          ],
+          [
+            "feed:eef7683a4ef94014fad6aecf",
+            "SKIP_PAUSED"
+          ],
+          [
+            "feed:0a13eec9a218d0e5291b375e",
+            "SKIP_PAUSED"
+          ],
+          [
+            "feed:8de4777652c4a3966636b990",
+            "SKIP_PAUSED"
+          ]
+        ]
+      }
+    }
+  }
+}

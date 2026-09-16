@@ -1,0 +1,170 @@
+from __future__ import annotations
+
+from datetime import datetime
+from decimal import Decimal
+from typing import Annotated, Any, Literal
+
+from pydantic import BaseModel, ConfigDict, Field, StringConstraints, model_validator
+
+from analysis_core.vendor.signal.domain.enums import (
+    CandidateRiskTag,
+    MarketType,
+    PriceType,
+    ToolStatus,
+)
+
+Symbol = Annotated[str, StringConstraints(pattern=r"^[A-Z0-9]{1,24}USDT$")]
+
+EvidenceId = Annotated[str, StringConstraints(pattern=r"^[A-Z0-9][A-Z0-9_.:-]{2,127}$")]
+
+
+class ContractModel(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True, str_strip_whitespace=True)
+
+
+def _require_aware(value: datetime, field: str) -> None:
+    if value.tzinfo is None or value.utcoffset() is None:
+        raise ValueError(f"{field} must be timezone-aware")
+
+
+class Candle(ContractModel):
+    symbol: Symbol
+    timeframe: Literal["1m", "3m", "5m", "15m", "30m", "1h", "4h"]
+    open_time: datetime
+    close_time: datetime
+    open: Decimal = Field(gt=0)
+    high: Decimal = Field(gt=0)
+    low: Decimal = Field(gt=0)
+    close: Decimal = Field(gt=0)
+    volume: Decimal = Field(ge=0)
+    turnover: Decimal = Field(ge=0)
+    completed: bool
+    source: Literal["BYBIT", "BINANCE", "OKX"]
+
+    @model_validator(mode="after")
+    def validate_candle(self) -> Candle:
+        _require_aware(self.open_time, "open_time")
+        _require_aware(self.close_time, "close_time")
+        if self.close_time <= self.open_time:
+            raise ValueError("close_time must be after open_time")
+        if self.low > min(self.open, self.close) or self.high < max(self.open, self.close):
+            raise ValueError("OHLC values are inconsistent")
+        if self.low > self.high:
+            raise ValueError("low cannot exceed high")
+        return self
+
+
+class CanonicalPrice(ContractModel):
+    symbol: Symbol
+    exchange: Literal["BYBIT"] = "BYBIT"
+    market: Literal[MarketType.LINEAR_PERPETUAL] = MarketType.LINEAR_PERPETUAL
+    price_type: PriceType
+    value: Decimal = Field(gt=0)
+    timestamp: datetime
+
+    @model_validator(mode="after")
+    def validate_timestamp(self) -> CanonicalPrice:
+        _require_aware(self.timestamp, "timestamp")
+        return self
+
+
+class EvidenceItem(ContractModel):
+    evidence_id: EvidenceId
+    category: str = Field(min_length=2, max_length=64)
+    source: str = Field(min_length=2, max_length=64)
+    observed_at: datetime
+    summary: str = Field(min_length=2, max_length=500)
+    values: dict[str, Any] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def validate_timestamp(self) -> EvidenceItem:
+        _require_aware(self.observed_at, "observed_at")
+        return self
+
+
+class EvidenceBundle(ContractModel):
+    schema_version: Literal[1, 2] = 2
+    symbol: Symbol
+    generated_at: datetime
+    source_snapshot_sha256: Annotated[str, StringConstraints(pattern=r"^[a-f0-9]{64}$")]
+    canonical_last: CanonicalPrice
+    canonical_mark: CanonicalPrice
+    evidence_items: tuple[EvidenceItem, ...] = Field(min_length=1)
+    tool_assessments: tuple[ToolAssessment, ...] = Field(min_length=1)
+    market_context: MarketContext | None = None
+    candidate_context: CandidateContext | None = None
+
+    @model_validator(mode="after")
+    def validate_bundle(self) -> EvidenceBundle:
+        _require_aware(self.generated_at, "generated_at")
+        if self.canonical_last.symbol != self.symbol or self.canonical_mark.symbol != self.symbol:
+            raise ValueError("canonical prices must match evidence bundle symbol")
+        identifiers = [item.evidence_id for item in self.evidence_items]
+        if len(identifiers) != len(set(identifiers)):
+            raise ValueError("evidence identifiers must be unique")
+        known = set(identifiers)
+        referenced = {
+            evidence_id
+            for assessment in self.tool_assessments
+            for evidence_id in assessment.evidence_ids
+        }
+        if not referenced <= known:
+            raise ValueError("tool assessment references unknown evidence")
+        return self
+
+
+class ToolAssessment(ContractModel):
+    tool: str = Field(min_length=2, max_length=80)
+    status: ToolStatus
+    version: str | None = Field(default=None, max_length=120)
+    reason: str = Field(min_length=2, max_length=500)
+    latency_ms: int | None = Field(default=None, ge=0)
+    evidence_ids: tuple[EvidenceId, ...] = ()
+
+
+class BreadthSnapshot(ContractModel):
+    observed_at: datetime
+    instrument_count: int = Field(ge=0)
+    advancing_count: int = Field(ge=0)
+    declining_count: int = Field(ge=0)
+    unchanged_count: int = Field(ge=0)
+    median_change_24h_percent: float | None = None
+    positive_turnover_share: float | None = Field(default=None, ge=0, le=1)
+    top_turnover_share: float | None = Field(default=None, ge=0, le=1)
+
+    @model_validator(mode="after")
+    def validate_breadth(self) -> BreadthSnapshot:
+        _require_aware(self.observed_at, "observed_at")
+        if (
+            self.advancing_count + self.declining_count + self.unchanged_count
+            != self.instrument_count
+        ):
+            raise ValueError("breadth counts do not match instrument_count")
+        return self
+
+
+class MarketContext(ContractModel):
+    schema_version: Literal[1] = 1
+    generated_at: datetime
+    breadth: BreadthSnapshot
+    btc_returns_percent: dict[str, float | None] = Field(default_factory=dict)
+    eth_returns_percent: dict[str, float | None] = Field(default_factory=dict)
+    candidate_median_return_5m_percent: float | None = None
+    candidate_synchronization: float | None = Field(default=None, ge=-1, le=1)
+    liquidation_status: ToolStatus = ToolStatus.WARMING_UP
+    liquidation_notional_5m: Decimal | None = Field(default=None, ge=0)
+    limitations: tuple[str, ...] = ()
+
+    @model_validator(mode="after")
+    def validate_market_context(self) -> MarketContext:
+        _require_aware(self.generated_at, "generated_at")
+        return self
+
+
+class CandidateContext(ContractModel):
+    rank: int = Field(ge=1, le=10)
+    opportunity_score: float = Field(ge=0, le=100)
+    tradability_score: float = Field(ge=0, le=100)
+    final_score: float = Field(ge=0, le=100)
+    risk_tags: tuple[CandidateRiskTag, ...] = ()
+    raw_features: dict[str, float | int | str | bool | None] = Field(default_factory=dict)

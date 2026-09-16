@@ -1,0 +1,175 @@
+import asyncio
+from datetime import UTC, datetime, timedelta
+from decimal import Decimal as D
+
+from longtime.indicators import direction_indicators, price_volume
+from longtime.orderflow import collect_orderflow
+from longtime.vendor.models import Candle, ScannerConfig
+from longtime.vendor.public import BybitPublicClient
+from longtime.vendor.scanner import BybitUniverseScanner
+
+
+def verify_candles(rows, minutes, now, minimum):
+    if len(rows) < minimum:
+        raise ValueError("Incomplete market candle window")
+    duration = timedelta(minutes=minutes)
+    if now - rows[-1].open_time > duration + timedelta(seconds=45) or rows[
+        -1
+    ].open_time > now + timedelta(seconds=5):
+        raise ValueError("Stale or future market candles")
+    if any(b.open_time - a.open_time != duration for a, b in zip(rows, rows[1:], strict=False)):
+        raise ValueError("Missing or duplicate market candle intervals")
+
+
+def validate_direction_rows(rows, symbol, timeframe, minutes, now):
+    for index, row in enumerate(rows):
+        values = [row.open, row.high, row.low, row.close, row.volume, row.turnover]
+        if (
+            row.symbol != symbol
+            or row.timeframe != timeframe
+            or any(not value.is_finite() for value in values)
+            or min(values[:4]) <= 0
+            or min(values[4:]) < 0
+            or row.high < max(row.open, row.close)
+            or row.low > min(row.open, row.close)
+            or row.low > row.high
+            or type(row.completed) is not bool
+            or row.close_time != row.open_time + timedelta(minutes=minutes)
+            or int(row.open_time.timestamp()) % (minutes * 60) != 0
+            or (row.completed and row.close_time > now)
+            or (
+                not row.completed
+                and (index != len(rows) - 1 or row.close_time < now - timedelta(seconds=45))
+            )
+        ):
+            raise ValueError("Invalid direction candle identity/OHLCV/completion")
+
+
+class Markets:
+    def __init__(self, client=None, *, include_orderflow=True):
+        self.client = client or BybitPublicClient(max_attempts=1)
+        self.include_orderflow = include_orderflow
+        self.scanner = BybitUniverseScanner(self.client, ScannerConfig())
+
+    async def scan(self, exclude):
+        return await self.scanner.scan(exclude=exclude)
+
+    async def evidence(self, symbol, candidate):
+        now = datetime.now(UTC)
+        specs = (
+            ("30m", 30, 337),
+            ("1h", 60, 169),
+            ("2h", 120, 85),
+            ("1m", 1, 721),
+            ("3m", 3, 241),
+            ("5m", 5, 146),
+            ("15m", 15, 673),
+        )
+        batches = await asyncio.gather(
+            *(
+                self.client.recent_candles(symbol, timeframe=tf, limit=count)  # type: ignore[arg-type]
+                for tf, _, count in specs
+            )
+        )
+        now = datetime.now(UTC)
+        data = {}
+        indicators = {}
+        for (tf, minutes, _count), rows in zip(specs, batches, strict=True):
+            validate_direction_rows(rows, symbol, tf, minutes, now)
+            verify_candles(rows, minutes, now, 1)
+            if (
+                tf in {"15m", "30m", "1h", "2h"}
+                and sum(c.completed for c in rows) < 10080 // minutes
+            ):
+                raise ValueError("SKIP_INSUFFICIENT_WEEK_HISTORY: " + tf)
+            visible = list(rows[-145:]) if tf == "5m" else list(rows)
+            data[tf] = [c.model_dump(mode="json") for c in visible]
+            indicators[tf] = direction_indicators(visible)
+        ten_minute = aggregate_ten_minutes(
+            dict(zip((tf for tf, _, _ in specs), batches, strict=True))["5m"]
+        )
+        verify_candles(ten_minute, 10, now, 1)
+        data["10m"] = [c.model_dump(mode="json") for c in ten_minute[-73:]]
+        indicators["10m"] = direction_indicators(ten_minute[-73:])
+        orderflow = await collect_orderflow(self.client, symbol) if self.include_orderflow else None
+        return {
+            "orderflow": orderflow,
+            "history_hours": {tf: 168 if tf in {"15m", "30m", "1h", "2h"} else 12 for tf in data},
+            "indicators": indicators,
+            "price_volume": {
+                tf: price_volume(list(rows))
+                for (tf, _, _), rows in zip(specs, batches, strict=True)
+                if tf in {"15m", "30m", "1h", "2h"}
+            },
+            "indicator_contract": "weekly-volume-v1：15m/30m/1h/2h完整一周为主，1m/3m/5m/10m近12小时辅助。统计仅用已收盘数据；量价统计不是订单流或逐价成交分布。有限窗口指标仅辅助，不能以短线信号替代周内趋势。",
+            "unavailable_evidence": [
+                "footprint",
+                "liquidation_heatmap",
+                "large_order_tracking",
+                "historical_aggressor_delta",
+                "complete_volume_at_price",
+                "continuous_dom_and_cancellations",
+                "diagonal_stacked_imbalance",
+            ],
+            "timeframe_roles": {
+                "primary": ["15m", "30m", "1h", "2h"],
+                "core": ["15m", "30m", "1h", "2h"],
+                "secondary": ["1m", "3m", "5m", "10m"],
+            },
+            "derived_timeframes": {"10m": "UTC对齐的相邻5m K线聚合；未收盘状态保留"},
+            "symbol": symbol,
+            "observed_at": now.isoformat(),
+            "selection": candidate,
+            "candles": data,
+        }
+
+    async def reachability(self, symbol):
+        rows = await self.client.recent_candles(symbol, timeframe="1m", limit=1441)
+        now = datetime.now(UTC)
+        validate_direction_rows(rows, symbol, "1m", 1, now)
+        verify_candles(rows, 1, now, 1440)
+        return tuple(c for c in rows if c.open_time >= now - timedelta(hours=24))
+
+    async def close(self):
+        await self.client.close()
+
+
+def aggregate_ten_minutes(rows):
+    """Bybit has no native 10m interval; aggregate only contiguous, UTC-aligned 5m rows."""
+    groups: dict[int, list[Candle]] = {}
+    for candle in rows:
+        bucket = int(candle.open_time.timestamp()) // 600 * 600
+        groups.setdefault(bucket, []).append(candle)
+    result = []
+    for bucket, candles in sorted(groups.items()):
+        start = datetime.fromtimestamp(bucket, UTC)
+        if candles[0].open_time != start:
+            if bucket == min(groups):
+                continue  # The request may begin in the second half of an older bucket.
+            raise ValueError("10m aggregation missing first 5m candle")
+        if len(candles) > 2 or any(
+            c.timeframe != "5m"
+            or c.symbol != candles[0].symbol
+            or c.open_time != start + timedelta(minutes=5 * index)
+            for index, c in enumerate(candles)
+        ):
+            raise ValueError("10m aggregation has inconsistent 5m candles")
+        if len(candles) != 2 and bucket != max(groups):
+            raise ValueError("10m aggregation missing second 5m candle")
+        result.append(
+            Candle(
+                symbol=candles[0].symbol,
+                timeframe="10m",
+                open_time=start,
+                close_time=start + timedelta(minutes=10),
+                open=candles[0].open,
+                high=max(c.high for c in candles),
+                low=min(c.low for c in candles),
+                close=candles[-1].close,
+                volume=sum((c.volume for c in candles), D(0)),
+                turnover=sum((c.turnover for c in candles), D(0)),
+                completed=len(candles) == 2 and all(c.completed for c in candles),
+                source="BYBIT",
+            )
+        )
+    return result

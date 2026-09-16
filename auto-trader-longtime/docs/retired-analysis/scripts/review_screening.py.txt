@@ -1,0 +1,95 @@
+"""Read-only live screening acceptance, isolated from the production ledger."""
+
+import asyncio
+import json
+from datetime import UTC, datetime
+from pathlib import Path
+
+from longtime.config import Settings
+from longtime.exchange import Exchange
+from longtime.market import Markets
+from longtime.model import DirectionModel, direction_context
+from longtime.screening import Screening
+from longtime.store import Store
+
+
+async def main():
+    settings = Settings()
+    settings.trading_enabled = False
+    run_id = datetime.now(UTC).strftime("%Y%m%dT%H%M%S%fZ")
+    root = Path("runtime/screening-review") / run_id
+    store = Store(root / "review.db")
+    markets, exchange = Markets(), Exchange(settings)
+    try:
+        await exchange.sync_clock()
+        excluded = {p["symbol"] for p in await exchange.active_positions()}
+        scan = await markets.scan(excluded)
+        store.event("SCAN", scan.model_dump(mode="json"))
+        print(
+            json.dumps(
+                {"phase": "scan", "candidates": len(scan.candidates), "excluded": len(excluded)}
+            ),
+            flush=True,
+        )
+        selected = await Screening(settings, store).select(run_id, scan.candidates)
+        result = {
+            "run_id": run_id,
+            "selected": selected,
+            "directions": [],
+            "private_writes": False,
+            "data_audit": [],
+        }
+        print(
+            json.dumps({"phase": "screened", "selected": [c["symbol"] for c in selected]}),
+            flush=True,
+        )
+        for candidate in selected:
+            if candidate["symbol"] in {p["symbol"] for p in await exchange.active_positions()}:
+                result["data_audit"].append(
+                    {"symbol": candidate["symbol"], "status": "SKIP_EXISTING_POSITION"}
+                )
+                continue
+            try:
+                context = await markets.evidence(candidate["symbol"], candidate)
+            except ValueError as error:
+                if not str(error).startswith("SKIP_INSUFFICIENT_WEEK_HISTORY"):
+                    raise
+                result["data_audit"].append({"symbol": candidate["symbol"], "status": str(error)})
+                continue
+            encoded = direction_context(context)
+            result["data_audit"].append(
+                {
+                    "symbol": candidate["symbol"],
+                    "candles": {tf: len(rows) for tf, rows in context["candles"].items()},
+                    "raw_characters": len(json.dumps(context, default=str)),
+                    "encoded_characters": len(json.dumps(encoded, default=str)),
+                    "recent_windows": {
+                        tf: item["recent_windows"] for tf, item in context["indicators"].items()
+                    },
+                }
+            )
+            direction = await DirectionModel(settings, store).decide(
+                run_id + candidate["symbol"], context
+            )
+            result["directions"].append(direction.model_dump())
+        (root / "result.json").write_text(
+            json.dumps(result, ensure_ascii=False, indent=2, default=str)
+        )
+        print(
+            json.dumps(
+                {
+                    "phase": "complete",
+                    "result": str(root / "result.json"),
+                    "selected": len(selected),
+                    "direction_calls": len(result["directions"]),
+                }
+            ),
+            flush=True,
+        )
+    finally:
+        await markets.close()
+        await exchange.close()
+
+
+if __name__ == "__main__":
+    asyncio.run(main())

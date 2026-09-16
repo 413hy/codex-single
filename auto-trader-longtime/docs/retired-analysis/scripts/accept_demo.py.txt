@@ -1,0 +1,129 @@
+"""One strategy-qualified Demo entry, then observe original TP/SL. Never force an exit."""
+
+import argparse
+import asyncio
+import json
+import time
+
+from longtime.config import Settings
+from longtime.service import App, ProcessLock, logging_setup, periodic
+from longtime.store import identity
+from longtime.telegram import Telegram
+
+
+async def acceptance_retry(app, row, callback_id):
+    # An acceptance run owns one automatic entry path. Old buttons must not
+    # introduce another cycle while it is waiting for the original TP/SL.
+    if row["kind"] in ("candidate", "cycle"):
+        return False
+    return await app.retry(row, callback_id)
+
+
+async def accept(settings, wait_seconds):
+    app = App(settings)
+    bot = Telegram(settings, app.store)
+    result = {
+        "started_at": time.time(),
+        "entry_verified": False,
+        "protection_verified": False,
+        "close_verified": False,
+    }
+    stop = asyncio.Event()
+    controls = None
+    cid = None
+    try:
+        await bot.preflight()
+        controls = asyncio.create_task(
+            periodic(
+                stop,
+                1,
+                lambda: bot.poll(lambda row, callback: acceptance_retry(app, row, callback)),
+                lambda e: app.executor.alert("TELEGRAM_POLL", "monitor", {}, e),
+            )
+        )
+        await app.monitor.startup()
+        positions = await app.exchange.active_positions()
+        scan = await app.markets.scan({p["symbol"] for p in positions} | app.store.reserved())
+        cid = "acceptance:" + identity(time.time_ns())
+        app.store.claim_cycle(cid)
+        chosen = None
+        for candidate in await app.screening.select(cid, scan.candidates):
+            await app.candidate(cid, candidate)
+            await bot.deliver()
+            rows = app.store.rows(
+                "SELECT * FROM trades WHERE cycle_id=? AND status IN ('OPEN','INTENT','SETTLING')",
+                (cid,),
+            )
+            if rows:
+                chosen = rows[0]
+                break
+            if app.funds_exhausted.is_set():
+                break
+        if not chosen:
+            result["status"] = "NO_QUALIFIED_ENTRY"
+            return result
+        tid = chosen["trade_id"]
+        result["trade_id"] = tid
+        end = time.monotonic() + wait_seconds
+        while time.monotonic() < end:
+            await app.monitor.tick()
+            await bot.deliver()
+            t = app.store.trade(tid)
+            result.update(
+                symbol=t["symbol"],
+                side=t["side"],
+                entry_verified=bool(t["entry_price"]),
+                protection_verified=bool(t["tp_order_id"] and t["sl_order_id"]),
+                close_verified=t["status"] == "CLOSED",
+            )
+            if t["status"] == "CLOSED":
+                result.update(
+                    status="CLOSED_VERIFIED", net_pnl=t["net_pnl"], close_reason=t["close_reason"]
+                )
+                break
+            await asyncio.sleep(30)
+        else:
+            result["status"] = (
+                "AWAITING_NATURAL_EXIT"
+                if result["protection_verified"]
+                else "REQUIRES_RECONCILIATION"
+            )
+        return result
+    finally:
+        stop.set()
+        if controls:
+            controls.cancel()
+            await asyncio.gather(controls, return_exceptions=True)
+        result["finished_at"] = time.time()
+        if cid is not None:
+            app.store.execute(
+                "UPDATE cycles SET status=?,completed_at=? WHERE cycle_id=? AND status='RUNNING'",
+                (result.get("status", "ERROR"), time.time(), cid),
+            )
+        path = settings.runtime_dir / "demo-acceptance.json"
+        await asyncio.to_thread(path.write_text, json.dumps(result, ensure_ascii=False, indent=2))
+        await bot.close()
+        await app.close()
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--wait-seconds", type=int, default=600)
+    args = parser.parse_args()
+    settings = Settings()
+    settings.require_credentials()
+    settings.require_telegram()
+    if not settings.trading_enabled:
+        raise SystemExit("Requires TRADING_ENABLED=true and a configured Demo account/Bot")
+    if args.wait_seconds < 30:
+        raise SystemExit("wait-seconds must be at least 30")
+    logging_setup(settings.runtime_dir)
+    lock = ProcessLock(settings.runtime_dir / "service.lock")
+    try:
+        print(json.dumps(asyncio.run(accept(settings, args.wait_seconds)), ensure_ascii=False))
+    finally:
+        lock.close()
+
+
+if __name__ == "__main__":
+    main()

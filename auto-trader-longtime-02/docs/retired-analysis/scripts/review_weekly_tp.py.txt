@@ -1,0 +1,83 @@
+"""Read-only retrospective gate audit; never a counterfactual profit backtest."""
+
+import asyncio
+import json
+import sqlite3
+from datetime import UTC, datetime, timedelta
+from decimal import Decimal as D
+from pathlib import Path
+
+from longtime.market import validate_direction_rows
+from longtime.vendor.public import BybitPublicClient
+
+
+async def main():
+    root = Path("runtime/week-trend")
+    conn = sqlite3.connect("file:runtime/trader.db?mode=ro", uri=True)
+    conn.row_factory = sqlite3.Row
+    rows = [
+        dict(r)
+        for r in conn.execute(
+            "SELECT trade_id,symbol,side,opened_at,tp_price,net_pnl,details FROM trades WHERE status='CLOSED' AND owned=1 AND opened_at IS NOT NULL ORDER BY opened_at DESC LIMIT 20"
+        )
+    ]
+    conn.close()
+    results = []
+    async with BybitPublicClient(max_attempts=1) as client:
+        for row in rows:
+            end = datetime.fromtimestamp(row["opened_at"], UTC).replace(second=0, microsecond=0)
+            start = end - timedelta(hours=24)
+            try:
+                candles = []
+                for a, b in [
+                    (start, start + timedelta(hours=12)),
+                    (start + timedelta(hours=12), end),
+                ]:
+                    candles.extend(
+                        await client.historical_completed_candles(
+                            row["symbol"], timeframe="1m", start_at=a, end_at=b, limit=720
+                        )
+                    )
+                validate_direction_rows(candles, row["symbol"], "1m", 1, end)
+                if len(candles) != 1440 or any(
+                    b.open_time - a.open_time != timedelta(minutes=1)
+                    for a, b in zip(candles, candles[1:], strict=False)
+                ):
+                    raise ValueError("incomplete historical 24h")
+                tp = D(row["tp_price"])
+                seconds = sum(
+                    60
+                    for c in candles
+                    if c.volume > 0 and (c.low > tp if row["side"] == "LONG" else c.high < tp)
+                )
+                results.append(
+                    {k: row[k] for k in ["trade_id", "symbol", "side", "opened_at", "net_pnl"]}
+                    | {
+                        "seconds_without_buffer": seconds,
+                        "passes_duration_without_buffer": seconds > 300,
+                    }
+                )
+            except Exception as error:
+                results.append(
+                    {"trade_id": row["trade_id"], "symbol": row["symbol"], "error": str(error)}
+                )
+    report = {
+        "method": "Historical actual filled TP; strict entire 1m range, no tick buffer; only completed candles before entry. Gate sensitivity, not replayed model decisions or executable PnL. Actual gate uses pre-entry quote TP and buffer, so these classifications are approximate.",
+        "results": results,
+    }
+    (root / "historical-tp.json").write_text(json.dumps(report, ensure_ascii=False, indent=2))
+    print(
+        json.dumps(
+            {
+                "samples": len(results),
+                "errors": sum("error" in r for r in results),
+                "pass_without_buffer": sum(
+                    r.get("passes_duration_without_buffer", False) for r in results
+                ),
+            }
+        )
+    )
+
+
+if __name__ == "__main__":
+    asyncio.run(main())

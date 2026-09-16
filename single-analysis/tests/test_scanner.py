@@ -1,0 +1,103 @@
+from datetime import UTC, datetime, timedelta
+from decimal import Decimal as D
+from types import SimpleNamespace
+
+import httpx
+import pytest
+
+from analysis_core.vendor.models import Candle, ScannerConfig
+from analysis_core.vendor.public import BybitPublicClient, BybitPublicError, BybitTicker
+from analysis_core.vendor.scanner import BybitUniverseScanner
+
+
+class Universe:
+    def __init__(self):
+        self.requested = []
+        self.fail_book = False
+        self.stale = False
+
+    async def instruments(self):
+        return [SimpleNamespace(symbol=f"C{i}USDT") for i in range(14)]
+
+    async def tickers(self):
+        return {
+            f"C{i}USDT": BybitTicker(
+                symbol=f"C{i}USDT",
+                last_price=D(100),
+                bid_price=D("99.99"),
+                ask_price=D("100.01"),
+                high_24h=D(110),
+                low_24h=D(90),
+                turnover_24h=D(100000000),
+                volume_24h=D(1000000),
+                price_change_24h=D(".1"),
+                observed_at=datetime.now(UTC),
+            )
+            for i in range(14)
+        }
+
+    async def completed_5m_candles(self, symbol, limit):
+        self.requested.append(symbol)
+        end = datetime.now(UTC) - timedelta(days=1 if self.stale else 0)
+        return tuple(
+            Candle(
+                symbol=symbol,
+                timeframe="5m",
+                open_time=end - timedelta(minutes=5 * (72 - i)),
+                close_time=end - timedelta(minutes=5 * (71 - i)),
+                open=D(100),
+                high=D(101),
+                low=D(99),
+                close=D(100) + D(i % 2) / 2,
+                volume=D(10000),
+                turnover=D(1000000),
+                completed=True,
+                source="BYBIT",
+            )
+            for i in range(72)
+        )
+
+    async def orderbook(self, symbol, limit):
+        if self.fail_book:
+            raise RuntimeError("orderbook unavailable")
+        return SimpleNamespace(
+            bids=[SimpleNamespace(notional=D(1000000))], asks=[SimpleNamespace(notional=D(1000000))]
+        )
+
+
+async def test_scanner_reuses_full_ranking_without_top_ten_cap():
+    client = Universe()
+    scan = await BybitUniverseScanner(client, ScannerConfig()).scan(exclude={"C0USDT"})
+    assert len(scan.candidates) == 13
+    assert "C0USDT" not in client.requested
+    assert not scan.failures
+
+
+@pytest.mark.parametrize("fault", ["book", "stale"])
+async def test_scanner_data_faults_skip_affected_symbols(fault):
+    client = Universe()
+    client.fail_book = fault == "book"
+    client.stale = fault == "stale"
+    scan = await BybitUniverseScanner(client, ScannerConfig()).scan()
+    assert not scan.candidates
+    assert len(scan.failures) == 14
+
+
+async def test_public_mismatched_candle_symbol_rejected():
+    async def handler(req):
+        return httpx.Response(
+            200,
+            json={
+                "retCode": 0,
+                "time": int(datetime.now(UTC).timestamp() * 1000),
+                "result": {"symbol": "OTHERUSDT", "list": []},
+            },
+        )
+
+    client = httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="https://api.bybit.com"
+    )
+    public = BybitPublicClient(client=client, max_attempts=1)
+    with pytest.raises(BybitPublicError, match="symbol"):
+        await public.recent_candles("TESTUSDT", timeframe="5m")
+    await client.aclose()

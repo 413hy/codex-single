@@ -1,0 +1,308 @@
+from __future__ import annotations
+
+from datetime import UTC, datetime, timedelta
+from decimal import Decimal
+
+from analysis_core.vendor.signal.domain.enums import PriceType, ToolStatus
+from analysis_core.vendor.signal.domain.models import Candle
+from analysis_core.vendor.signal.evidence.builder import EvidenceBuilder
+from analysis_core.vendor.signal.providers.bybit import (
+    BybitBookLevel,
+    BybitOpenInterest,
+    BybitOrderBook,
+    BybitPublicTrade,
+    BybitTicker,
+)
+from analysis_core.vendor.signal.providers.cross_exchange import ReferenceTicker
+from analysis_core.vendor.signal.providers.deep_market import DeepTimeframe, NativeMarketSnapshot
+
+
+def _candles(symbol: str, timeframe: DeepTimeframe, duration: timedelta) -> tuple[Candle, ...]:
+    start = datetime(2026, 7, 1, tzinfo=UTC)
+    result = []
+    for index in range(240):
+        center = Decimal("100") + Decimal(index) / Decimal("10")
+        open_time = start + duration * index
+        result.append(
+            Candle(
+                symbol=symbol,
+                timeframe=timeframe,
+                open_time=open_time,
+                close_time=open_time + duration,
+                open=center,
+                high=center + Decimal("0.8"),
+                low=center - Decimal("0.7"),
+                close=center + (Decimal("0.3") if index % 2 else Decimal("-0.2")),
+                volume=Decimal("1000"),
+                turnover=Decimal("100000") + Decimal(index * 100),
+                completed=True,
+                source="BYBIT",
+            )
+        )
+    return tuple(result)
+
+
+def _snapshot(*, partial_trades: bool = False) -> NativeMarketSnapshot:
+    symbol = "CYSUSDT"
+    now = datetime(2026, 8, 17, 8, tzinfo=UTC)
+    ticker = BybitTicker(
+        symbol=symbol,
+        last_price=Decimal("123.90"),
+        mark_price=Decimal("123.85"),
+        index_price=Decimal("123.80"),
+        bid_price=Decimal("123.89"),
+        ask_price=Decimal("123.91"),
+        high_24h=Decimal("130"),
+        low_24h=Decimal("110"),
+        turnover_24h=Decimal("5000000"),
+        volume_24h=Decimal("40000"),
+        price_change_24h=Decimal("0.05"),
+        funding_rate=Decimal("0.0001"),
+        open_interest=Decimal("2000000"),
+        open_interest_value=Decimal("240000000"),
+        next_funding_time=now + timedelta(hours=4),
+        observed_at=now,
+    )
+    book = BybitOrderBook(
+        symbol=symbol,
+        observed_at=now,
+        update_id=10,
+        sequence=11,
+        bids=tuple(
+            BybitBookLevel(
+                price=Decimal("123.89") - i / Decimal("100"),
+                size=Decimal(100 + i),
+            )
+            for i in range(20)
+        ),
+        asks=tuple(
+            BybitBookLevel(
+                price=Decimal("123.91") + i / Decimal("100"),
+                size=Decimal(90 + i),
+            )
+            for i in range(20)
+        ),
+    )
+    count = 10 if partial_trades else 80
+    spacing = 2 if partial_trades else 5
+    trades = tuple(
+        BybitPublicTrade(
+            symbol=symbol,
+            trade_id=f"trade-{index}",
+            timestamp=now - timedelta(seconds=(count - 1 - index) * spacing),
+            side="Buy" if index % 3 else "Sell",
+            price=Decimal("123.90"),
+            size=Decimal("2"),
+        )
+        for index in range(count)
+    )
+    oi = tuple(
+        BybitOpenInterest(
+            symbol=symbol,
+            timestamp=now - timedelta(minutes=(47 - index) * 5),
+            open_interest=Decimal("1900000") + Decimal(index * 2000),
+        )
+        for index in range(48)
+    )
+    return NativeMarketSnapshot(
+        symbol=symbol,
+        collection_started_at=now - timedelta(seconds=2),
+        generated_at=now,
+        ticker=ticker,
+        candles={
+            "3m": _candles(symbol, "3m", timedelta(minutes=3)),
+            "5m": _candles(symbol, "5m", timedelta(minutes=5)),
+            "15m": _candles(symbol, "15m", timedelta(minutes=15)),
+            "30m": _candles(symbol, "30m", timedelta(minutes=30)),
+            "1h": _candles(symbol, "1h", timedelta(hours=1)),
+            "4h": _candles(symbol, "4h", timedelta(hours=4)),
+        },
+        orderbook=book,
+        recent_trades=trades,
+        open_interest=oi,
+        reference_tickers=(
+            ReferenceTicker(
+                symbol=symbol,
+                exchange="BINANCE",
+                instrument=symbol,
+                last_price=Decimal("123.88"),
+                bid_price=Decimal("123.87"),
+                ask_price=Decimal("123.89"),
+                observed_at=now,
+            ),
+        ),
+    )
+
+
+def test_builder_preserves_prices_and_derives_completed_candle_features() -> None:
+    bundle = EvidenceBuilder().build(_snapshot())
+
+    assert bundle.canonical_last.price_type is PriceType.LAST
+    assert bundle.canonical_last.value != bundle.canonical_mark.value
+    price_action = next(
+        item for item in bundle.evidence_items if item.evidence_id == "CYSUSDT.PA.5M"
+    )
+    assert price_action.values["completed_candles"] == 240
+    assert float(price_action.values["rolling_high_20"]) < 1_000
+    assert price_action.values["ema_50"] is not None
+    assert price_action.values["return_1_percent"] is not None
+    assert price_action.values["return_3_acceleration_percent"] is not None
+    assert price_action.values["ema_9_slope_3_atr"] is not None
+    assert price_action.values["rsi_14_delta_3"] is not None
+    assert price_action.values["latest_close_location"] is not None
+    assert price_action.values["range_expansion_3_vs_prior_9"] is not None
+    assert price_action.values["turnover_impulse_latest_vs_median_20"] is not None
+    assert float(price_action.values["recent_6_bars_turnover_usdt"]) > 0
+    assert float(price_action.values["drawdown_from_rolling_high_atr"]) >= 0
+    assert float(price_action.values["rebound_from_rolling_low_atr"]) >= 0
+    assert 0 <= float(price_action.values["rolling_range_position_20"]) <= 1
+    assert int(price_action.values["higher_high_steps_8"]) == 7
+    assert int(price_action.values["higher_low_steps_8"]) == 7
+    assert (
+        int(price_action.values["close_up_steps_8"])
+        + int(price_action.values["close_down_steps_8"])
+        == 7
+    )
+    assert price_action.values["recent_two_turnover_vs_median_20"] is not None
+    thirty = next(item for item in bundle.evidence_items if item.evidence_id == "CYSUSDT.PA.30M")
+    assert thirty.values["completed_candles"] == 240
+    core = next(tool for tool in bundle.tool_assessments if tool.tool == "BYBIT_NATIVE_MARKET_DATA")
+    assert core.status is ToolStatus.AVAILABLE
+    assert all(
+        not item.evidence_id.endswith((".PA.1M", ".RAW.1M")) for item in bundle.evidence_items
+    )
+    assert all(not item.evidence_id.endswith(".LIQUIDATIONS.1M") for item in bundle.evidence_items)
+    assert all(tool.tool != "BYBIT_NATIVE_ULTRASHORT_1M" for tool in bundle.tool_assessments)
+    reference = next(
+        item for item in bundle.evidence_items if item.evidence_id == "CYSUSDT.REFERENCE.BINANCE"
+    )
+    assert reference.values["last_divergence_vs_bybit_bps"] is not None
+    raw = next(item for item in bundle.evidence_items if item.evidence_id == "CYSUSDT.RAW.5M")
+    assert raw.values["columns"] == [
+        "open_time",
+        "open",
+        "high",
+        "low",
+        "close",
+        "volume",
+        "turnover",
+    ]
+    assert len(raw.values["rows"]) == 24
+    assert len(raw.values["rows"][0]) == 7
+    raw_30m = next(item for item in bundle.evidence_items if item.evidence_id == "CYSUSDT.RAW.30M")
+    assert len(raw_30m.values["rows"]) == 12
+
+
+def test_builder_fail_closes_incomplete_public_trade_window() -> None:
+    bundle = EvidenceBuilder().build(_snapshot(partial_trades=True))
+
+    trade_window = next(
+        item for item in bundle.evidence_items if item.evidence_id == "CYSUSDT.MICRO.TRADES.5M"
+    )
+    assert trade_window.values["qualified"] is False
+    assert trade_window.values["normalized_delta"] is None
+
+
+def test_confirmed_pivots_use_only_right_side_completed_bars() -> None:
+    bundle = EvidenceBuilder().build(_snapshot())
+    price_action = next(
+        item for item in bundle.evidence_items if item.evidence_id == "CYSUSDT.PA.5M"
+    )
+
+    latest = datetime.fromisoformat(str(price_action.values["latest_completed_close_time"]))
+    for key in ("pivot_high_confirmed_at", "pivot_low_confirmed_at"):
+        confirmed = price_action.values[key]
+        assert confirmed is None or datetime.fromisoformat(str(confirmed)) <= latest
+    for key in ("pivot_high_age_bars", "pivot_low_age_bars"):
+        age = price_action.values[key]
+        assert age is None or int(age) >= 0
+
+
+def test_builder_records_zero_atr_as_unavailable_instead_of_crashing() -> None:
+    snapshot = _snapshot()
+    flat_candles = {
+        timeframe: tuple(
+            candle.model_copy(
+                update={
+                    "open": Decimal("100"),
+                    "high": Decimal("100"),
+                    "low": Decimal("100"),
+                    "close": Decimal("100"),
+                }
+            )
+            for candle in candles
+        )
+        for timeframe, candles in snapshot.candles.items()
+    }
+
+    bundle = EvidenceBuilder().build(snapshot.model_copy(update={"candles": flat_candles}))
+
+    price_action = next(
+        item for item in bundle.evidence_items if item.evidence_id == "CYSUSDT.PA.5M"
+    )
+    assert price_action.values["atr_14"] == 0
+    assert price_action.values["rsi_14"] == 50
+    assert price_action.values["ema_9_slope_3_atr"] is None
+    assert price_action.values["latest_true_range_atr"] is None
+    assert price_action.values["drawdown_from_rolling_high_atr"] is None
+
+
+def test_builder_omits_under_warmed_timeframe_instead_of_failing_bundle() -> None:
+    snapshot = _snapshot()
+    candles = dict(snapshot.candles)
+    candles["4h"] = candles["4h"][-49:]
+
+    bundle = EvidenceBuilder().build(snapshot.model_copy(update={"candles": candles}))
+
+    evidence_ids = {item.evidence_id for item in bundle.evidence_items}
+    assert "CYSUSDT.PA.4H" not in evidence_ids
+    quality = next(
+        item for item in bundle.evidence_items if item.evidence_id == "CYSUSDT.NATIVE.QUALITY"
+    )
+    assert quality.values["under_warmed_timeframe_count"] == 1
+    assert quality.values["under_warmed_timeframes"] == "4h"
+    assert quality.values["qualified_timeframe_count"] == 5
+    core = next(tool for tool in bundle.tool_assessments if tool.tool == "BYBIT_NATIVE_MARKET_DATA")
+    assert core.status is ToolStatus.PARTIAL
+    assert "5/6 completed-candle timeframes qualified" in core.reason
+
+
+def test_empty_timeframe_not_counted_as_qualified_and_volume_window_is_explicit():
+    snapshot = _snapshot()
+    candles = dict(snapshot.candles)
+    candles["4h"] = ()
+    bundle = EvidenceBuilder().build(snapshot.model_copy(update={"candles": candles}))
+    quality = next(x for x in bundle.evidence_items if x.category == "data_quality")
+    assert quality.values["qualified_timeframe_count"] == 5
+    for item in bundle.evidence_items:
+        if item.evidence_id.endswith(".PA.5M"):
+            assert item.values["recent_turnover_window_minutes"] == 30
+        if item.evidence_id.endswith(".PA.1H"):
+            assert item.values["recent_turnover_window_minutes"] == 360
+            assert "recent_30m_turnover_usdt" not in item.values
+
+
+def test_oi_change_requires_actual_five_minute_spacing_and_fresh_end():
+    from analysis_core.vendor.signal.evidence.builder import _oi_change
+
+    snapshot = _snapshot()
+    points = list(snapshot.open_interest)
+    assert _oi_change(points, 3, snapshot.generated_at) is not None
+    assert _oi_change(points[:-1], 3, snapshot.generated_at + timedelta(hours=1)) is None
+    points[-2] = points[-2].model_copy(update={"timestamp": points[-3].timestamp})
+    assert _oi_change(points, 3, snapshot.generated_at) is None
+
+
+def test_turnover_baseline_uses_twenty_prior_candles():
+    import statistics
+
+    snapshot = _snapshot()
+    candles = snapshot.candles["5m"]
+    item = EvidenceBuilder()._price_action(snapshot.symbol, "5m", candles)
+    expected = float(candles[-1].turnover) / statistics.median(
+        float(c.turnover) for c in candles[-21:-1]
+    )
+    assert item.values["turnover_impulse_latest_vs_median_20"] == expected
+    flow = EvidenceBuilder()._trade_window(snapshot, seconds=300, label="5M")
+    assert flow.values["coverage_complete"] is False
+    assert "continuous coverage unverified" in flow.summary

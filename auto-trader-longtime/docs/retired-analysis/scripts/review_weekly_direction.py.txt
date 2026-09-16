@@ -1,0 +1,107 @@
+"""Historical direction replay with an explicit clock and no post-entry data."""
+
+import asyncio
+import json
+import sqlite3
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
+from unittest.mock import patch
+
+from longtime.config import Settings
+from longtime.market import Markets, verify_candles
+from longtime.model import DirectionModel
+from longtime.store import Store
+from longtime.vendor.public import BybitPublicClient
+
+
+async def main():
+    root = Path("runtime/week-trend/direction-replay")
+    store = Store(root / "review.db")
+    conn = sqlite3.connect("file:runtime/trader.db?mode=ro", uri=True)
+    conn.row_factory = sqlite3.Row
+    samples = [
+        dict(r)
+        for r in conn.execute(
+            "SELECT trade_id,symbol,side,opened_at,net_pnl,analysis FROM trades WHERE status='CLOSED' AND owned=1 AND opened_at IS NOT NULL ORDER BY opened_at DESC LIMIT 2"
+        )
+    ]
+    conn.close()
+    settings = Settings(trading_enabled=False)
+    results = []
+    async with BybitPublicClient(max_attempts=1) as public:
+        for sample in samples:
+            at = datetime.fromtimestamp(sample["opened_at"], UTC)
+
+            class HistoricalClient:
+                async def recent_candles(self, symbol, timeframe, limit, at=at):
+                    minutes = {
+                        "1m": 1,
+                        "3m": 3,
+                        "5m": 5,
+                        "15m": 15,
+                        "30m": 30,
+                        "1h": 60,
+                        "2h": 120,
+                    }[timeframe]
+                    end = datetime.fromtimestamp(
+                        int(at.timestamp()) // (minutes * 60) * (minutes * 60), UTC
+                    )
+                    return await public.historical_completed_candles(
+                        symbol,
+                        timeframe=timeframe,
+                        start_at=end - timedelta(minutes=minutes * limit),
+                        end_at=end,
+                        limit=limit,
+                    )
+
+            class HistoricalClock(datetime):
+                @classmethod
+                def now(cls, tz=None, at=at):
+                    return at
+
+            def verify_closed(rows, minutes, now, minimum):
+                # A historical replay has no reconstructible forming candle.
+                # Its latest closed candle must end within one interval of as_of.
+                if not rows or not timedelta(0) <= now - rows[-1].close_time < timedelta(
+                    minutes=minutes
+                ):
+                    raise ValueError("Stale historical closed candles")
+                verify_candles(rows, minutes, rows[-1].close_time, minimum)
+
+            try:
+                with (
+                    patch("longtime.market.datetime", HistoricalClock),
+                    patch("longtime.market.verify_candles", verify_closed),
+                ):
+                    context = await Markets(HistoricalClient(), include_orderflow=False).evidence(
+                        sample["symbol"], {"replay": True}
+                    )
+                assert all(
+                    datetime.fromisoformat(c["close_time"]) <= at
+                    for rows in context["candles"].values()
+                    for c in rows
+                )
+                decision = await DirectionModel(settings, store).decide(sample["trade_id"], context)
+                results.append(
+                    {**sample, "replayed": decision.model_dump(), "as_of": at.isoformat()}
+                )
+            except Exception as error:
+                results.append({**sample, "error": str(error)})
+            (root / "result.json").write_text(
+                json.dumps(
+                    {
+                        "method": "Two most recent closed trades chosen by entry time; original outcomes never sent to model; completed pre-entry public candles only. Direction consistency review, not profitability backtest.",
+                        "results": results,
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                )
+            )
+            print(
+                json.dumps({"symbol": sample["symbol"], "complete": "error" not in results[-1]}),
+                flush=True,
+            )
+
+
+if __name__ == "__main__":
+    asyncio.run(main())

@@ -1,7 +1,0 @@
-interface:
-  display_name: "Bybit 超短线方向分析"
-  short_description: "按模型中心契约分析 Bybit 超短线方向与结构威胁"
-  default_prompt: "Use $analyze-bybit-ultrashort-signals to analyze supplied Bybit public-market evidence and return model-centered direction signals."
-
-policy:
-  allow_implicit_invocation: true

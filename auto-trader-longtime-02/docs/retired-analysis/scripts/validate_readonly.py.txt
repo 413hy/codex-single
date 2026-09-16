@@ -1,0 +1,68 @@
+"""Read-only validation against an existing Demo credential file; never copies secrets."""
+
+import asyncio
+import json
+import time
+from pathlib import Path
+
+from longtime.config import Settings
+from longtime.service import App, ProcessLock
+
+
+async def main():
+    settings = Settings(trading_enabled=False, runtime_dir=Path("runtime/validation"))
+    settings.require_credentials()
+    settings.runtime_dir.mkdir(parents=True, exist_ok=True)
+    lock = ProcessLock(settings.runtime_dir / "service.lock")
+    app = App(settings)
+    try:
+        await app.exchange.sync_clock()
+        account = await app.exchange.account()
+        positions = await app.exchange.active_positions()
+        orders = await app.exchange.open_orders()
+        result = {
+            "endpoint": "https://api-demo.bybit.com",
+            "account": account,
+            "positions": len(positions),
+            "orders": len(orders),
+            "mode_indexes": sorted({int(p["positionIdx"]) for p in positions}),
+        }
+        scan = await app.markets.scan({p["symbol"] for p in positions})
+        app.store.event("VALIDATION_SCAN", scan.model_dump(mode="json"))
+        result.update(
+            universe=scan.universe_size,
+            candidates=len(scan.candidates),
+            scan_failures=scan.failures,
+        )
+        if scan.candidates:
+            cid = "readonly-validation-" + str(time.time_ns())
+            app.store.claim_cycle(cid)
+            try:
+                selected = await app.screening.select(cid, scan.candidates)
+                outcomes = [await app.candidate(cid, candidate) for candidate in selected]
+                result["direction_and_economics"] = all(outcomes)
+                app.store.execute(
+                    "UPDATE cycles SET status=?,completed_at=? WHERE cycle_id=?",
+                    ("SUCCESS" if all(outcomes) else "PARTIAL_ERROR", time.time(), cid),
+                )
+            except Exception:
+                app.store.execute(
+                    "UPDATE cycles SET status='ERROR',completed_at=? WHERE cycle_id=?",
+                    (time.time(), cid),
+                )
+                raise
+            result["signals"] = app.store.rows(
+                "SELECT symbol,status,side,analysis FROM signals WHERE cycle_id=?", (cid,)
+            )
+        await asyncio.to_thread(
+            Path("runtime/validation/acceptance.json").write_text,
+            json.dumps(result, ensure_ascii=False, indent=2),
+        )
+        print(json.dumps(result, ensure_ascii=False))
+    finally:
+        await app.close()
+        lock.close()
+
+
+if __name__ == "__main__":
+    asyncio.run(main())

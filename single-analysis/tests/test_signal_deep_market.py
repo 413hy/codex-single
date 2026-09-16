@@ -1,0 +1,155 @@
+from __future__ import annotations
+
+from datetime import UTC, datetime, timedelta
+from decimal import Decimal
+from typing import Any
+
+import pytest
+
+from analysis_core.vendor.signal.domain.market_requirements import PRICE_ACTION_MINIMUM_CANDLES
+from analysis_core.vendor.signal.domain.models import Candle
+from analysis_core.vendor.signal.providers.bybit import BybitTicker
+from analysis_core.vendor.signal.providers.deep_market import (
+    BybitDeepMarketCollector,
+    DeepTimeframe,
+)
+
+
+class FakePublicClient:
+    def __init__(self) -> None:
+        self.timeframes: list[str] = []
+
+    async def tickers(self) -> dict[str, BybitTicker]:
+        now = datetime.now(UTC)
+        return {
+            "CYSUSDT": BybitTicker(
+                symbol="CYSUSDT",
+                last_price=Decimal("1"),
+                mark_price=Decimal("1.001"),
+                bid_price=Decimal("0.999"),
+                ask_price=Decimal("1.001"),
+                high_24h=Decimal("1.2"),
+                low_24h=Decimal("0.8"),
+                turnover_24h=Decimal("1000000"),
+                volume_24h=Decimal("1000000"),
+                price_change_24h=Decimal("0.1"),
+                observed_at=now,
+            )
+        }
+
+    async def completed_candles(
+        self, symbol: str, *, timeframe: DeepTimeframe, limit: int
+    ) -> tuple[Candle, ...]:
+        self.timeframes.append(timeframe)
+        duration = {
+            "1m": timedelta(minutes=1),
+            "3m": timedelta(minutes=3),
+            "5m": timedelta(minutes=5),
+            "15m": timedelta(minutes=15),
+            "30m": timedelta(minutes=30),
+            "1h": timedelta(hours=1),
+            "4h": timedelta(hours=4),
+        }[timeframe]
+        end = datetime.now(UTC).replace(second=0, microsecond=0)
+        end -= timedelta(seconds=end.timestamp() % duration.total_seconds())
+        start = end - duration * 240
+        return tuple(
+            Candle(
+                symbol=symbol,
+                timeframe=timeframe,
+                open_time=start + duration * index,
+                close_time=start + duration * (index + 1),
+                open=Decimal("1"),
+                high=Decimal("1.1"),
+                low=Decimal("0.9"),
+                close=Decimal("1.01"),
+                volume=Decimal("100"),
+                turnover=Decimal("100"),
+                completed=True,
+                source="BYBIT",
+            )
+            for index in range(240)
+        )
+
+    async def orderbook(self, symbol: str, *, limit: int) -> Any:
+        raise RuntimeError("optional book unavailable")
+
+    async def recent_trades(self, symbol: str, *, limit: int) -> tuple[Any, ...]:
+        return ()
+
+    async def open_interest_history(
+        self, symbol: str, *, interval: str, limit: int
+    ) -> tuple[Any, ...]:
+        return ()
+
+    async def long_short_ratio(self, symbol: str, *, period: str, limit: int) -> tuple[Any, ...]:
+        return ()
+
+
+class BoundaryCrossingClient(FakePublicClient):
+    async def completed_candles(
+        self, symbol: str, *, timeframe: DeepTimeframe, limit: int
+    ) -> tuple[Candle, ...]:
+        candles = await super().completed_candles(symbol, timeframe=timeframe, limit=limit)
+        duration = candles[-1].close_time - candles[-1].open_time
+        last = candles[-1]
+        post_cutoff = last.model_copy(
+            update={
+                "open_time": last.close_time,
+                "close_time": last.close_time + duration,
+            }
+        )
+        return (*candles, post_cutoff)
+
+
+class UnderWarmedFourHourClient(FakePublicClient):
+    async def completed_candles(
+        self, symbol: str, *, timeframe: DeepTimeframe, limit: int
+    ) -> tuple[Candle, ...]:
+        candles = await super().completed_candles(symbol, timeframe=timeframe, limit=limit)
+        if timeframe == "4h":
+            return candles[-(PRICE_ACTION_MINIMUM_CANDLES - 1) :]
+        return candles
+
+
+@pytest.mark.asyncio
+async def test_native_collector_fetches_all_required_timeframes_and_degrades_optional() -> None:
+    client = FakePublicClient()
+    snapshot = await BybitDeepMarketCollector(client).collect("CYSUSDT")  # type: ignore[arg-type]
+
+    assert sorted(client.timeframes) == ["15m", "1h", "30m", "3m", "4h", "5m"]
+    assert set(snapshot.candles) == {"3m", "5m", "15m", "30m", "1h", "4h"}
+    assert snapshot.orderbook is None
+    assert "orderbook" in snapshot.collection_failures
+    assert all(candle.completed for candles in snapshot.candles.values() for candle in candles)
+
+
+@pytest.mark.asyncio
+async def test_native_collector_trims_candle_completed_after_snapshot_cutoff() -> None:
+    client = BoundaryCrossingClient()
+
+    snapshot = await BybitDeepMarketCollector(client).collect(  # type: ignore[arg-type]
+        "CYSUSDT"
+    )
+
+    assert set(snapshot.candles) == {"3m", "5m", "15m", "30m", "1h", "4h"}
+    assert all(
+        candles[-1].close_time <= snapshot.collection_started_at
+        for candles in snapshot.candles.values()
+    )
+
+
+@pytest.mark.asyncio
+async def test_native_collector_rejects_timeframe_that_cannot_build_ema50() -> None:
+    client = UnderWarmedFourHourClient()
+
+    snapshot = await BybitDeepMarketCollector(client).collect("CYSUSDT")  # type: ignore[arg-type]
+
+    assert "4h" not in snapshot.candles
+    assert snapshot.collection_failures["candles.4h"] == (
+        "only 49 completed candles; minimum is 50"
+    )
+    assert all(
+        minimum >= PRICE_ACTION_MINIMUM_CANDLES
+        for minimum in BybitDeepMarketCollector._MINIMUM_CANDLES.values()
+    )

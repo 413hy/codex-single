@@ -1,0 +1,67 @@
+"""Persistent live acceptance observer: no new entry cycles."""
+
+import asyncio
+import signal
+
+from longtime.config import Settings
+from longtime.service import App, ProcessLock, logging_setup, periodic
+from longtime.telegram import Telegram
+
+
+async def main():
+    settings = Settings(trading_enabled=True)
+    logging_setup(settings.runtime_dir)
+    lock = ProcessLock(settings.runtime_dir / "service.lock")
+    app = App(settings)
+    bot = Telegram(settings, app.store)
+    stop = asyncio.Event()
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        asyncio.get_running_loop().add_signal_handler(sig, stop.set)
+    tasks = []
+
+    async def retry(row, callback):
+        if row["kind"] in ("candidate", "cycle"):
+            return False  # Observer never introduces new positions.
+        return await app.retry(row, callback)
+
+    try:
+        await bot.preflight()
+        await app.monitor.startup()
+        tasks = [
+            asyncio.create_task(
+                periodic(
+                    stop,
+                    30,
+                    app.monitor.tick,
+                    lambda e: app.executor.alert("MONITOR", "monitor", {}, e),
+                )
+            ),
+            asyncio.create_task(
+                periodic(
+                    stop,
+                    2,
+                    bot.deliver,
+                    lambda e: app.executor.alert("DATABASE_OUTBOX", "monitor", {}, e),
+                )
+            ),
+            asyncio.create_task(
+                periodic(
+                    stop,
+                    1,
+                    lambda: bot.poll(retry),
+                    lambda e: app.executor.alert("TELEGRAM_POLL", "monitor", {}, e),
+                )
+            ),
+        ]
+        await stop.wait()
+    finally:
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        await bot.close()
+        await app.close()
+        lock.close()
+
+
+if __name__ == "__main__":
+    asyncio.run(main())

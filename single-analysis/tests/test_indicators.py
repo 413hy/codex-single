@@ -1,0 +1,125 @@
+from datetime import UTC, datetime, timedelta
+from decimal import Decimal as D
+
+import pytest
+
+from analysis_core.indicators import direction_indicators, ema, wilder
+from analysis_core.vendor.models import Candle
+
+
+def rows(prices):
+    at = datetime(2026, 9, 1, tzinfo=UTC)
+    return [
+        Candle(
+            symbol="TESTUSDT",
+            timeframe="1h",
+            open_time=at + timedelta(hours=i),
+            close_time=at + timedelta(hours=i + 1),
+            open=D(p),
+            high=D(p),
+            low=D(p),
+            close=D(p),
+            volume=D(10),
+            turnover=D(p) * 10,
+            completed=True,
+            source="BYBIT",
+        )
+        for i, p in enumerate(prices)
+    ]
+
+
+def test_known_seeds_and_smoothing():
+    assert ema([D(1), D(2), D(3), D(5)], 3) == [D(2), D("3.5")]
+    assert wilder([D(1), D(2), D(3), D(5)], 3) == D(3)
+
+
+def test_flat_zero_denominators_are_not_directional_signals():
+    candles = [r.model_copy(update={"volume": D(0)}) for r in rows([10] * 120)]
+    result = direction_indicators(candles)["recent"][-1]
+    assert result["rsi14"] == 50 and result["atr14"] == 0
+    assert result["ema9"] == result["ema20"] == 10
+    assert result["macd_12_26_9"]["histogram"] == 0
+    assert result["bollinger_20_2"]["percent_b"] is None
+    assert result["range20"]["close_position"] is None
+    assert result["volume_ratio_previous20"] is None
+
+
+def test_rising_market_known_bollinger_atr_rsi_and_volume():
+    candles = rows(range(1, 121))
+    candles[-1] = candles[-1].model_copy(update={"volume": D(30)})
+    result = direction_indicators(candles)["recent"][-1]
+    assert result["rsi14"] == 100 and result["atr14"] == 1
+    assert result["ema9"] > result["ema20"]
+    assert result["bollinger_20_2"]["middle"] == D("110.5")
+    assert result["bollinger_20_2"]["upper"] == D("110.5") + 2 * D("33.25").sqrt()
+    assert result["range20"]["close_position"] == 1
+    assert result["volume_ratio_previous20"] == 3
+    assert direction_indicators(rows(range(120, 0, -1)))["recent"][-1]["rsi14"] == 0
+
+
+def test_forming_spike_cannot_change_closed_indicators():
+    candles = rows(range(1, 121))
+    forming = rows([10000])[-1].model_copy(update={"completed": False})
+    first, second = direction_indicators(candles), direction_indicators(candles + [forming])
+    assert first["recent"] == second["recent"]
+    assert second["closed_samples"] == 120 and second["forming_excluded"] == 1
+    assert len(first["recent"]) == 3
+    with pytest.raises(ValueError):
+        direction_indicators([forming])
+
+
+def test_short_history_omits_unavailable_metrics_without_blocking():
+    for count in (1, 8, 12, 16, 24, 32):
+        result = direction_indicators(rows(range(1, count + 1)))
+        latest = result["recent"][-1]
+        assert len(result["recent"]) == min(count, 3)
+        assert (latest["ema9"] is not None) == (count >= 9)
+        assert (latest["ema20"] is not None) == (count >= 20)
+        assert (latest["rsi14"] is not None) == (count >= 15)
+        assert (latest["bollinger_20_2"] is not None) == (count >= 20)
+        assert latest["macd_12_26_9"] is None
+        assert "ema50" not in latest
+
+
+def test_recent_structure_uses_actual_short_window_not_twenty_bar_label():
+    candles = rows([10, 12, 11])
+    candles[-1] = candles[-1].model_copy(update={"volume": D(30)})
+    result = direction_indicators(candles)["recent"][-1]
+    structure = result["background_structure"]
+    assert structure["samples"] == 3
+    assert structure["high"] == 12 and structure["low"] == 10
+    assert structure["close_change_ratio"] == D("0.1")
+    assert structure["close_position"] == D("0.5")
+    assert structure["volume_ratio_previous_available"] == 3
+    assert result["range20"] is None and result["volume_ratio_previous20"] is None
+
+
+def test_near_window_reversal_not_hidden_by_background():
+    candles = rows(list(range(100, 130)) + [120, 110, 105, 104])
+    result = direction_indicators(candles)
+    assert result["recent"][-1]["background_structure"]["close_change_ratio"] > 0
+    assert result["recent_windows"][0]["close_change_ratio"] < 0
+    assert result["recent_windows"][0]["samples"] == 4
+    short = direction_indicators(candles[:2])
+    assert short["recent_windows"][0]["complete"] is False
+    assert short["recent_windows"][0]["samples"] == 2
+
+
+def test_two_hour_macd_intentionally_omitted_without_extending_history():
+    candles = [r.model_copy(update={"timeframe": "2h"}) for r in rows(range(1, 37))]
+    result = direction_indicators(candles)
+    assert result["recent"][-1]["macd_12_26_9"] is None
+    assert result["recent"][-1]["ema20"] is not None
+    assert result["indicator_notes"]["macd_12_26_9"]
+
+
+def test_price_volume_is_ohlcv_not_aggressor_flow():
+    from analysis_core.indicators import price_volume
+
+    candles = rows(range(1, 25))
+    result = price_volume(candles)
+    assert sum(day["volume"] for day in result["daily"]) == sum(
+        c.volume for c in candles if c.completed
+    )
+    assert len(result["high_volume_candles"]) == 10
+    assert "not aggressor" in result["method"]

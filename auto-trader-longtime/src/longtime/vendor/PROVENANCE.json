@@ -1,0 +1,77 @@
+{
+  "scanner.py": {
+    "source": "/opt/bybit-signal/src/bybit_signal/selection/scanner.py",
+    "sha256": "dcf78a6c91f482482e160acb42ddb92d0767d62c9bbeb671a2972dae954905f6"
+  },
+  "public.py": {
+    "source": "/opt/bybit-signal/src/bybit_signal/providers/bybit.py",
+    "sha256": "7a8ceb6be63b163747aea223f3390ef040ae2bb9bc7681484c08a6e5cbaa743d"
+  },
+  "signal/domain/enums.py": {
+    "source": "/opt/bybit-signal/src/bybit_signal/domain/enums.py",
+    "sha256": "28ee32b2fdeef194b577e8030839c93bb284adf1b94dee5d21e05c160a3a5747",
+    "adaptation": "Independent public screening subset; local imports only"
+  },
+  "signal/domain/market_requirements.py": {
+    "source": "/opt/bybit-signal/src/bybit_signal/domain/market_requirements.py",
+    "sha256": "d62211ae26d4efca091cf5dbfc4c65698ca10a0abf01422ce1d99cbd796ed7ea",
+    "adaptation": "Independent public screening subset; local imports only"
+  },
+  "signal/providers/bybit.py": {
+    "source": "/opt/bybit-signal/src/bybit_signal/providers/bybit.py",
+    "sha256": "7a8ceb6be63b163747aea223f3390ef040ae2bb9bc7681484c08a6e5cbaa743d",
+    "adaptation": "Independent public screening subset; local imports only"
+  },
+  "signal/providers/cross_exchange.py": {
+    "source": "/opt/bybit-signal/src/bybit_signal/providers/cross_exchange.py",
+    "sha256": "ec7a62a4eba4a979bb9f13dff1da7d4862f86b434357444804bc2308f37e3f58",
+    "adaptation": "Independent public screening subset; local imports only"
+  },
+  "signal/providers/market_context.py": {
+    "source": "/opt/bybit-signal/src/bybit_signal/providers/market_context.py",
+    "sha256": "e9bdc2f58936d6e48ac2a895524ff61526c3a5337e054f94f4455c21f03636ce",
+    "adaptation": "Independent public screening subset; local imports only"
+  },
+  "signal/providers/public_streams.py": {
+    "source": "/opt/bybit-signal/src/bybit_signal/providers/public_streams.py",
+    "sha256": "62a582f644486289da56e9c5a3f1a19200b5c53c5ccd5552176b08de9bfb9d61",
+    "adaptation": "Independent public screening subset; local imports only"
+  },
+  "signal/providers/deep_market.py": {
+    "source": "/opt/bybit-signal/src/bybit_signal/providers/deep_market.py",
+    "sha256": "ae5d8aa5c0266696330140acfaa39c867fabe7432b634cc27dd9dced47e4c6e7",
+    "adaptation": "Independent public screening subset; local imports only"
+  },
+  "signal/evidence/builder.py": {
+    "source": "/opt/bybit-signal/src/bybit_signal/evidence/builder.py",
+    "sha256": "e2dca73d1939ab225796bc1e905c8758001d3dc48fe8a90861e56bd4c1dac915",
+    "adaptation": "Independent public screening subset; local imports only"
+  },
+  "signal/screening/models.py": {
+    "source": "/opt/bybit-signal/src/bybit_signal/screening/models.py",
+    "sha256": "8eda01fd74249dfb342de2f22cec7b56e877800f1e8a9bda7d1bc0b37ce0fdc0",
+    "adaptation": "Independent public screening subset; local imports only"
+  },
+  "signal/domain/models.py": {
+    "source": "/opt/bybit-signal/src/bybit_signal/domain/models.py",
+    "sha256": "6415d0837dc773b61c8b4278faa84b52171ee26c096129f1166bdd0a8a5dbe6f",
+    "adaptation": "Independent public screening subset; local imports only"
+  },
+  "signal/screening/validation.py": {
+    "source": "/opt/bybit-signal/src/bybit_signal/analysis/screening.py",
+    "sha256": "c49769256dabd1d1d86f48e56604357f66c07e46e586df60dffe26b29043f892",
+    "adaptation": "Independent public screening subset; local imports only"
+  },
+  ".agents/skills/screen-bybit-market-candidates/SKILL.md": {
+    "source": "/opt/bybit-signal/.agents/skills/screen-bybit-market-candidates/SKILL.md",
+    "sha256": "34f64caced5e49481a3074b76657d2807b012529413ab91b7f20f8d615401ce0"
+  },
+  ".agents/skills/screen-bybit-market-candidates/references/operating-contract.md": {
+    "source": "/opt/bybit-signal/.agents/skills/screen-bybit-market-candidates/references/operating-contract.md",
+    "sha256": "f80fafa9a8b01bd55f09a0d6ae3bd41bcefcf7bdd4d09ae545639eb14f9c7033"
+  },
+  "prompts/candidate_screening_zh.md": {
+    "source": "/opt/bybit-signal/prompts/candidate_screening_zh.md",
+    "sha256": "fe6f7fe867ff86e88f25025ed6a30220636d3315c5e632817be460849ff4c954"
+  }
+}

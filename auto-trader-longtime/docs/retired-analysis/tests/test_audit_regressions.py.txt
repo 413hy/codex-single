@@ -1,0 +1,408 @@
+"""Regression evidence for the file-by-file audit, without exchange mutations."""
+
+import asyncio
+from datetime import UTC, datetime
+from types import SimpleNamespace
+
+import httpx
+import pytest
+
+from longtime.config import Settings
+from longtime.model import Decision
+from longtime.monitor import Monitor
+from longtime.service import App, scheduled_cycles
+from longtime.transport import DemoTransport
+
+
+async def test_valid_model_skip_is_successful_cycle_without_error_alert(setup):
+    e, store, exchange, markets, _ = setup
+
+    async def scan(excluded):
+        return SimpleNamespace(candidates=[{}], failures={}, model_dump=lambda **kw: {})
+
+    async def evidence(*args):
+        return {"symbol": "TESTUSDT", "observed_at": datetime.now(UTC).isoformat()}
+
+    class Selector:
+        async def select(self, *args):
+            return [{"symbol": "TESTUSDT"}]
+
+    class Model:
+        async def decide(self, *args):
+            return Decision(symbol="TESTUSDT", decision="SKIP", reason="主结构实质冲突")
+
+    markets.scan, markets.evidence = scan, evidence
+    app = App(
+        e.settings,
+        store=store,
+        exchange=exchange,
+        markets=markets,
+        screening=Selector(),
+        model=Model(),
+    )
+    assert await app.cycle("skip-cycle")
+    assert store.rows("SELECT status FROM cycles")[0]["status"] == "SUCCESS"
+    assert (
+        store.rows("SELECT status FROM signals WHERE cycle_id='skip-cycle'")[0]["status"]
+        == "SKIP_MODEL"
+    )
+    assert not store.rows("SELECT * FROM incidents") and not exchange.submissions
+
+
+async def test_natural_cycle_waits_for_manual_and_uses_current_bucket(setup, monkeypatch):
+    e, store, exchange, markets, _ = setup
+    store.set("entries_paused", True)
+    app = App(e.settings, store=store, exchange=exchange, markets=markets)
+    bucket = ["100"]
+    monkeypatch.setattr("longtime.service.cycle_id", lambda *args, **kwargs: bucket[0])
+    await app.cycle_lock.acquire()
+    task = asyncio.create_task(app.cycle(wait_for_lock=True))
+    await asyncio.sleep(0)
+    assert not task.done()
+    bucket[0] = "101"
+    app.cycle_lock.release()
+    assert await task
+    assert store.rows("SELECT cycle_id FROM cycles") == [{"cycle_id": "101"}]
+
+
+async def test_scheduler_catches_new_bucket_after_long_cycle(monkeypatch, tmp_path):
+    bucket, calls, stop = ["1"], [], asyncio.Event()
+    monkeypatch.setattr("longtime.service.cycle_id", lambda *args, **kwargs: bucket[0])
+
+    from longtime.store import Store
+
+    class AppStub:
+        store = Store(tmp_path / "scheduler.db")
+        async def cycle(self, **kwargs):
+            calls.append(bucket[0])
+            if len(calls) == 1:
+                bucket[0] = "2"
+            else:
+                stop.set()
+
+    await scheduled_cycles(AppStub(), stop)
+    assert calls == ["1", "2"]
+
+
+async def test_entry_deadline_checked_after_slow_preparation(setup):
+    e, store, exchange, _, decision = setup
+    assert await e.enter("cycle", "sig", decision, deadline=1) == "SKIP_CYCLE_ENDED"
+    assert not exchange.submissions
+    assert not store.rows("SELECT * FROM trades")
+
+
+@pytest.mark.parametrize("method", ["POST", "PUT", "PATCH", "DELETE", "get"])
+async def test_readonly_blocks_all_non_get_methods(method):
+    ex = DemoTransport(Settings(_env_file=None))
+    try:
+        with pytest.raises(ValueError, match="TRADING_ENABLED"):
+            await ex._private(method, "/v5/order/create", {})
+    finally:
+        await ex.close()
+
+
+@pytest.mark.parametrize(
+    "body", [[], {"retCode": 0}, {"retCode": 500}, {"retMsg": "upstream error"}]
+)
+async def test_http_error_is_not_definitive_order_rejection(body):
+    from longtime.transport import BybitAPIError
+
+    client = httpx.AsyncClient(
+        base_url="https://api-demo.bybit.com",
+        transport=httpx.MockTransport(lambda req: httpx.Response(503, json=body)),
+    )
+    ex = DemoTransport(Settings(_env_file=None, trading_enabled=True), client)
+    try:
+        with pytest.raises(BybitAPIError) as error:
+            await ex._private("POST", "/v5/order/create", {})
+        assert not error.value.definitive_rejection
+    finally:
+        await ex.close()
+
+
+async def test_accepted_entry_with_http_error_stays_single_order(setup):
+    from longtime.transport import _validate_document
+
+    e, store, exchange, _, decision = setup
+    original = exchange.submit
+
+    async def submit(payload):
+        result = await original(payload)
+        if not payload["reduceOnly"]:
+            _validate_document({}, 503, method="POST", path="/v5/order/create")
+        return result
+
+    exchange.submit = submit
+    assert await e.enter("cycle", "sig", decision) == "OPEN"
+    assert len([o for o in exchange.submissions if not o["reduceOnly"]]) == 1
+
+
+async def test_closed_during_monitor_not_recorded_as_external(setup):
+    e, store, exchange, _, decision = setup
+    await e.enter("cycle", "sig", decision)
+    t = store.rows("SELECT * FROM trades")[0]
+    original = exchange.positions
+    fired = False
+
+    async def positions(symbol=None):
+        nonlocal fired
+        if symbol and not fired:
+            fired = True
+            exchange.close_at_tp(t)
+        return await original(symbol)
+
+    exchange.positions = positions
+    await Monitor(e).tick()
+    assert store.trade(t["trade_id"])["status"] == "CLOSED"
+    assert not store.rows("SELECT * FROM events WHERE kind='EXTERNAL_POSITION_OBSERVED'")
+    assert store.state("exchange_positions") == []
+
+
+async def test_delivery_success_does_not_hide_other_failed_messages(tmp_path):
+    from longtime.store import Store
+    from longtime.telegram import Telegram
+
+    store = Store(tmp_path / "db")
+    store.queue("failed", "old")
+    store.execute("UPDATE outbox SET status='FAILED',attempts=2 WHERE event_key='failed'")
+    store.incident("TELEGRAM_DELIVERY", "delivery", {}, "delivery failed")
+    store.queue("new", "new")
+    client = httpx.AsyncClient(
+        transport=httpx.MockTransport(
+            lambda req: httpx.Response(200, json={"ok": True, "result": {"message_id": 1}})
+        )
+    )
+    bot = Telegram(Settings(_env_file=None), store, client)
+    try:
+        await bot.deliver()
+        assert store.rows("SELECT status FROM incidents")[0]["status"] == "OPEN"
+        store.execute("UPDATE outbox SET status='PENDING',attempts=0 WHERE event_key='failed'")
+        await bot.deliver()
+        assert store.rows("SELECT status FROM incidents")[0]["status"] == "RESOLVED"
+    finally:
+        await bot.close()
+
+
+def test_changed_incident_error_is_retained_and_deduplicated(setup):
+    e, store, _, _, _ = setup
+    for error in ("first", "changed", "changed"):
+        e.alert("CANDIDATE:TESTUSDT", "candidate", {"symbol": "TESTUSDT"}, RuntimeError(error))
+    assert store.rows("SELECT error FROM incidents") == [{"error": "changed"}]
+    assert len(store.rows("SELECT * FROM events WHERE kind='ERROR'")) == 2
+    assert len(store.rows("SELECT * FROM outbox")) == 1
+
+
+async def test_database_callback_replay_does_not_clear_new_emergency(tmp_path):
+    from longtime import emergency
+    from longtime.store import Store
+    from longtime.telegram import Telegram
+
+    store = Store(tmp_path / "db")
+    settings = Settings(
+        _env_file=None, runtime_dir=tmp_path, telegram_user_id=1, telegram_chat_id=2
+    )
+    bot = Telegram(settings, store)
+
+    async def call(*args):
+        return {}
+
+    bot.call = call
+    update = {
+        "callback_query": {
+            "id": "db-callback",
+            "from": {"id": 1},
+            "message": {"chat": {"id": 2}},
+            "data": "retry:database",
+        }
+    }
+    try:
+        emergency.queue(tmp_path, "old", "error")
+        await bot.handle(update, None)
+        assert emergency.load(tmp_path) is None
+        emergency.queue(tmp_path, "new", "error")
+        await bot.handle(update, None)
+        assert emergency.load(tmp_path)["scope"] == "new"
+    finally:
+        await bot.close()
+
+
+async def test_partial_tp_with_real_remaining_position_is_observed_without_topup(setup):
+    e, store, exchange, _, decision = setup
+    await e.enter("cycle", "sig", decision)
+    t = store.rows("SELECT * FROM trades")[0]
+    position = dict(exchange.position_rows[0])
+    exchange.close_at_tp(t, partial=True)
+    from decimal import Decimal
+
+    position["size"] = str(Decimal(t["qty"]) / 2)
+    exchange.position_rows = [position]
+    tp = next(o for o in exchange.orders.values() if o["orderId"] == t["tp_order_id"])
+    tp["orderStatus"] = "PartiallyFilled"
+    tp["leavesQty"] = position["size"]
+    await Monitor(e).tick()
+    assert store.trade(t["trade_id"])["status"] == "OPEN"
+    assert len(exchange.submissions) == 3
+    assert not store.rows("SELECT * FROM incidents WHERE scope LIKE 'TP:%'")
+    tp["orderStatus"] = "Filled"
+    await Monitor(e).tick()
+    assert store.rows("SELECT * FROM incidents WHERE scope LIKE 'TP:%'")
+    assert len(exchange.submissions) == 3
+
+
+async def test_acceptance_script_only_finishes_its_own_cycle(setup, monkeypatch):
+    import importlib.util
+    from pathlib import Path
+
+    e, store, _, markets, _ = setup
+    spec = importlib.util.spec_from_file_location("accept_script", Path("scripts/accept_demo.py"))
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    store.claim_cycle("acceptance:historical")
+
+    async def nothing(*args):
+        return None
+
+    async def scan(*args):
+        return SimpleNamespace(candidates=[])
+
+    async def select(*args):
+        return []
+
+    markets.scan = scan
+    app = SimpleNamespace(
+        store=store,
+        monitor=SimpleNamespace(startup=nothing),
+        exchange=SimpleNamespace(active_positions=select),
+        markets=markets,
+        screening=SimpleNamespace(select=select),
+        close=nothing,
+        retry=nothing,
+        executor=e,
+    )
+    bot = SimpleNamespace(preflight=nothing, close=nothing, poll=nothing)
+    monkeypatch.setattr(module, "App", lambda settings: app)
+    monkeypatch.setattr(module, "Telegram", lambda *args: bot)
+    result = await module.accept(e.settings, 30)
+    assert result["status"] == "NO_QUALIFIED_ENTRY"
+    assert store.rows("SELECT status FROM cycles WHERE cycle_id='acceptance:historical'") == [
+        {"status": "RUNNING"}
+    ]
+    assert store.rows("SELECT status FROM cycles WHERE cycle_id!='acceptance:historical'") == [
+        {"status": "NO_QUALIFIED_ENTRY"}
+    ]
+
+
+@pytest.mark.parametrize("terminal", ["Cancelled", "Rejected"])
+async def test_manual_protection_late_rejection_submits_only_once(setup, terminal):
+    e, store, exchange, _, decision = setup
+    exchange.fail_kind = "SL"
+    await e.enter("cycle", "sig", decision)
+    t = store.rows("SELECT * FROM trades")[0]
+    before = len(exchange.submissions)
+    exchange.fail_kind = None
+    original_submit = exchange.submit
+
+    async def submit(payload):
+        oid = await original_submit(payload)
+        exchange.orders[payload["orderLinkId"]]["orderStatus"] = terminal
+        return oid
+
+    exchange.submit = submit
+    assert not await e.protect(t["trade_id"], manual_kind="SL")
+    assert len(exchange.submissions) == before + 1
+
+
+async def test_external_native_stop_can_lock_in_profit_without_adoption(setup):
+    e, store, exchange, _, _ = setup
+    exchange.position_rows = [
+        {
+            "symbol": "TESTUSDT",
+            "positionIdx": 0,
+            "side": "Buy",
+            "size": "1",
+            "avgPrice": "100",
+            "markPrice": "120",
+            "takeProfit": "130",
+            "stopLoss": "110",
+        }
+    ]
+    assert await Monitor(e).check_external("TESTUSDT")
+    assert not exchange.submissions and not store.rows("SELECT * FROM trades")
+
+
+async def test_external_uncovered_or_wrong_trigger_order_is_not_confirmed(setup):
+    e, store, exchange, _, _ = setup
+    exchange.position_rows = [
+        {
+            "symbol": "TESTUSDT",
+            "positionIdx": 0,
+            "side": "Buy",
+            "size": "1",
+            "avgPrice": "100",
+            "takeProfit": "0",
+            "stopLoss": "0",
+        }
+    ]
+    exchange.orders = {
+        "tp": {
+            "symbol": "TESTUSDT",
+            "positionIdx": 0,
+            "side": "Sell",
+            "qty": "0.1",
+            "orderStatus": "New",
+            "reduceOnly": True,
+            "orderType": "Limit",
+            "price": "110",
+        },
+        "sl": {
+            "symbol": "TESTUSDT",
+            "positionIdx": 0,
+            "side": "Sell",
+            "qty": "1",
+            "orderStatus": "Untriggered",
+            "reduceOnly": True,
+            "orderType": "Market",
+            "triggerPrice": "110",
+            "triggerDirection": 1,
+            "closeOnTrigger": True,
+        },
+    }
+    assert not await Monitor(e).check_external("TESTUSDT")
+    assert not exchange.submissions
+
+
+def test_unused_stream_component_rejects_naive_time_at_its_boundary():
+    from longtime.vendor.signal.providers.public_streams import PublicLiquidation, PublicStreamCache
+
+    naive = datetime(2026, 9, 9)
+    with pytest.raises(ValueError, match="timezone-aware"):
+        PublicLiquidation(
+            symbol="TESTUSDT", timestamp=naive, liquidated_position="LONG", price=1, size=1
+        )
+    cache = PublicStreamCache()
+    for method in (cache.mark_subscribed, cache.heartbeat):
+        with pytest.raises(ValueError, match="timezone-aware"):
+            method("TESTUSDT", at=naive)
+    with pytest.raises(ValueError, match="timezone-aware"):
+        cache.liquidation_window("TESTUSDT", now=naive)
+
+
+async def test_short_week_history_skips_without_direction_or_alert(setup):
+    e, store, exchange, markets, _ = setup
+
+    async def evidence(*args):
+        raise ValueError("SKIP_INSUFFICIENT_WEEK_HISTORY: 15m")
+
+    class Model:
+        async def decide(self, *args):
+            raise AssertionError("Direction must not see insufficient weekly history")
+
+    markets.evidence = evidence
+    app = App(e.settings, store=store, exchange=exchange, markets=markets, model=Model())
+    assert await app.candidate("week-test", {"symbol": "TESTUSDT"})
+    assert (
+        store.rows("SELECT status FROM signals WHERE cycle_id='week-test'")[0]["status"]
+        == "SKIP_INSUFFICIENT_WEEK_HISTORY"
+    )
+    assert not store.rows("SELECT * FROM incidents")
+    assert not exchange.submissions

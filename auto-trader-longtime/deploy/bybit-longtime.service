@@ -1,0 +1,24 @@
+[Unit]
+Description=Independent Bybit Mainnet Demo long-running trader
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+WorkingDirectory=/root/auto-trader-longtime
+ExecStart=/root/auto-trader-longtime/.venv/bin/bybit-longtime serve
+Restart=on-failure
+RestartSec=30
+TimeoutStopSec=30
+KillMode=control-group
+UMask=0077
+Environment=PYTHONUNBUFFERED=1
+Environment=PATH=/root/.local/bin:/usr/local/bin:/usr/bin:/bin
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ReadWritePaths=/root/auto-trader-longtime/runtime
+
+[Install]
+WantedBy=multi-user.target

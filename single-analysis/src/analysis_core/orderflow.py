@@ -1,0 +1,156 @@
+"""Bounded REST microstructure evidence; samples never imply stream continuity."""
+
+import asyncio
+from datetime import UTC, datetime
+from decimal import Decimal as D
+from statistics import median
+from typing import Any
+
+from analysis_core.vendor.public import BybitPublicTrade
+
+
+async def collect_orderflow(client, symbol):
+    books = []
+    for index in range(3):
+        if index:
+            await asyncio.sleep(1)
+        books.append(await client.orderbook(symbol, limit=50))
+    trades = await client.recent_trades(symbol, limit=1000)
+    return orderflow_evidence(symbol, books, trades, datetime.now(UTC))
+
+
+def orderflow_evidence(symbol, books, trades, now):
+    if len(books) != 3:
+        raise ValueError("Orderflow requires three book samples")
+    for book in books:
+        if book.symbol != symbol or not -5 <= (now - book.observed_at).total_seconds() <= 30:
+            raise ValueError("Invalid or stale orderflow book identity/time")
+        for levels, reverse in ((book.bids, True), (book.asks, False)):
+            prices = [level.price for level in levels]
+            if (
+                not prices
+                or len(set(prices)) != len(prices)
+                or prices != sorted(prices, reverse=reverse)
+                or any(
+                    not v.is_finite() or v <= 0
+                    for level in levels
+                    for v in (level.price, level.size)
+                )
+            ):
+                raise ValueError("Invalid orderflow ladder")
+        if book.bids[0].price >= book.asks[0].price:
+            raise ValueError("Crossed orderflow book")
+    # Equal sequence is a repeated market state, not a new independent update.
+    if any(
+        b.observed_at <= a.observed_at or b.sequence < a.sequence
+        for a, b in zip(books, books[1:], strict=False)
+    ):
+        raise ValueError("Non-increasing book time or regressing sequence")
+    unique: dict[str, BybitPublicTrade] = {}
+    for trade in trades:
+        if (
+            trade.symbol != symbol
+            or trade.side not in {"Buy", "Sell"}
+            or not trade.trade_id
+            or not -5 <= (now - trade.timestamp).total_seconds()
+            or any(not v.is_finite() or v <= 0 for v in (trade.price, trade.size))
+        ):
+            raise ValueError("Invalid orderflow trade identity/value/time")
+        previous = unique.get(trade.trade_id)
+        if previous is not None and previous != trade:
+            raise ValueError("Conflicting orderflow execution ID")
+        unique[trade.trade_id] = trade
+    # Only a bounded recent sample; old rows are explicitly excluded, not re-dated.
+    recent = sorted(
+        (t for t in unique.values() if 0 <= (now - t.timestamp).total_seconds() <= 300),
+        key=lambda t: (t.timestamp, t.trade_id),
+    )
+    latest = books[-1]
+    walls = []
+    for side in ("bids", "asks"):
+        levels = getattr(latest, side)
+        for i, level in enumerate(levels):
+            neighbours = [x.size for j, x in enumerate(levels) if j != i and abs(i - j) <= 3]
+            if len(neighbours) < 2:
+                continue
+            baseline = median(neighbours)
+            ratio = level.size / baseline
+            if ratio < 3:
+                continue
+            sizes = [
+                next((x.size for x in getattr(b, side) if x.price == level.price), D(0))
+                for b in books
+            ]
+            walls.append(
+                {
+                    "side": side,
+                    "price": level.price,
+                    "size": level.size,
+                    "neighbour_median_size": baseline,
+                    "size_ratio": ratio,
+                    "sample_sizes": sizes,
+                    "visible_in_all_samples": all(size > 0 for size in sizes),
+                }
+            )
+    by_price: dict[D, dict[str, Any]] = {}
+    for trade in recent:
+        row = by_price.setdefault(trade.price, {"buy_size": D(0), "sell_size": D(0), "count": 0})
+        row["buy_size" if trade.side == "Buy" else "sell_size"] += trade.size
+        row["count"] += 1
+    price_rows = [
+        {"price": price, **row, "delta_size": row["buy_size"] - row["sell_size"]}
+        for price, row in sorted(by_price.items())
+    ]
+    windows = []
+    for seconds in (30, 60, 300):
+        rows = [t for t in recent if (now - t.timestamp).total_seconds() <= seconds]
+        buy = sum((t.size for t in rows if t.side == "Buy"), D(0))
+        sell = sum((t.size for t in rows if t.side == "Sell"), D(0))
+        windows.append(
+            {
+                "requested_seconds": seconds,
+                "coverage_complete": False,
+                "count": len(rows),
+                "first_trade_at": rows[0].timestamp.isoformat() if rows else None,
+                "last_trade_at": rows[-1].timestamp.isoformat() if rows else None,
+                "buy_size": buy,
+                "sell_size": sell,
+                "delta_size": buy - sell,
+                "first_price": rows[0].price if rows else None,
+                "last_price": rows[-1].price if rows else None,
+                "high": max((t.price for t in rows), default=None),
+                "low": min((t.price for t in rows), default=None),
+            }
+        )
+    midpoint = (latest.bids[0].price + latest.asks[0].price) / 2
+    return {
+        "contract": "rest-orderflow-sample-v1",
+        "observed_at": now.isoformat(),
+        "symbol": symbol,
+        "coverage_complete": False,
+        "book_sample_span_seconds": D(
+            str((latest.observed_at - books[0].observed_at).total_seconds())
+        ),
+        "book_snapshots": [b.model_dump(mode="json") for b in books],
+        "distinct_book_sequences": len({b.sequence for b in books}),
+        "spread_bps": (latest.asks[0].price - latest.bids[0].price) / midpoint * 10000,
+        "large_displayed_levels": sorted(walls, key=lambda x: x["size_ratio"], reverse=True)[:10],
+        "trade_received_count": len(trades),
+        "trade_unique_count": len(unique),
+        "trade_excluded_outside_300s": len(unique) - len(recent),
+        "sample_windows": windows,
+        "sample_volume_at_price": price_rows,
+        "trade_columns": ["trade_id", "timestamp", "side", "price", "size"],
+        "trade_sample": [
+            [t.trade_id, t.timestamp.isoformat(), t.side, t.price, t.size] for t in recent
+        ],
+        "limitations": [
+            "三次REST快照不证明期间连续存在；价位聚合量不是单一订单或交易者身份。",
+            "数量减少可能是成交或撤单；增加可能是新挂单；不能确认撤单、补单、冰山或吸收。",
+            "大挂单定义为同侧附近最多六个已显示价位数量中位数的至少3倍，仅描述相对规模。",
+            "逐笔最多1000条、仅保留近300秒，30/60/300秒嵌套窗口不是完整覆盖也不是独立投票。",
+            "逐价样本不是完整Footprint或日成交分布；缺失价位不表示零成交，未计算斜向堆叠失衡。",
+            "Buy/Sell为主动成交方，每笔成交仍同时有买卖双方；Delta不代表持仓净流入。",
+            "盘口不含RPI挂单；逐笔成交与快照非原子同步，不逐笔推断消耗某一挂单。",
+        ],
+    }

@@ -1,0 +1,22 @@
+[Unit]
+Description=Shared autonomous signal analysis
+After=network-online.target bybit-longtime-02.service
+Wants=network-online.target
+StartLimitIntervalSec=0
+[Service]
+Type=simple
+WorkingDirectory=/root/single-analysis
+ExecStart=/root/single-analysis/.venv/bin/single-analysis serve
+Restart=on-failure
+RestartSec=30
+TimeoutStopSec=30
+KillMode=control-group
+UMask=0077
+Environment=PYTHONUNBUFFERED=1
+Environment=PATH=/root/.local/bin:/usr/local/bin:/usr/bin:/bin
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ReadWritePaths=/root/single-analysis/runtime /root/.codex
+[Install]
+WantedBy=multi-user.target

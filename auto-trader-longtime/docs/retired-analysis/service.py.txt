@@ -1,0 +1,405 @@
+from __future__ import annotations
+
+import asyncio
+import fcntl
+import json
+import logging
+import logging.handlers
+import signal
+import time
+from datetime import datetime
+
+from longtime.exchange import Exchange
+from longtime.execution import Executor
+from longtime.market import Markets
+from longtime.model import DirectionModel, ModelServiceError
+from longtime.monitor import Monitor
+from longtime.screening import Screening
+from longtime.store import Store, encode, identity
+from longtime.telegram import Telegram
+from longtime.trading_settings import EntryDefaults
+
+log = logging.getLogger(__name__)
+
+
+def cycle_id(now=None, seconds=1200):
+    bucket = int(time.time() if now is None else now) // seconds
+    return str(bucket) if seconds == 1200 else f"interval:{seconds}:{bucket}"
+
+
+class App:
+    def __init__(
+        self, settings, *, store=None, exchange=None, markets=None, model=None, screening=None
+    ):
+        self.settings = settings
+        self.store = store or Store(settings.runtime_dir / "trader.db")
+        self.exchange = exchange or Exchange(settings)
+        self.markets = markets or Markets()
+        self.model = model or DirectionModel(settings, self.store)
+        self.screening = screening or Screening(settings, self.store)
+        self.executor = Executor(settings, self.store, self.exchange, self.markets)
+        self.monitor = Monitor(self.executor)
+        self.cycle_lock = asyncio.Lock()
+        self.model_slots = asyncio.Semaphore(1)
+        self.model_unavailable = asyncio.Event()
+        self.funds_exhausted = asyncio.Event()
+
+    async def candidate(self, cid, candidate, *, deadline=None):
+        symbol = candidate["symbol"]
+        sid = identity(cid, symbol)
+        if not self.store.signal(sid, cid, symbol, candidate):
+            return True
+        async with self.model_slots:
+            try:
+                if self.model_unavailable.is_set():
+                    self.store.signal_result(sid, "SKIP_MODEL_SERVICE_UNAVAILABLE")
+                    return False
+                if deadline and time.time() >= deadline:
+                    self.store.signal_result(sid, "SKIP_CYCLE_ENDED")
+                    return True
+                if self.funds_exhausted.is_set() or self.store.state("entries_paused", False):
+                    self.store.signal_result(sid, "SKIP_FUNDS_OR_PAUSED")
+                    return True
+                held = {
+                    p["symbol"] for p in await self.exchange.active_positions()
+                } | self.store.reserved()
+                if symbol in held:
+                    self.store.signal_result(sid, "SKIP_EXISTING_POSITION")
+                    return True
+                evidence = await self.markets.evidence(symbol, candidate)
+                self.store.execute(
+                    "UPDATE signals SET evidence=? WHERE signal_id=?", (encode(evidence), sid)
+                )
+                decision = await self.model.decide(sid, evidence)
+                self.store.signal_result(sid, "ANALYZED", decision.decision, decision.model_dump())
+                age = time.time() - datetime.fromisoformat(evidence["observed_at"]).timestamp()
+                if deadline and time.time() >= deadline:
+                    self.store.signal_result(sid, "SKIP_CYCLE_ENDED")
+                    return True
+                if age < -5 or age > self.settings.model_timeout + 30:
+                    raise ValueError("本次行情时间异常或结果已过期；下轮重新读取行情")
+                if decision.decision == "SKIP":
+                    self.store.signal_result(sid, "SKIP_MODEL")
+                    self.store.resolve("CANDIDATE:" + symbol)
+                    return True
+                if self.funds_exhausted.is_set():
+                    self.store.signal_result(sid, "STOP_INSUFFICIENT_MARGIN")
+                    return True
+                result = await self.executor.enter(cid, sid, decision, deadline=deadline)
+                if result == "STOP_INSUFFICIENT_MARGIN":
+                    self.funds_exhausted.set()
+                self.store.resolve("CANDIDATE:" + symbol)
+                return True
+            except ModelServiceError as error:
+                self.model_unavailable.set()
+                self.store.signal_result(sid, "ERROR_MODEL_SERVICE")
+                self.executor.alert("MODEL_SERVICE", "cycle", {}, error)
+                return False
+            except ValueError as error:
+                if str(error) == "SKIP_EXISTING_POSITION":
+                    self.store.signal_result(sid, "SKIP_EXISTING_POSITION")
+                    return True
+                if str(error).startswith("SKIP_INSUFFICIENT_WEEK_HISTORY"):
+                    self.store.signal_result(
+                        sid, "SKIP_INSUFFICIENT_WEEK_HISTORY", analysis={"reason": str(error)}
+                    )
+                    return True
+                if str(error).startswith("SKIP_SIZE_LIMIT"):
+                    self.store.signal_result(
+                        sid, "SKIP_SIZE_LIMIT", analysis={"reason": str(error)}
+                    )
+                    return True
+                self.store.signal_result(sid, "ERROR")
+                self.executor.alert("CANDIDATE:" + symbol, "candidate", {"symbol": symbol}, error)
+                return False
+            except Exception as error:
+                self.store.signal_result(sid, "ERROR")
+                self.executor.alert("CANDIDATE:" + symbol, "candidate", {"symbol": symbol}, error)
+                return False
+
+    async def cycle(self, cid=None, only_symbol=None, *, wait_for_lock=False):
+        if self.cycle_lock.locked() and not wait_for_lock:
+            return False
+        async with self.cycle_lock:
+            defaults = EntryDefaults.load(self.store)
+            now = time.time()
+            if cid is None or wait_for_lock:
+                if now < defaults.next_cycle(defaults.cycle_changed_at):
+                    return True
+                cid = cycle_id(now, defaults.cycle_seconds)
+            if cid.isdigit():
+                deadline = (int(cid) + 1) * 1200
+            elif cid.startswith("interval:"):
+                _, seconds, bucket = cid.split(":")
+                deadline = (int(bucket) + 1) * int(seconds)
+            else:
+                deadline = now + defaults.cycle_seconds
+            if not self.store.claim_cycle(cid):
+                return True
+            try:
+                if self.store.state("entries_paused", False):
+                    self.store.execute(
+                        "UPDATE cycles SET status='PAUSED',completed_at=? WHERE cycle_id=?",
+                        (time.time(), cid),
+                    )
+                    return True
+                self.funds_exhausted.clear()
+                self.model_unavailable.clear()
+                await self.exchange.sync_clock()
+                account = await self.exchange.account()
+                positions = await self.exchange.active_positions()
+                excluded = {p["symbol"] for p in positions} | self.store.reserved()
+                for symbol in sorted(excluded):
+                    sid = identity(cid, symbol)
+                    self.store.signal(sid, cid, symbol, {"source": "exchange_or_unresolved_intent"})
+                    self.store.signal_result(sid, "SKIP_EXISTING_POSITION")
+                scan = await self.markets.scan(excluded)
+                self.store.event(
+                    "SCAN",
+                    {
+                        "cycle_id": cid,
+                        "account": account,
+                        "excluded": sorted(excluded),
+                        "scan": scan.model_dump(mode="json"),
+                    },
+                )
+                if scan.failures:
+                    self.executor.alert(
+                        "SCAN_DATA",
+                        "cycle",
+                        {},
+                        RuntimeError("选币行情采集存在失败，受影响币本轮跳过；详见SCAN记录"),
+                    )
+                else:
+                    self.store.resolve("SCAN_DATA")
+                candidates = await self.screening.select(cid, scan.candidates)
+                if len(candidates) > 3 or len({c["symbol"] for c in candidates}) != len(candidates):
+                    raise ValueError("Screening must return at most three distinct symbols")
+                if only_symbol:
+                    candidates = [c for c in candidates if c["symbol"] == only_symbol]
+                results = await asyncio.gather(
+                    *(self.candidate(cid, c, deadline=deadline) for c in candidates)
+                )
+                ok = all(results)
+                self.store.execute(
+                    "UPDATE cycles SET status=?,completed_at=?,details=? WHERE cycle_id=?",
+                    (
+                        "SUCCESS" if ok else "PARTIAL_ERROR",
+                        time.time(),
+                        encode({"candidates": len(candidates), "excluded": sorted(excluded)}),
+                        cid,
+                    ),
+                )
+                self.store.set("cycle_heartbeat", time.time())
+                self.store.resolve("CYCLE")
+                # Validated screening is a successful model call even when it selects
+                # zero coins. A failed direction/contract must not prove recovery.
+                if ok and not self.model_unavailable.is_set():
+                    self.store.resolve("MODEL_SERVICE")
+                log.info(
+                    "cycle=%s completed candidates=%s status=%s",
+                    cid,
+                    len(candidates),
+                    "SUCCESS" if ok else "PARTIAL_ERROR",
+                )
+                return ok
+            except asyncio.CancelledError:
+                self.store.execute(
+                    "UPDATE cycles SET status='INTERRUPTED',completed_at=? WHERE cycle_id=?",
+                    (time.time(), cid),
+                )
+                raise
+            except Exception as error:
+                self.store.execute(
+                    "UPDATE cycles SET status='ERROR',completed_at=? WHERE cycle_id=?",
+                    (time.time(), cid),
+                )
+                self.executor.alert(
+                    "MODEL_SERVICE" if isinstance(error, ModelServiceError) else "CYCLE",
+                    "cycle",
+                    {},
+                    error,
+                )
+                return False
+
+    async def retry(self, incident, callback_id):
+        payload, kind = json.loads(incident["payload"]), incident["kind"]
+        self.store.event(
+            "MANUAL_RETRY",
+            {"incident_id": incident["incident_id"], "callback_id": callback_id, "kind": kind},
+        )
+        if kind == "protection":
+            async with self.executor.lock:
+                return await self.executor.protect(payload["trade_id"], manual_kind=payload["kind"])
+        if kind == "reconcile":
+            async with self.executor.lock:
+                return await self.executor.reconcile_entry(payload["trade_id"])
+        if kind in ("candidate", "cycle"):
+            # An unresolved entry is reconciled; clicking a signal alert never resubmits it.
+            if payload.get("symbol"):
+                rows = self.store.rows(
+                    "SELECT trade_id FROM trades WHERE symbol=? AND status='INTENT'",
+                    (payload["symbol"],),
+                )
+                if rows:
+                    async with self.executor.lock:
+                        return await self.executor.reconcile_entry(rows[0]["trade_id"])
+            return await self.cycle("manual:" + identity(callback_id), payload.get("symbol"))
+        if kind == "delivery":
+            self.store.execute(
+                "UPDATE outbox SET status='PENDING',attempts=0,next_attempt=0 WHERE status='FAILED'"
+            )
+            return True
+        if incident["scope"].startswith("EXTERNAL:"):
+            ok = await self.monitor.check_external(payload["symbol"])
+            if ok:
+                self.store.resolve(incident["scope"])
+            return ok
+        if incident["scope"] == "STARTUP":
+            await self.exchange.sync_clock()
+            await self.exchange.account()
+        await self.monitor.tick()
+        if incident["scope"] in {"STARTUP", "TELEGRAM_POLL", "DATABASE_OUTBOX", "MONITOR"}:
+            self.store.resolve(incident["scope"])
+        return not bool(
+            self.store.rows(
+                "SELECT incident_id FROM incidents WHERE incident_id=? AND status IN ('OPEN','RUNNING')",
+                (incident["incident_id"],),
+            )
+        )
+
+    async def close(self):
+        await self.markets.close()
+        await self.exchange.close()
+
+
+async def scheduled_cycles(app, stop):
+    """Retry a boundary deferred by another cycle without replaying expired buckets."""
+    while not stop.is_set():
+        defaults = EntryDefaults.load(app.store)
+        before = cycle_id(seconds=defaults.cycle_seconds)
+        await app.cycle(wait_for_lock=True)
+        if stop.is_set():
+            break
+        if cycle_id(seconds=defaults.cycle_seconds) != before:
+            continue
+        # Re-read saved settings while idle so edits take effect without a restart.
+        while not stop.is_set():
+            current = EntryDefaults.load(app.store)
+            if (current.cycle_minutes, current.cycle_changed_at) != (
+                defaults.cycle_minutes, defaults.cycle_changed_at
+            ) or cycle_id(seconds=current.cycle_seconds) != before:
+                break
+            try:
+                await asyncio.wait_for(stop.wait(), 1)
+            except TimeoutError:
+                pass
+
+
+async def periodic(stop, seconds, action, on_error):
+    while not stop.is_set():
+        start = time.monotonic()
+        try:
+            await action()
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            on_error(error)
+        try:
+            await asyncio.wait_for(stop.wait(), max(0.1, seconds - (time.monotonic() - start)))
+        except TimeoutError:
+            pass
+
+
+async def serve(settings):
+    settings.require_credentials()
+    settings.require_telegram()
+    settings.runtime_dir.mkdir(parents=True, exist_ok=True)
+    app = App(settings)
+    bot = Telegram(settings, app.store)
+    stop = asyncio.Event()
+    loop = asyncio.get_running_loop()
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        loop.add_signal_handler(sig, stop.set)
+    tasks = []
+    try:
+        await bot.preflight()
+        try:
+            await app.monitor.startup()
+        except Exception as error:
+            app.executor.alert("STARTUP", "monitor", {}, error)
+            await bot.deliver()
+            raise
+
+        tasks = [
+            asyncio.create_task(scheduled_cycles(app, stop), name="scheduler"),
+            asyncio.create_task(
+                periodic(
+                    stop,
+                    30,
+                    app.monitor.tick,
+                    lambda e: app.executor.alert("MONITOR", "monitor", {}, e),
+                ),
+                name="monitor",
+            ),
+            asyncio.create_task(
+                periodic(
+                    stop,
+                    1,
+                    bot.deliver,
+                    lambda e: app.executor.alert("DATABASE_OUTBOX", "monitor", {}, e),
+                ),
+                name="outbox",
+            ),
+            asyncio.create_task(
+                periodic(
+                    stop,
+                    1,
+                    lambda: bot.poll(app.retry),
+                    lambda e: app.executor.alert("TELEGRAM_POLL", "monitor", {}, e),
+                ),
+                name="telegram",
+            ),
+            asyncio.create_task(stop.wait(), name="stop"),
+        ]
+        log.info("Bybit Demo service ready; trading_enabled=%s", settings.trading_enabled)
+        done, _ = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+        for task in done:
+            if task.get_name() != "stop":
+                task_error = task.exception() or RuntimeError("Background task exited unexpectedly")
+                app.executor.alert("SCHEDULER", "cycle", {}, task_error)
+                await bot.deliver()
+                raise RuntimeError("Service background task failed") from task_error
+    finally:
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        await bot.close()
+        await app.close()
+
+
+def logging_setup(runtime_dir):
+    runtime_dir.mkdir(parents=True, exist_ok=True)
+    handler = logging.handlers.RotatingFileHandler(
+        runtime_dir / "service.log", maxBytes=10_000_000, backupCount=10
+    )
+    logging.basicConfig(
+        level=logging.INFO,
+        handlers=[handler, logging.StreamHandler()],
+        format="%(asctime)s %(levelname)s %(name)s %(message)s",
+    )
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
+
+
+class ProcessLock:
+    def __init__(self, path):
+        self.file = path.open("a")
+        try:
+            fcntl.flock(self.file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            self.file.close()
+            raise RuntimeError("Another trader process already owns this runtime") from None
+
+    def close(self):
+        self.file.close()
