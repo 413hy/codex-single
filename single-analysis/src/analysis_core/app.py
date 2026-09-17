@@ -232,17 +232,26 @@ async def run(settings, mode):
 
         async def notifications():
             while not stop.is_set():
+                delay = 0.5
                 try:
                     await bot.deliver()
+                except Exception as error:
+                    delay = bot.communication_failure("TELEGRAM_DELIVERY", error)
+                await asyncio.sleep(delay)
+
+        async def commands():
+            while not stop.is_set():
+                delay = 0.5
+                try:
                     await bot.poll()
                 except Exception as error:
-                    app.incident("ANALYSIS_BOT", error)
-                    await asyncio.sleep(5)
-                await asyncio.sleep(0.5)
+                    delay = bot.communication_failure("TELEGRAM_POLL", error)
+                await asyncio.sleep(delay)
 
         tasks = [
             asyncio.create_task(scheduler()),
             asyncio.create_task(notifications()),
+            asyncio.create_task(commands()),
             asyncio.create_task(stop.wait()),
         ]
         done, _ = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)

@@ -9,12 +9,16 @@ from analysis_core.store import Store
 
 
 @pytest.fixture
-def bot(tmp_path):
-    return AnalysisBot(
+async def bot(tmp_path):
+    instance = AnalysisBot(
         Settings(_env_file=None, telegram_token="test", telegram_chat_id=1, telegram_user_id=2),
         Store(tmp_path / "db"),
         client=AsyncMock(),
     )
+    try:
+        yield instance
+    finally:
+        await instance.close()
 
 
 def update(i, text, user=2):
@@ -363,3 +367,70 @@ def test_status_shows_latest_round_and_shanghai_schedule(bot, monkeypatch):
     bot.handle(update(2, "/status"))
     text = bot.store.rows("SELECT text FROM outbox")[-1]["text"]
     assert "下次运行: 已暂停，恢复后重新安排" in text
+
+
+async def test_paused_poll_recovers_old_incident_without_starting_analysis(bot):
+    bot.store.set('analysis_paused', True)
+    bot.store.incident('ANALYSIS_BOT', 'analysis', {}, 'getUpdates HTTP 409')
+    bot.store.incident('MODEL_SERVICE', 'analysis', {}, 'historical capacity')
+    bot.call = AsyncMock(return_value=[])
+    await bot.poll()
+    assert bot.store.state('analysis_paused') is True
+    assert not bot.store.rows('SELECT * FROM cycles')
+    incidents = {r['scope']: r['status'] for r in bot.store.rows('SELECT * FROM incidents')}
+    assert incidents == {'ANALYSIS_BOT': 'RESOLVED', 'MODEL_SERVICE': 'OPEN'}
+    assert bot.store.rows("SELECT status FROM outbox ORDER BY rowid")[0]['status'] == 'CANCELLED'
+    assert bot.call.call_args.args[1]['timeout'] == 25
+
+
+def test_transient_poll_failure_is_recorded_without_alert_and_sustained_alert_recovers(bot, monkeypatch):
+    monkeypatch.setattr('analysis_core.bot.time.time', lambda: 1000)
+    assert bot.communication_failure('TELEGRAM_POLL', RuntimeError('ReadTimeout')) == 5
+    assert not bot.store.rows('SELECT * FROM incidents')
+    assert len(bot.store.rows('SELECT * FROM events')) == 1
+    monkeypatch.setattr('analysis_core.bot.time.time', lambda: 1060)
+    bot.communication_failure('TELEGRAM_POLL', RuntimeError('ReadTimeout'))
+    monkeypatch.setattr('analysis_core.bot.time.time', lambda: 1120)
+    bot.communication_failure('TELEGRAM_POLL', RuntimeError('ReadTimeout'))
+    alert = bot.store.rows('SELECT * FROM outbox')[0]
+    assert '通信异常' in alert['text']
+    assert '本轮受影响' not in alert['text']
+    bot.communication_ok('TELEGRAM_POLL')
+    assert bot.store.rows('SELECT status FROM incidents')[0]['status'] == 'RESOLVED'
+    assert bot.store.rows('SELECT status FROM outbox')[0]['status'] == 'CANCELLED'
+
+
+async def test_conflict_classified_without_echoing_sensitive_response(bot):
+    import httpx
+
+    from analysis_core.bot import BotAPIError
+
+    bot.client.post.return_value = httpx.Response(409, json={
+        'ok': False,
+        'description': 'Conflict: terminated by other getUpdates request SECRET',
+    })
+    with pytest.raises(BotAPIError) as caught:
+        await bot.poll()
+    assert caught.value.conflict
+    assert 'SECRET' not in str(caught.value)
+    assert '其他getUpdates' in str(caught.value)
+    bot.communication_failure('TELEGRAM_POLL', caught.value)
+    assert bot.store.rows('SELECT status FROM incidents')[0]['status'] == 'OPEN'
+
+
+def test_error_menu_labels_historical_time_and_pause(bot):
+    bot.store.set('analysis_paused', True)
+    bot.store.incident('MODEL_SERVICE', 'analysis', {}, 'capacity')
+    bot.handle(update(900, '/errors'))
+    text = bot.store.rows("SELECT text FROM outbox WHERE event_key='command:900'")[0]['text']
+    assert '分析已暂停' in text
+    assert '不代表正在分析' in text
+    assert ' · MODEL_SERVICE' in text
+
+
+def test_delivery_success_does_not_clear_poll_failure(bot):
+    from analysis_core.bot import BotAPIError
+
+    bot.communication_failure('TELEGRAM_POLL', BotAPIError('409', conflict=True))
+    bot.communication_ok('TELEGRAM_DELIVERY')
+    assert bot.store.rows('SELECT status FROM incidents')[0]['status'] == 'OPEN'

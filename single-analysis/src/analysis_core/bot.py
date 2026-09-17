@@ -1,5 +1,6 @@
 """Analysis-only owner bot with durable command processing and outbox."""
 
+import asyncio
 import json
 import time
 from datetime import datetime
@@ -8,16 +9,47 @@ from zoneinfo import ZoneInfo
 import httpx
 
 from analysis_core.notifications import cycle_keyboard, cycle_notice, signal_detail
+from analysis_core.polling import STATE_KEY, PollingGuard
 from analysis_core.scheduling import next_slot
 from analysis_core.store import encode, identity
+
+
+class BotAPIError(RuntimeError):
+    def __init__(self, message, *, conflict=False):
+        super().__init__(message)
+        self.conflict = conflict
 
 
 class AnalysisBot:
     def __init__(self, settings, store, client=None):
         self.settings, self.store = settings, store
-        self.client = client or httpx.AsyncClient(timeout=20)
+        self.client = client or httpx.AsyncClient(timeout=httpx.Timeout(35, connect=10))
+        self.poll_client = client or self.new_poll_client()
+        self.owns_poll_client = client is None
+        self.polling = PollingGuard(store, settings.telegram_token.get_secret_value())
+        self.poll_lock = asyncio.Lock()
+
+    @staticmethod
+    def new_poll_client():
+        # Separate transport: reconnecting a failed long poll cannot disrupt delivery.
+        return httpx.AsyncClient(timeout=httpx.Timeout(60, connect=10))
 
     async def call(self, method, payload=None):
+        if method != "getUpdates":
+            return await self._call(method, payload)
+        try:
+            async with self.polling.request():
+                try:
+                    return await self._call(method, payload)
+                except (Exception, asyncio.CancelledError):
+                    if self.owns_poll_client:
+                        await self.poll_client.aclose()
+                        self.poll_client = self.new_poll_client()
+                    raise
+        except TimeoutError:
+            raise BotAPIError("分析Bot getUpdates 总请求超时：TimeoutError") from None
+
+    async def _call(self, method, payload=None):
         payload = dict(payload or {})
         markup = payload.get("reply_markup")
         if isinstance(markup, dict) and "remove_keyboard" in markup:
@@ -30,7 +62,8 @@ class AnalysisBot:
             # Normalize direct and persisted navigation; leave inline controls local.
             payload["reply_markup"] = self.keyboard()
         try:
-            response = await self.client.post(
+            client = self.poll_client if method == "getUpdates" else self.client
+            response = await client.post(
                 "https://api.telegram.org/bot"
                 + self.settings.telegram_token.get_secret_value()
                 + "/"
@@ -39,10 +72,22 @@ class AnalysisBot:
             )
             doc = response.json()
             if response.status_code >= 400 or not doc.get("ok"):
-                raise RuntimeError(f"分析Bot {method} 请求失败，HTTP {response.status_code}")
+                description = str(doc.get("description", "")).lower()
+                reason = ""
+                conflict = response.status_code == 409
+                if conflict:
+                    reason = (
+                        "；webhook与轮询冲突" if "webhook" in description
+                        else "；存在其他getUpdates请求" if "getupdates" in description
+                        else "；Telegram轮询冲突，具体来源未确认"
+                    )
+                raise BotAPIError(
+                    f"分析Bot {method} 请求失败，HTTP {response.status_code}{reason}",
+                    conflict=conflict,
+                )
             return doc["result"]
         except (httpx.HTTPError, ValueError) as error:
-            raise RuntimeError(f"分析Bot {method} 连接失败：{type(error).__name__}") from None
+            raise BotAPIError(f"分析Bot {method} 连接失败：{type(error).__name__}") from None
 
     async def preflight(self):
         if not (
@@ -51,6 +96,7 @@ class AnalysisBot:
             and self.settings.telegram_user_id
         ):
             raise ValueError("请在single-analysis/.env填写独立分析Bot凭据")
+        self.polling.startup()
         me = await self.call("getMe")
         hook = await self.call("getWebhookInfo")
         if hook.get("url"):
@@ -162,9 +208,14 @@ class AnalysisBot:
                 reply, markup = signal_detail(self.store, text.removeprefix("detail:"))
             elif text == "/errors":
                 rows = db.execute(
-                    "SELECT scope,error FROM incidents WHERE status='OPEN' ORDER BY created_at DESC LIMIT 5"
+                    "SELECT scope,error,created_at FROM incidents WHERE status='OPEN' ORDER BY created_at DESC LIMIT 5"
                 ).fetchall()
-                reply = "\n".join(f"{r[0]}：{r[1]}" for r in rows) or "暂无分析异常"
+                reply = "\n".join(
+                    f"{datetime.fromtimestamp(r['created_at'], ZoneInfo('Asia/Shanghai')):%m-%d %H:%M:%S}"
+                    f" · {r['scope']}：{r['error']}" for r in rows
+                ) or "暂无分析异常"
+                if get("analysis_paused", False):
+                    reply = "分析已暂停；以下为尚未恢复验证的异常记录，不代表正在分析。\n" + reply
                 if db.execute("SELECT 1 FROM outbox WHERE status='FAILED'").fetchone():
                     markup = {"inline_keyboard": [[{"text": "重试失败通知", "callback_data": "retry_delivery"}]]}
             elif text in ("/pause", "/resume"):
@@ -231,20 +282,65 @@ class AnalysisBot:
             )
 
     async def poll(self):
+        # Serialize offset read, request and command commit together.
+        async with self.poll_lock:
+            await self._poll()
+
+    async def _poll(self):
         updates = await self.call(
             "getUpdates",
             {
                 "offset": self.store.state("bot_offset", 0),
-                "timeout": 0,
+                "timeout": 25,
                 "allowed_updates": ["message", "callback_query"],
             },
         )
+        self.communication_ok("TELEGRAM_POLL")
         for update in updates:
             self.handle(update)
             callback = update.get("callback_query")
             if callback:
                 await self.acknowledge_callback(callback)
             self.store.set("bot_offset", update["update_id"] + 1)
+
+    def communication_failure(self, scope, error):
+        now = time.time()
+        key = scope + ":failure"
+        failure = self.store.state(key) or {"since": now, "count": 0}
+        failure["count"] += 1
+        self.store.set(key, failure)
+        # Persist safe diagnostics immediately, but alert only sustained outages.
+        self.store.event(scope + "_FAILURE", {
+            "error": str(error)[:500],
+            "request": self.store.state(STATE_KEY) if scope == "TELEGRAM_POLL" else None,
+        })
+        conflict = isinstance(error, BotAPIError) and error.conflict
+        if conflict or failure["count"] >= 3 and now - failure["since"] >= 120:
+            self.store.incident(scope, "communication", {}, str(error)[:500])
+        return min(60, 5 * 2 ** min(failure["count"] - 1, 4))
+
+    def communication_ok(self, scope):
+        self.store.set(scope + ":failure", None)
+        self.store.set(scope + ":last_success", time.time())
+        scopes = [scope]
+        # Migrate only the old polling incident after actual successful polling.
+        if scope == "TELEGRAM_POLL":
+            old = self.store.rows(
+                "SELECT error FROM incidents WHERE scope='ANALYSIS_BOT' AND status='OPEN'"
+            )
+            if old and "getUpdates" in old[0]["error"]:
+                scopes.append("ANALYSIS_BOT")
+        with self.store.connect() as db:
+            for resolved in scopes:
+                db.execute(
+                    "UPDATE outbox SET status='CANCELLED' WHERE status IN ('PENDING','FAILED') "
+                    "AND event_key IN (SELECT 'alert:' || incident_id FROM incidents WHERE scope=?)",
+                    (resolved,),
+                )
+                db.execute(
+                    "UPDATE incidents SET status='RESOLVED' WHERE scope=? AND status='OPEN'",
+                    (resolved,),
+                )
 
     def keyboard(self):
         paused = self.store.state("analysis_paused", False)
@@ -293,6 +389,7 @@ class AnalysisBot:
                         "reply_markup": markup if markup is not None else self.keyboard(),
                     },
                 )
+                self.communication_ok("TELEGRAM_DELIVERY")
                 self.store.execute(
                     "UPDATE outbox SET status='SENT',message_id=? WHERE event_key=?",
                     (reply["message_id"], r["event_key"]),
@@ -305,4 +402,9 @@ class AnalysisBot:
                 raise
 
     async def close(self):
-        await self.client.aclose()
+        try:
+            if self.owns_poll_client:
+                await self.poll_client.aclose()
+            await self.client.aclose()
+        finally:
+            self.polling.close()

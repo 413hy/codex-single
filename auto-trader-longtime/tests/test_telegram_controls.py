@@ -328,6 +328,12 @@ async def test_flapping_poll_keeps_one_alert_and_restart_does_not_prove_health(
 ):
     clock = [1000.0]
     monkeypatch.setattr("longtime.telegram.time.monotonic", lambda: clock[0])
+    monkeypatch.setattr("longtime.polling.time.time", lambda: clock[0])
+
+    async def sleep(seconds):
+        clock[0] += seconds
+
+    monkeypatch.setattr("longtime.polling.asyncio.sleep", sleep)
     s = Store(tmp_path / "db")
     failing = [True]
 

@@ -26,7 +26,7 @@ def service_failure(diagnostic):
         line.lower() for line in diagnostic.splitlines() if line.startswith("ERROR:")
     )
     if "selected model is at capacity" in errors:
-        return "指定GPT模型服务繁忙(capacity)，本轮剩余分析停止；下一轮或点击重试时使用新行情"
+        return "指定GPT模型服务繁忙(capacity)，本轮剩余分析停止；恢复运行后的下一轮使用新行情"
     if any(x in errors for x in ("out of credits", "insufficient_quota", "usage limit")):
         return "GPT额度暂不可用，本轮剩余分析停止；请检查额度后重试"
     if any(x in errors for x in ("401 unauthorized", "invalid_api_key", "authentication failed")):

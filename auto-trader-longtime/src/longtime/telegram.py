@@ -15,6 +15,7 @@ import httpx
 
 from longtime import emergency, settings_controls
 from longtime.notices import incident_text
+from longtime.polling import STATE_KEY, PollingGuard
 from longtime.trading_settings import EntryDefaults
 
 log = logging.getLogger(__name__)
@@ -44,11 +45,21 @@ def direction(value):
     return {"LONG": "做多", "SHORT": "做空", "Buy": "做多", "Sell": "做空"}.get(value, value)
 
 
+class TelegramAPIError(RuntimeError):
+    def __init__(self, message, *, transient=False):
+        super().__init__(message)
+        self.transient = transient
+
+
 class Telegram:
     def __init__(self, settings, store, client=None):
         self.settings, self.store = settings, store
         self.client = client or httpx.AsyncClient(timeout=40)
         self.token = settings.telegram_token.get_secret_value()
+        self.poll_client = client or self.new_poll_client()
+        self.owns_poll_client = client is None
+        self.polling = PollingGuard(store, self.token)
+        self.poll_lock = asyncio.Lock()
         self.tasks = set()
         self.delivery_lock = asyncio.Lock()
         self._offset = 0
@@ -57,6 +68,27 @@ class Telegram:
         self._poll_failures = 0
 
     async def call(self, method, payload=None):
+        if method != "getUpdates":
+            return await self._call(method, payload)
+        try:
+            async with self.polling.request():
+                try:
+                    return await self._call(method, payload)
+                except (Exception, asyncio.CancelledError):
+                    if self.owns_poll_client:
+                        await self.poll_client.aclose()
+                        self.poll_client = self.new_poll_client()
+                    raise
+        except TimeoutError:
+            raise TelegramAPIError(
+                "Telegram getUpdates failed (TimeoutError)", transient=True
+            ) from None
+
+    @staticmethod
+    def new_poll_client():
+        return httpx.AsyncClient(timeout=httpx.Timeout(60, connect=10))
+
+    async def _call(self, method, payload=None):
         payload = dict(payload or {})
         markup = payload.get("reply_markup")
         if isinstance(markup, dict) and "remove_keyboard" in markup:
@@ -72,18 +104,26 @@ class Telegram:
                 self.store.state("entries_paused", False) if self.store else False
             )
         try:
-            r = await self.client.post(
+            client = self.poll_client if method == "getUpdates" else self.client
+            r = await client.post(
                 f"https://api.telegram.org/bot{self.token}/{method}", json=payload or {}
             )
+            if r.status_code >= 500:
+                raise TelegramAPIError(
+                    f"Telegram {method} rejected (HTTP {r.status_code})", transient=True
+                )
             d = r.json()
             if r.status_code >= 400 or d.get("ok") is not True:
-                raise RuntimeError(
+                raise TelegramAPIError(
                     f"Telegram {method} rejected (HTTP {r.status_code}, code {d.get('error_code')})"
                 )
             return d["result"]
         except (httpx.HTTPError, ValueError) as error:
             # Do not leak the token-bearing URL via exception text or exception chaining.
-            raise RuntimeError(f"Telegram {method} failed ({type(error).__name__})") from None
+            raise TelegramAPIError(
+                f"Telegram {method} failed ({type(error).__name__})",
+                transient=isinstance(error, httpx.TransportError),
+            ) from None
 
     async def preflight(self):
         me = await self.call("getMe")
@@ -449,7 +489,38 @@ class Telegram:
                 else {"inline_keyboard": [[{"text": "🔄 重试", "callback_data": "retry:" + iid}]]},
             )
 
-    async def poll(self, retry):
+    async def poll(self, retry=None):
+        async with self.poll_lock:
+            await self._poll(retry)
+
+    def poll_error(self, error, alert):
+        now = time.time()
+        failure = self.store.state("TELEGRAM_POLL:failure") or {"since": now, "count": 0}
+        failure["count"] += 1
+        self.store.set("TELEGRAM_POLL:failure", failure)
+        safe = str(error)[:600] if isinstance(error, TelegramAPIError) else type(error).__name__
+        self.store.event(
+            "TELEGRAM_POLL_FAILURE",
+            {
+                "error": safe,
+                "request": self.store.state(STATE_KEY),
+                "count": failure["count"],
+                "since": failure["since"],
+            },
+        )
+        # Only known transport/5xx failures get an outage observation window.
+        # Auth, conflicts, malformed data and command failures remain immediate.
+        if (
+            not isinstance(error, TelegramAPIError)
+            or not error.transient
+            or failure["count"] >= 3
+            and now - failure["since"] >= 120
+        ):
+            alert("TELEGRAM_POLL", "monitor", {}, error)
+        else:
+            log.warning("TELEGRAM_POLL reconnecting: %s", safe)
+
+    async def _poll(self, retry):
         # Back off only polling; never replay sends or consume another delivery attempt.
         delay = self._poll_retry_at - time.monotonic()
         if delay > 0:
@@ -463,6 +534,8 @@ class Telegram:
             raise
         self._poll_failures = 0
         self._poll_retry_at = 0.0
+        self.store.set("TELEGRAM_POLL:failure", None)
+        self.store.set("TELEGRAM_POLL:last_success", time.time())
         now = time.monotonic()
         if self._poll_healthy_since is None:
             self._poll_healthy_since = now
@@ -497,3 +570,6 @@ class Telegram:
             task.cancel()
         await asyncio.gather(*self.tasks, return_exceptions=True)
         await self.client.aclose()
+        if self.owns_poll_client:
+            await self.poll_client.aclose()
+        self.polling.close()

@@ -117,6 +117,7 @@ async def serve(settings):
         loop.add_signal_handler(sig, stop.set)
     tasks = []
     try:
+        bot.polling.startup()
         await bot.preflight()
         try:
             await app.monitor.startup()
@@ -150,7 +151,7 @@ async def serve(settings):
                     stop,
                     1,
                     lambda: bot.poll(app.retry),
-                    lambda e: app.executor.alert("TELEGRAM_POLL", "monitor", {}, e),
+                    lambda e: bot.poll_error(e, app.executor.alert),
                 ),
                 name="telegram",
             ),
