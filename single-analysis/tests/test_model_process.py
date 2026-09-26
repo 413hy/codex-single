@@ -7,7 +7,7 @@ from pathlib import Path
 import pytest
 
 from analysis_core.config import Settings
-from analysis_core.model import DirectionModel, ModelServiceError
+from analysis_core.model import SCREENING_PROFILE, DirectionModel, ModelService, ModelServiceError
 from analysis_core.store import Store
 
 
@@ -27,7 +27,7 @@ async def test_real_child_gets_no_exchange_or_bot_secrets(tmp_path, monkeypatch)
 assert "BYBIT_API_SECRET" not in os.environ
 assert "TELEGRAM_TOKEN" not in os.environ
 args=sys.argv
-assert args[args.index("--model")+1]=="gpt-5.6-terra"
+assert args[args.index("--model")+1]=="gpt-6-sol"
 assert 'model_reasoning_effort="medium"' in args
 assert "multi_agent" in args and "shell_tool" in args
 assert "skip_host_skill_discovery" in args and "project_doc_max_bytes=0" in args
@@ -47,6 +47,29 @@ out.write_text(json.dumps({"symbol":"TESTUSDT","decision":"SHORT","reason":"dire
         "MODEL_INPUT",
         "MODEL_OUTPUT",
     ]
+    event = json.loads(store.rows("SELECT payload FROM events WHERE kind='MODEL_INPUT'")[0]["payload"])
+    assert event["purpose"] == "direction" and event["model"] == "gpt-6-sol"
+    assert event["input_sha256"] and event["prompt_sha256"]
+
+
+async def test_screening_route_remains_terra_and_rejects_direction_prompt(tmp_path):
+    binary = executable(
+        tmp_path,
+        "import json,sys,pathlib\n"
+        "assert sys.argv[sys.argv.index('--model')+1]=='gpt-5.6-terra'\n"
+        "assert 'model_reasoning_effort=\"medium\"' in sys.argv\n"
+        "pathlib.Path(sys.argv[sys.argv.index('--output-last-message')+1]).write_text('{}')\n",
+    )
+    store = Store(tmp_path / "db")
+    runner = ModelService(Settings(_env_file=None, codex_bin=binary), store, SCREENING_PROFILE)
+    assert await runner.request("screen-test", {}, {}, "screening_v3.md") == {}
+    event = json.loads(
+        store.rows("SELECT payload FROM events WHERE kind='SCREENING_MODEL_INPUT'")[0]["payload"]
+    )
+    assert event["purpose"] == "screening" and event["model"] == "gpt-5.6-terra"
+    with pytest.raises(ValueError, match="profile and prompt"):
+        await runner.request("bad", {}, {}, "direction_v12.md")
+    assert len(store.rows("SELECT * FROM events WHERE kind='SCREENING_MODEL_INPUT'")) == 1
 
 
 @pytest.mark.parametrize(
@@ -136,6 +159,44 @@ def test_column_encoding_preserves_every_candle_value_without_mutation():
         direction_context({"symbol": "TESTUSDT", "candles": {"1m": [{**row, "new_field": 1}]}})
 
 
+@pytest.mark.parametrize("corruption", ["latest", "order", "completion", "duration", "future", "extra"])
+async def test_invalid_candle_identity_is_rejected_before_model_call(tmp_path, corruption):
+    from unittest.mock import AsyncMock
+
+    model = DirectionModel(Settings(_env_file=None), Store(tmp_path / "db"))
+    model.request = AsyncMock()
+    first = {
+        "symbol": "TESTUSDT", "timeframe": "1h", "source": "BYBIT",
+        "open_time": "2026-09-22T00:00:00Z", "close_time": "2026-09-22T01:00:00Z",
+        "open": "1", "high": "2", "low": "1", "close": "1.5", "volume": "3",
+        "turnover": "4", "completed": True,
+    }
+    second = {**first, "open_time": "2026-09-22T01:00:00Z",
+              "close_time": "2026-09-22T02:00:00Z", "close": "1.7"}
+    rows = [first, second]
+    latest = second
+    if corruption == "latest":
+        latest = {**second, "close": "9"}
+    elif corruption == "order":
+        rows = [second, first]
+    elif corruption == "completion":
+        rows = [{**first, "completed": False}, second]
+    elif corruption == "duration":
+        rows = [first, {**second, "close_time": "2026-09-22T02:30:00Z"}]
+    elif corruption == "future":
+        rows = [first, {**second, "close_time": "2026-09-22T02:00:00Z"}]
+    supplied = {"1h": latest}
+    if corruption == "extra":
+        supplied["2h"] = latest
+    with pytest.raises(ValueError):
+        await model.decide("invalid", {
+            "symbol": "TESTUSDT", "candles": {"1h": rows},
+            "latest_closed_candles": supplied,
+            **({"observed_at": "2026-09-22T01:30:00Z"} if corruption == "future" else {}),
+        })
+    model.request.assert_not_awaited()
+
+
 @pytest.mark.parametrize(
     "error,expected",
     [
@@ -159,9 +220,9 @@ async def test_real_child_upstream_errors_classified_once_without_fallback(
         f"sys.stderr.write('ERROR: '+{error!r}+'\\n')\nsys.exit(1)\n",
     )
     store = Store(tmp_path / "db")
-    model = DirectionModel(Settings(_env_file=None, codex_bin=binary), store)
+    model = ModelService(Settings(_env_file=None, codex_bin=binary), store, SCREENING_PROFILE)
     with pytest.raises(ModelServiceError, match=expected):
-        await model.request("screen-test", {}, {}, "screening.md", event_prefix="SCREENING_MODEL")
+        await model.request("screen-test", {}, {}, "screening_v3.md")
     assert calls.read_text() == "x"
     failure = json.loads(
         store.rows("SELECT payload FROM events WHERE kind='SCREENING_MODEL_FAILURE'")[0]["payload"]
@@ -311,3 +372,48 @@ async def test_cancellation_during_subprocess_creation_reaps_child(tmp_path, mon
             if child.returncode is None:
                 os.killpg(child.pid, 9)
                 await child.wait()
+
+
+async def test_startup_time_counts_toward_timeout_and_reaps_child(tmp_path, monkeypatch):
+    real_create = asyncio.create_subprocess_exec
+    children = []
+
+    async def delayed_create(*args, **kwargs):
+        child = await real_create(*args, **kwargs)
+        children.append(child)
+        await asyncio.sleep(0.1)
+        return child
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", delayed_create)
+    binary = executable(tmp_path, "import time\ntime.sleep(30)\n")
+    settings = Settings(_env_file=None, codex_bin=binary).model_copy(update={"model_timeout": 0.03})
+    store = Store(tmp_path / "db")
+    with pytest.raises(ModelServiceError, match="超时"):
+        await DirectionModel(settings, store).decide("startup-timeout", {"symbol": "TESTUSDT"})
+    assert len(children) == 1
+    assert not await asyncio.to_thread(Path(f"/proc/{children[0].pid}").exists)
+    event = json.loads(store.rows("SELECT payload FROM events WHERE kind='MODEL_INTERRUPTED'")[0]["payload"])
+    assert event["reason"] == "TimeoutError" and event["phase"] == "startup"
+
+
+async def test_slow_startup_returns_on_timeout_and_reaps_when_child_arrives(tmp_path, monkeypatch):
+    real_create = asyncio.create_subprocess_exec
+    children = []
+
+    async def delayed_create(*args, **kwargs):
+        child = await real_create(*args, **kwargs)
+        children.append(child)
+        await asyncio.sleep(1.2)
+        return child
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", delayed_create)
+    binary = executable(tmp_path, "import time\ntime.sleep(30)\n")
+    settings = Settings(_env_file=None, codex_bin=binary).model_copy(update={"model_timeout": 0.03})
+    store = Store(tmp_path / "db")
+    with pytest.raises(ModelServiceError, match="超时"):
+        await DirectionModel(settings, store).decide("slow-startup", {"symbol": "TESTUSDT"})
+    event = json.loads(store.rows("SELECT payload FROM events WHERE kind='MODEL_INTERRUPTED'")[0]["payload"])
+    assert event["phase"] == "startup" and event["reaped_before_return"] is False
+    await asyncio.sleep(0.3)
+    assert len(children) == 1
+    assert not await asyncio.to_thread(Path(f"/proc/{children[0].pid}").exists)

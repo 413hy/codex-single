@@ -101,23 +101,32 @@ class PublicStreamCache:
         current = aware(now or datetime.now(UTC))
         self._prune(current)
         cutoff = current - timedelta(seconds=seconds)
-        coverage_start = self._coverage_start.get(symbol)
+        subscribed_at = self._coverage_start.get(symbol)
+        coverage_start = (
+            max(subscribed_at, current - self._retention)
+            if subscribed_at is not None else None
+        )
         coverage_end = self._heartbeat.get(symbol)
         complete = bool(
             coverage_start is not None
             and coverage_start <= cutoff
             and coverage_end is not None
-            and coverage_end >= current - timedelta(seconds=60)
+            and coverage_end >= current
+        )
+        observed_coverage = bool(
+            coverage_start is not None
+            and coverage_end is not None
+            and coverage_end > max(cutoff, coverage_start)
         )
         events = tuple(
             event for event in self._events.get(symbol, ()) if cutoff < event.timestamp <= current
         )
-        available = complete or bool(events)
+        available = observed_coverage or bool(events)
         status = (
             ToolStatus.AVAILABLE
             if complete
             else ToolStatus.PARTIAL
-            if events
+            if available
             else ToolStatus.WARMING_UP
             if coverage_start is not None
             else ToolStatus.UNAVAILABLE

@@ -24,9 +24,12 @@ class AnalysisApp:
         self.settings = settings
         self.store = Store(settings.runtime_dir / "analysis.db")
         self.bus = SignalBus(settings.runtime_dir / "signals.db")
-        self.markets = markets or Markets()
+        self.markets = markets or Markets(
+            include_tradingview=settings.tradingview_enabled,
+            tradingview_extra_fields=settings.tradingview_extra_fields,
+        )
         self.model = model or DirectionModel(settings, self.store)
-        self.screening = screening or Screening(settings, self.store, runner=self.model)
+        self.screening = screening or Screening(settings, self.store)
         self.sniffer = sniffer or HedgeSniffer(settings.hedge_db)
         self.lock = asyncio.Lock()
 
@@ -122,19 +125,21 @@ class AnalysisApp:
                             "UPDATE signals SET evidence=? WHERE signal_id=?",
                             (encode(context), sid),
                         )
+                        age = time.time() - datetime.fromisoformat(
+                            context["observed_at"]
+                        ).timestamp()
+                        if age < -5:
+                            raise ValueError("方向分析行情时间在未来，禁止调用模型")
                         decision = await self.model.decide(sid, context)
                         if symbol == primary and decision.decision == "SKIP":
                             raise ValueError(
                                 "普通首选未给出明确方向，本轮分析失败，不重试或伪造方向"
                             )
-                        age = (
-                            time.time() - datetime.fromisoformat(context["observed_at"]).timestamp()
-                        )
-                        if not -5 <= age <= self.settings.model_timeout + 30:
-                            raise ValueError("方向分析行情已过期，禁止发布")
                         payload = self.bus.publish(
                             sid,
                             decision,
+                            cycle_id=cid,
+                            analysis_started_at=now,
                             normal=symbol in normal,
                             hedge=(
                                 {k: hedged[symbol][k] for k in ("group_id", "generation")}
@@ -155,6 +160,8 @@ class AnalysisApp:
                     except ValueError as error:
                         if str(error).startswith("SKIP_INSUFFICIENT_WEEK_HISTORY"):
                             self.store.signal_result(sid, "SKIP_INSUFFICIENT_WEEK_HISTORY")
+                            self.incident("DIRECTION:" + symbol, error)
+                            ok = False
                         else:
                             self.store.signal_result(sid, "ERROR")
                             self.incident("DIRECTION:" + symbol, error)

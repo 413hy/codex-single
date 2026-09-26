@@ -2,7 +2,7 @@
 
 from datetime import UTC, datetime
 
-from analysis_core.model import DirectionModel
+from analysis_core.model import SCREENING_PROFILE, ModelService
 from analysis_core.screening_contract import TrendScreeningResponse
 from analysis_core.store import identity
 from analysis_core.vendor.signal.domain.market_requirements import PRICE_ACTION_MINIMUM_CANDLES
@@ -75,7 +75,7 @@ def bundle_payload(bundle):
 class Screening:
     def __init__(self, settings, store, *, runner=None, collector=None, builder=None):
         self.store = store
-        self.runner = runner or DirectionModel(settings, store)
+        self.runner = runner or ModelService(settings, store, SCREENING_PROFILE)
         self.collector = collector
         self.builder = builder or EvidenceBuilder()
 

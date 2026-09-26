@@ -8,12 +8,20 @@ import json
 import os
 import signal
 import tempfile
+import time
+from dataclasses import dataclass
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from analysis_core.config import MODEL, REASONING
+from analysis_core.config import (
+    DIRECTION_MODEL,
+    DIRECTION_REASONING,
+    SCREENING_MODEL,
+    SCREENING_REASONING,
+)
 from analysis_core.store import encode
 
 
@@ -56,8 +64,60 @@ class Decision(BaseModel):
     reason: str = Field(min_length=1, max_length=600)
 
 
+@dataclass(frozen=True)
+class ModelProfile:
+    purpose: str
+    model_id: str
+    reasoning_effort: str
+    prompt_names: frozenset[str]
+    event_prefix: str
+
+
+SCREENING_PROFILE = ModelProfile(
+    "screening", SCREENING_MODEL, SCREENING_REASONING, frozenset({"screening_v3.md"}),
+    "SCREENING_MODEL",
+)
+DIRECTION_PROFILE = ModelProfile(
+    "direction", DIRECTION_MODEL, DIRECTION_REASONING,
+    frozenset({"direction_v11.md", "direction_v14.md"}), "MODEL",
+)
+
+
+def _parse_aware_time(value):
+    parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    if parsed.tzinfo is None:
+        raise ValueError("Candle timestamp must have a timezone")
+    return parsed
+
+
+async def _kill_and_reap(proc):
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    try:
+        await asyncio.wait_for(asyncio.shield(proc.wait()), timeout=5)
+        return True
+    except TimeoutError:
+        # The group was killed; keep a waiter attached if the OS has not reaped it yet.
+        asyncio.create_task(proc.wait())
+        return False
+
+
+async def _reap_late_spawn(spawning):
+    try:
+        proc = await spawning
+    except Exception:
+        return False
+    return await _kill_and_reap(proc)
+
+
 def direction_context(context):
     """Lossless column encoding: invariant candle identity stays at timeframe level."""
+    if "tradingview" in context:
+        context = {**context, "tradingview": {
+            key: value for key, value in context["tradingview"].items() if key != "provenance"
+        }}
     if "candles" not in context:
         return context
     columns = [
@@ -71,22 +131,51 @@ def direction_context(context):
         "turnover",
         "completed",
     ]
+    period_minutes = {
+        "1m": 1, "3m": 3, "5m": 5, "10m": 10,
+        "15m": 15, "30m": 30, "1h": 60, "2h": 120,
+    }
+    observed = _parse_aware_time(context["observed_at"]) if "observed_at" in context else None
     metadata, candles, latest_closed = {}, {}, {}
     for timeframe, rows in context["candles"].items():
+        if timeframe not in period_minutes:
+            raise ValueError("Unexpected direction candle timeframe")
         if not rows:
             raise ValueError("Empty direction candle input")
         identity = {key: rows[0][key] for key in ("symbol", "timeframe", "source")}
         if identity["symbol"] != context["symbol"] or identity["timeframe"] != timeframe:
             raise ValueError("Direction candle metadata mismatch")
+        previous_open = None
+        incomplete_seen = False
         for row in rows:
             if any(row[key] != value for key, value in identity.items()):
                 raise ValueError("Inconsistent direction candle metadata")
             if set(row) != set(columns) | set(identity):
                 raise ValueError("Unexpected direction candle fields")
+            opened = _parse_aware_time(row["open_time"])
+            closed_at = _parse_aware_time(row["close_time"])
+            if (
+                (previous_open is not None and opened <= previous_open)
+                or closed_at - opened != timedelta(minutes=period_minutes[timeframe])
+            ):
+                raise ValueError("Direction candles must be chronological with valid close times")
+            previous_open = opened
+            if type(row["completed"]) is not bool:
+                raise ValueError("Direction candle completed must be boolean")
+            if row["completed"] and observed is not None and closed_at > observed:
+                raise ValueError("Completed direction candle ends after observed_at")
+            if incomplete_seen and row["completed"]:
+                raise ValueError("Completed direction candle follows an incomplete candle")
+            incomplete_seen = incomplete_seen or not row["completed"]
         metadata[timeframe] = identity
         candles[timeframe] = [[row[key] for key in columns] for row in rows]
         closed = [row for row in rows if row["completed"] is True]
         latest_closed[timeframe] = closed[-1] if closed else None
+        supplied_latest = context.get("latest_closed_candles", {})
+        if timeframe in supplied_latest and supplied_latest[timeframe] != latest_closed[timeframe]:
+            raise ValueError("Latest closed candle disagrees with direction history")
+    if "latest_closed_candles" in context and set(context["latest_closed_candles"]) != set(candles):
+        raise ValueError("Latest closed candle timeframes disagree with direction history")
     return {
         **context,
         "candles": candles,
@@ -97,36 +186,29 @@ def direction_context(context):
     }
 
 
-class DirectionModel:
-    def __init__(self, settings, store):
-        self.settings, self.store = settings, store
+class ModelService:
+    def __init__(self, settings, store, profile: ModelProfile):
+        self.settings, self.store, self.profile = settings, store, profile
 
-    async def decide(self, signal_id, context):
-        schema = Decision.model_json_schema()
-        schema["properties"]["symbol"]["enum"] = [context["symbol"]]
-        required = context.get("direction_required") is True
-        if required:
-            schema["properties"]["decision"]["enum"] = ["LONG", "SHORT"]
-        raw = await self.request(signal_id, direction_context(context), schema, "direction_v11.md")
-        result = Decision.model_validate(raw)
-        if result.symbol != context["symbol"]:
-            raise ValueError("Model symbol mismatch")
-        if required and result.decision == "SKIP":
-            raise ValueError("普通首选必须明确判向，模型返回SKIP；本轮分析失败，不伪造方向")
-        return result
-
-    async def request(self, signal_id, context, schema, prompt_name, *, event_prefix="MODEL"):
+    async def request(self, signal_id, context, schema, prompt_name, *, event_prefix=None):
+        if prompt_name not in self.profile.prompt_names:
+            raise ValueError("Model profile and prompt do not match")
+        event_prefix = event_prefix or self.profile.event_prefix
         base_prompt = (Path(__file__).parent / "prompts" / prompt_name).read_text()
         prompt = base_prompt + "\nUNTRUSTED MARKET DATA:\n" + encode(context)
+        input_sha256 = hashlib.sha256(prompt.encode()).hexdigest()
+        started = time.monotonic()
         self.store.event(
             event_prefix + "_INPUT",
             {
                 "signal_id": signal_id,
-                "model": MODEL,
-                "reasoning_effort": REASONING,
+                "purpose": self.profile.purpose,
+                "model": self.profile.model_id,
+                "reasoning_effort": self.profile.reasoning_effort,
                 "schema": schema,
                 "prompt": prompt,
                 "prompt_sha256": hashlib.sha256(base_prompt.encode()).hexdigest(),
+                "input_sha256": input_sha256,
             },
         )
         # Credentials are never inherited by the direction process.
@@ -146,9 +228,9 @@ class DirectionModel:
                 "--sandbox",
                 "read-only",
                 "--model",
-                MODEL,
+                self.profile.model_id,
                 "-c",
-                f'model_reasoning_effort="{REASONING}"',
+                f'model_reasoning_effort="{self.profile.reasoning_effort}"',
                 "-c",
                 'web_search="disabled"',
                 "-c",
@@ -188,32 +270,42 @@ class DirectionModel:
                 )
             )
             try:
-                proc = await asyncio.shield(spawning)
-            except asyncio.CancelledError:
-                proc = await spawning
-                try:
-                    os.killpg(proc.pid, signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
-                await proc.wait()
-                self.store.event(
-                    event_prefix + "_INTERRUPTED",
-                    {"signal_id": signal_id, "pid": proc.pid, "reason": "CancelledError"},
-                )
-                raise
-            try:
-                _, err = await asyncio.wait_for(
-                    proc.communicate(prompt.encode()), self.settings.model_timeout
+                proc = await asyncio.wait_for(
+                    asyncio.shield(spawning), self.settings.model_timeout
                 )
             except (TimeoutError, asyncio.CancelledError) as error:
+                cleanup = asyncio.create_task(_reap_late_spawn(spawning))
                 try:
-                    os.killpg(proc.pid, signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
-                await proc.wait()
+                    reaped = await asyncio.wait_for(asyncio.shield(cleanup), timeout=1)
+                except TimeoutError:
+                    reaped = False
                 self.store.event(
                     event_prefix + "_INTERRUPTED",
-                    {"signal_id": signal_id, "pid": proc.pid, "reason": type(error).__name__},
+                    {
+                        "signal_id": signal_id, "reason": type(error).__name__,
+                        "phase": "startup", "reaped_before_return": reaped,
+                    },
+                )
+                if isinstance(error, TimeoutError):
+                    raise ModelServiceError(
+                        f"GPT分析超时({self.settings.model_timeout}秒)，本轮剩余分析停止；"
+                        "下一轮使用新行情重新检查"
+                    ) from None
+                raise
+            try:
+                remaining = self.settings.model_timeout - (time.monotonic() - started)
+                _, err = await asyncio.wait_for(
+                    proc.communicate(prompt.encode()), max(0, remaining)
+                )
+            except (TimeoutError, asyncio.CancelledError) as error:
+                reaped = await _kill_and_reap(proc)
+                self.store.event(
+                    event_prefix + "_INTERRUPTED",
+                    {
+                        "signal_id": signal_id, "pid": proc.pid,
+                        "reason": type(error).__name__, "phase": "inference",
+                        "reaped_before_return": reaped,
+                    },
                 )
                 if isinstance(error, TimeoutError):
                     raise ModelServiceError(
@@ -228,6 +320,11 @@ class DirectionModel:
                     event_prefix + "_FAILURE",
                     {
                         "signal_id": signal_id,
+                        "purpose": self.profile.purpose,
+                        "model": self.profile.model_id,
+                        "reasoning_effort": self.profile.reasoning_effort,
+                        "input_sha256": input_sha256,
+                        "elapsed_seconds": round(time.monotonic() - started, 3),
                         "returncode": proc.returncode,
                         "diagnostic": diagnostic[-2000:],
                         "errors": [
@@ -254,10 +351,38 @@ class DirectionModel:
                     f"GPT调用结束但未生成结果；详见{event_prefix}_FAILURE，signal_id={signal_id}"
                 )
             raw = output.read_text()
-            self.store.event(event_prefix + "_OUTPUT", {"signal_id": signal_id, "raw": raw})
+            self.store.event(event_prefix + "_OUTPUT", {
+                "signal_id": signal_id,
+                "purpose": self.profile.purpose,
+                "model": self.profile.model_id,
+                "reasoning_effort": self.profile.reasoning_effort,
+                "input_sha256": input_sha256,
+                "elapsed_seconds": round(time.monotonic() - started, 3),
+                "raw": raw,
+            })
             try:
                 return json.loads(raw)
             except json.JSONDecodeError:
                 raise ValueError(
                     f"GPT返回无效JSON，未采用；详见{event_prefix}_OUTPUT，signal_id={signal_id}"
                 ) from None
+
+
+class DirectionModel(ModelService):
+    def __init__(self, settings, store):
+        super().__init__(settings, store, DIRECTION_PROFILE)
+
+    async def decide(self, signal_id, context):
+        schema = Decision.model_json_schema()
+        schema["properties"]["symbol"]["enum"] = [context["symbol"]]
+        required = context.get("direction_required") is True
+        if required:
+            schema["properties"]["decision"]["enum"] = ["LONG", "SHORT"]
+        prompt_name = "direction_v14.md" if "tradingview" in context else "direction_v11.md"
+        raw = await self.request(signal_id, direction_context(context), schema, prompt_name)
+        result = Decision.model_validate(raw)
+        if result.symbol != context["symbol"]:
+            raise ValueError("Model symbol mismatch")
+        if required and result.decision == "SKIP":
+            raise ValueError("普通首选必须明确判向，模型返回SKIP；本轮分析失败，不伪造方向")
+        return result

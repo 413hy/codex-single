@@ -23,8 +23,8 @@ def orderflow_evidence(symbol, books, trades, now):
     if len(books) != 3:
         raise ValueError("Orderflow requires three book samples")
     for book in books:
-        if book.symbol != symbol or not -5 <= (now - book.observed_at).total_seconds() <= 30:
-            raise ValueError("Invalid or stale orderflow book identity/time")
+        if book.symbol != symbol or (now - book.observed_at).total_seconds() < -5:
+            raise ValueError("Invalid orderflow book identity/future time")
         for levels, reverse in ((book.bids, True), (book.asks, False)):
             prices = [level.price for level in levels]
             if (
@@ -131,6 +131,7 @@ def orderflow_evidence(symbol, books, trades, now):
         "book_sample_span_seconds": D(
             str((latest.observed_at - books[0].observed_at).total_seconds())
         ),
+        "book_latest_age_seconds": D(str((now - latest.observed_at).total_seconds())),
         "book_snapshots": [b.model_dump(mode="json") for b in books],
         "distinct_book_sequences": len({b.sequence for b in books}),
         "spread_bps": (latest.asks[0].price - latest.bids[0].price) / midpoint * 10000,

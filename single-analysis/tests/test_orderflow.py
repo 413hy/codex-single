@@ -65,13 +65,12 @@ def test_sample_math_dedup_windows_and_wall_are_not_continuity():
 
 
 @pytest.mark.parametrize(
-    "case", ["stale", "future", "symbol", "crossed", "duplicate", "order", "sequence"]
+    "case", ["future", "symbol", "crossed", "duplicate", "order", "sequence"]
 )
 def test_bad_book_rejected(case):
     now, books, trades = samples()
     book = books[-1]
     changes = {
-        "stale": {"observed_at": now - timedelta(seconds=31)},
         "future": {"observed_at": now + timedelta(seconds=6)},
         "symbol": {"symbol": "OTHERUSDT"},
         "crossed": {"asks": book.bids},
@@ -82,6 +81,17 @@ def test_bad_book_rejected(case):
     books[-1] = book.model_copy(update=changes[case])
     with pytest.raises(ValueError):
         orderflow_evidence("TESTUSDT", books, trades, now)
+
+
+def test_old_book_snapshots_are_labeled_and_available_as_reference():
+    now, books, trades = samples()
+    old_books = [
+        book.model_copy(update={"observed_at": book.observed_at - timedelta(minutes=5)})
+        for book in books
+    ]
+    evidence = orderflow_evidence("TESTUSDT", old_books, trades, now)
+    assert evidence["book_latest_age_seconds"] >= 300
+    assert evidence["book_sample_span_seconds"] == 2
 
 
 @pytest.mark.parametrize(

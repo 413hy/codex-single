@@ -4,7 +4,7 @@ from decimal import Decimal as D
 import httpx
 import pytest
 
-from analysis_core.market import Markets, aggregate_ten_minutes
+from analysis_core.market import Markets, aggregate_ten_minutes, verify_candles
 from analysis_core.vendor.models import Candle
 from analysis_core.vendor.public import BybitPublicClient
 
@@ -149,6 +149,20 @@ def test_historical_incomplete_candle_rejected():
             5,
             at + timedelta(minutes=10),
         )
+
+
+def test_old_completed_direction_candles_are_still_usable():
+    at = datetime(2026, 9, 9, 8, tzinfo=UTC)
+    rows = [candle(at), candle(at + timedelta(minutes=5))]
+    verify_candles(rows, 5, at + timedelta(days=1), 2)
+
+
+def test_old_last_unconfirmed_candle_remains_labeled_unconfirmed():
+    from analysis_core.market import validate_direction_rows
+
+    at = datetime(2026, 9, 9, 8, tzinfo=UTC)
+    rows = [candle(at), candle(at + timedelta(minutes=5), completed=False)]
+    validate_direction_rows(rows, "TESTUSDT", "5m", 5, at + timedelta(days=1))
 
 
 @pytest.mark.parametrize("short_tf", ["15m", "30m", "1h", "2h"])

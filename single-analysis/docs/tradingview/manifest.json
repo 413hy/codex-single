@@ -1,0 +1,46 @@
+{
+  "backup": "/root/single-analysis-backups/pre-tradingview-20260923-104618",
+  "unchanged_verified": [
+    "src/analysis_core/prompts/direction_v11.md",
+    "src/analysis_core/prompts/screening_v3.md",
+    "src/analysis_core/scheduling.py",
+    "src/analysis_core/screening.py",
+    "src/analysis_core/screening_contract.py",
+    "src/analysis_core/signals.py",
+    "src/analysis_core/vendor/PROVENANCE.json",
+    "src/analysis_core/vendor/__init__.py",
+    "src/analysis_core/vendor/models.py",
+    "src/analysis_core/vendor/public.py",
+    "src/analysis_core/vendor/scanner.py",
+    "src/analysis_core/vendor/signal/__init__.py",
+    "src/analysis_core/vendor/signal/domain/__init__.py",
+    "src/analysis_core/vendor/signal/domain/enums.py",
+    "src/analysis_core/vendor/signal/domain/market_requirements.py",
+    "src/analysis_core/vendor/signal/domain/models.py",
+    "src/analysis_core/vendor/signal/evidence/__init__.py",
+    "src/analysis_core/vendor/signal/evidence/builder.py",
+    "src/analysis_core/vendor/signal/providers/__init__.py",
+    "src/analysis_core/vendor/signal/providers/bybit.py",
+    "src/analysis_core/vendor/signal/providers/cross_exchange.py",
+    "src/analysis_core/vendor/signal/providers/deep_market.py",
+    "src/analysis_core/vendor/signal/providers/market_context.py",
+    "src/analysis_core/vendor/signal/providers/public_streams.py",
+    "src/analysis_core/vendor/signal/screening/__init__.py",
+    "src/analysis_core/vendor/signal/screening/models.py",
+    "src/analysis_core/vendor/signal/screening/validation.py"
+  ],
+  "changed_or_added_source": {
+    "src/analysis_core/tradingview_validation.py": "d33f19c948ebfdc1f95d0b1b90cae088f4546ada845d45a7a88b3e89eec7f3e6",
+    "src/analysis_core/model.py": "556a88edb224cc370e9e5d1e7fc25e116712c0fcdeeeabc82f04bf460431a52e",
+    "src/analysis_core/market.py": "5eba1f9f5a54d57d462975daaf761a7d377ba212ec9def6476289c9e94471341",
+    "src/analysis_core/config.py": "7ca8f287dc52b541b7cc53709b87ed36b736a15c510fed23e55c2cb146aa6e4f",
+    "src/analysis_core/tradingview.py": "e92b2f5bf37589cb4c4a0bbe482110afc16992656abbb645bb08da1efb160380",
+    "src/analysis_core/app.py": "0028983e8d8adcdce6b2ca6fde4ad64e01ca8905bb1d3bbdbe16b65e18b7c0f8",
+    "src/analysis_core/prompts/direction_v12.md": "85e01c250d1e2d511a741a57719c79c3a8e5681c69fb45ac96fca9b36c56ea04"
+  },
+  "prompts": {
+    "screening_v3.md": "539cda7947281e56ad2a727e2a64b56204157fea4ab1d65bfc31c10a40c07320",
+    "direction_v11.md": "987f340fba7ffc468bb8b0b4c48a9cba7cb85dddcfa70ec2d6d95abd2710483f",
+    "direction_v12.md": "85e01c250d1e2d511a741a57719c79c3a8e5681c69fb45ac96fca9b36c56ea04"
+  }
+}

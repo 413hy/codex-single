@@ -34,6 +34,21 @@ def test_liquidation_event_cannot_advance_coverage_and_unordered_expiry_is_prune
         cache.record_liquidation(event(now + timedelta(days=1)))
     cache.heartbeat("TESTUSDT", at=now)
     assert cache.liquidation_window("TESTUSDT", now=now).coverage_complete
+    long_window = cache.liquidation_window("TESTUSDT", seconds=800, now=now)
+    assert not long_window.coverage_complete
+    assert long_window.coverage_start == now - timedelta(seconds=600)
+    # A heartbeat before the query cannot prove the final unobserved interval.
+    partial = cache.liquidation_window("TESTUSDT", now=now + timedelta(seconds=30))
+    assert not partial.coverage_complete
+    assert partial.status.value == "PARTIAL"
+    assert partial.coverage_end == now
+    assert partial.event_count == 1
+    empty = PublicStreamCache()
+    empty.mark_subscribed("EMPTYUSDT", at=now - timedelta(seconds=900))
+    empty.heartbeat("EMPTYUSDT", at=now)
+    empty_partial = empty.liquidation_window("EMPTYUSDT", now=now + timedelta(seconds=30))
+    assert empty_partial.status.value == "PARTIAL"
+    assert empty_partial.event_count == 0
 
 
 async def test_benchmark_returns_exclude_candles_after_frozen_cutoff():

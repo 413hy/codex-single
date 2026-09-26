@@ -3,7 +3,7 @@
 ## 本机发布
 
 `signals.db/publications`：自增序号、唯一signal_id、symbol、published_at、expires_at和JSON payload。
-JSON version=1；内容包含方向LONG/SHORT/SKIP、reason、normal_candidate、hedge（group_id、generation或null）、行情时间和60秒有效期。
+当前发布 JSON version=2，消费者兼容 version=1/2；内容包含方向LONG/SHORT/SKIP、reason、normal_candidate、hedge（group_id、generation或null）、行情时间和60秒有效期。
 每个交易系统只读打开库，按自己的signals表唯一主键`feed:<signal_id>`认领，发布者不写交易账本。
 消费者不调用模型、不发分析请求。重复、过期、无方向、暂停的普通信号不执行。额外双仓信号仅匹配当前LOCKED组与轮次时管理仓位。
 正常入选且是双仓币时只分析一次，normal_candidate=true与hedge字段同时存在；普通系统可按自身持仓决定是否开仓。

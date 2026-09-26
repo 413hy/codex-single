@@ -66,6 +66,8 @@ async def test_overlap_priority_single_call_skip_no_retry(producer):
     assert contexts[0]["symbol"] == "HEDGEUSDT" and "priority_review" in contexts[0]
     rows = publications(producer)
     assert rows[0]["normal_candidate"] is True and rows[0]["hedge"]["generation"] == 3
+    assert all(r["version"] == 2 and r["cycle_id"] == "one" for r in rows)
+    assert all(isinstance(r["analysis_started_at"], float) for r in rows)
     assert all(r["expires_at"] - r["published_at"] == 60 for r in rows)
     assert await producer.cycle("one")
     assert producer.model.decide.await_count == 2
@@ -99,13 +101,58 @@ async def test_service_outage_stops_all_additional_calls_and_recovers(producer):
     )
 
 
-async def test_stale_direction_never_published(producer):
+async def test_old_direction_evidence_can_be_analyzed(producer):
     async def evidence(symbol, candidate):
         return dict(symbol=symbol, observed_at="2000-01-01T00:00:00+00:00")
 
     producer.markets.evidence.side_effect = evidence
-    assert not await producer.cycle("one")
-    assert publications(producer) == []
+    assert await producer.cycle("one")
+    assert len(publications(producer)) == 2
+    assert producer.model.decide.await_count == 2
+
+
+async def test_nonprimary_missing_week_history_marks_cycle_failed(producer):
+    original = producer.markets.evidence.side_effect
+
+    async def evidence(symbol, candidate):
+        if symbol == "OTHERUSDT":
+            raise ValueError("SKIP_INSUFFICIENT_WEEK_HISTORY: 2h")
+        return await original(symbol, candidate)
+
+    producer.markets.evidence.side_effect = evidence
+    assert not await producer.cycle("missing-week")
+    assert producer.store.rows("SELECT status FROM cycles WHERE cycle_id='missing-week'")[0]["status"] == "PARTIAL_ERROR"
+    assert producer.store.rows("SELECT status FROM signals WHERE symbol='OTHERUSDT'")[0]["status"] == "SKIP_INSUFFICIENT_WEEK_HISTORY"
+    assert producer.store.rows("SELECT scope FROM incidents WHERE scope='DIRECTION:OTHERUSDT' AND status='OPEN'")
+
+
+async def test_direction_evidence_has_no_age_limit_before_or_after_model(producer, monkeypatch):
+    clock = [1000.0]
+    monkeypatch.setattr("time.time", lambda: clock[0])
+
+    async def evidence(symbol, candidate):
+        return dict(symbol=symbol, observed_at=datetime.fromtimestamp(clock[0] - 91, UTC).isoformat())
+
+    producer.markets.evidence.side_effect = evidence
+    assert await producer.cycle("old-before-call")
+    assert producer.model.decide.await_count == 2
+    assert len(publications(producer)) == 2
+
+    async def fresher_evidence(symbol, candidate):
+        return dict(symbol=symbol, observed_at=datetime.fromtimestamp(clock[0] - 89, UTC).isoformat())
+
+    original = producer.model.decide.side_effect
+
+    async def slow_decide(sid, context):
+        result = await original(sid, context)
+        clock[0] += 2
+        return result
+
+    producer.markets.evidence.side_effect = fresher_evidence
+    producer.model.decide.side_effect = slow_decide
+    assert await producer.cycle("old-after-call")
+    assert producer.model.decide.await_count == 4
+    assert len(publications(producer)) == 4
 
 
 async def test_sniffer_failure_does_not_silently_omit_pairs(producer):
@@ -191,8 +238,14 @@ async def test_cancelled_cycle_is_interrupted_and_not_replayed(producer):
 
 def test_duplicate_publication_does_not_extend_validity(producer):
     d = Decision(symbol="TESTUSDT", decision="LONG", reason="structure")
-    one = producer.bus.publish("same", d, normal=True, hedge=None, observed_at="now", now=100)
-    two = producer.bus.publish("same", d, normal=True, hedge=None, observed_at="now", now=200)
+    one = producer.bus.publish(
+        "same", d, cycle_id="cycle", analysis_started_at=90,
+        normal=True, hedge=None, observed_at="now", now=100,
+    )
+    two = producer.bus.publish(
+        "same", d, cycle_id="cycle", analysis_started_at=90,
+        normal=True, hedge=None, observed_at="now", now=200,
+    )
     assert one == two and two["expires_at"] == 160
 
 
@@ -246,12 +299,13 @@ async def test_automatic_long_cycle_does_not_immediately_run_again(producer, mon
     async def slow(sid, context):
         result = await original(sid, context)
         clock[0] += 1300
+        context['observed_at'] = datetime.fromtimestamp(clock[0], UTC).isoformat()
         return result
 
     producer.model.decide.side_effect = slow
-    # Market timestamps remain fresh relative to the fake clock.
+    # This scheduler-only test refreshes its mocked evidence after simulated work.
     async def evidence(symbol, candidate):
-        return dict(symbol=symbol, observed_at=datetime.fromtimestamp(clock[0]+1300, UTC).isoformat())
+        return dict(symbol=symbol, observed_at=datetime.fromtimestamp(clock[0], UTC).isoformat())
 
     producer.markets.evidence.side_effect = evidence
     producer.store.set('next_analysis_at', 1200)

@@ -2,6 +2,7 @@
 import asyncio
 import json
 import sys
+import time
 from pathlib import Path
 
 root, workspace = map(Path, sys.argv[1:])
@@ -52,6 +53,7 @@ async def main():
         bus = SignalBus(config.signal_db)
         app.store.set('entries_paused', True)
         bus.publish('review', Decision(symbol='TESTUSDT', decision='SHORT', reason='fixture review'),
+                    cycle_id='cross-system:review', analysis_started_at=time.time(),
                     normal=False, hedge={k:ownership[k] for k in ('group_id','generation')},
                     observed_at='fixture')
         await app.consumer.tick()
@@ -68,6 +70,7 @@ async def main():
         group = app.executor.hedge.get(group['group_id'])
         assert group['phase'] == 'LOCKED'
         bus.publish('stale-generation', Decision(symbol='TESTUSDT', decision='LONG', reason='fixture stale generation'),
+                    cycle_id='cross-system:stale-generation', analysis_started_at=time.time(),
                     normal=False, hedge={k:ownership[k] for k in ('group_id','generation')},
                     observed_at='fixture')
         count_stale = len(exchange.submissions)

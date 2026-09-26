@@ -21,8 +21,16 @@ async def test_real_publisher_both_consumers_and_hedge_snapshot(tmp_path):
         ('extra', 'SHORT', False, time.time()),
         ('expired', 'LONG', True, time.time()-61),
     ]:
-        bus.publish(sid, Decision(symbol='TESTUSDT',decision=side,reason='isolated integration fixture'),
-                    normal=normal,hedge=None,observed_at='fixture',now=now)
+        bus.publish(
+            sid,
+            Decision(symbol='TESTUSDT', decision=side, reason='isolated integration fixture'),
+            cycle_id='cross-system:' + sid,
+            analysis_started_at=now,
+            normal=normal,
+            hedge=None,
+            observed_at='fixture',
+            now=now,
+        )
     worker = Path(__file__).parents[1]/'docs/audit-2026-09-16/cross_system_worker.py'
     for root in roots:
         proc = await asyncio.create_subprocess_exec(

@@ -4,6 +4,7 @@ from decimal import Decimal as D
 
 from analysis_core.indicators import direction_indicators, price_volume
 from analysis_core.orderflow import collect_orderflow
+from analysis_core.tradingview import TradingViewWeb
 from analysis_core.vendor.models import Candle, ScannerConfig
 from analysis_core.vendor.public import BybitPublicClient
 from analysis_core.vendor.scanner import BybitUniverseScanner
@@ -13,10 +14,8 @@ def verify_candles(rows, minutes, now, minimum):
     if len(rows) < minimum:
         raise ValueError("Incomplete market candle window")
     duration = timedelta(minutes=minutes)
-    if now - rows[-1].open_time > duration + timedelta(seconds=45) or rows[
-        -1
-    ].open_time > now + timedelta(seconds=5):
-        raise ValueError("Stale or future market candles")
+    if rows[-1].open_time > now + timedelta(seconds=5):
+        raise ValueError("Future market candles")
     if any(b.open_time - a.open_time != duration for a, b in zip(rows, rows[1:], strict=False)):
         raise ValueError("Missing or duplicate market candle intervals")
 
@@ -37,18 +36,17 @@ def validate_direction_rows(rows, symbol, timeframe, minutes, now):
             or row.close_time != row.open_time + timedelta(minutes=minutes)
             or int(row.open_time.timestamp()) % (minutes * 60) != 0
             or (row.completed and row.close_time > now)
-            or (
-                not row.completed
-                and (index != len(rows) - 1 or row.close_time < now - timedelta(seconds=45))
-            )
+            or (not row.completed and index != len(rows) - 1)
         ):
             raise ValueError("Invalid direction candle identity/OHLCV/completion")
 
 
 class Markets:
-    def __init__(self, client=None, *, include_orderflow=True):
+    def __init__(self, client=None, *, include_orderflow=True, include_tradingview=False,
+                 tradingview_extra_fields=""):
         self.client = client or BybitPublicClient(max_attempts=1)
         self.include_orderflow = include_orderflow
+        self.tradingview = TradingViewWeb(extra_fields=tradingview_extra_fields) if include_tradingview else None
         self.scanner = BybitUniverseScanner(self.client, ScannerConfig())
 
     async def scan(self, exclude):
@@ -92,7 +90,9 @@ class Markets:
         data["10m"] = [c.model_dump(mode="json") for c in ten_minute[-73:]]
         indicators["10m"] = direction_indicators(ten_minute[-73:])
         orderflow = await collect_orderflow(self.client, symbol) if self.include_orderflow else None
+        reference = await self.tradingview.collect(symbol) if self.tradingview else None
         return {
+            **({"tradingview": reference} if reference is not None else {}),
             "orderflow": orderflow,
             "history_hours": {tf: 168 if tf in {"15m", "30m", "1h", "2h"} else 12 for tf in data},
             "indicators": indicators,
@@ -131,7 +131,11 @@ class Markets:
         return tuple(c for c in rows if c.open_time >= now - timedelta(hours=24))
 
     async def close(self):
-        await self.client.close()
+        try:
+            await self.client.close()
+        finally:
+            if self.tradingview:
+                await self.tradingview.close()
 
 
 def aggregate_ten_minutes(rows):

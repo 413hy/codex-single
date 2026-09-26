@@ -24,11 +24,24 @@ class SignalBus:
         db.execute("PRAGMA synchronous=FULL")
         return db
 
-    def publish(self, signal_id, decision, *, normal, hedge, observed_at, now=None):
+    def publish(
+        self,
+        signal_id,
+        decision,
+        *,
+        cycle_id,
+        analysis_started_at,
+        normal,
+        hedge,
+        observed_at,
+        now=None,
+    ):
         now = time.time() if now is None else now
         payload = dict(
-            version=1,
+            version=2,
             signal_id=signal_id,
+            cycle_id=cycle_id,
+            analysis_started_at=analysis_started_at,
             **decision.model_dump(),
             normal_candidate=normal,
             hedge=hedge,
