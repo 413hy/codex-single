@@ -5,4 +5,9 @@ def incident_text(scope, kind, error, incident_id, symbol=None):
             "管理消息接收或通知发送受影响；此异常不表示启动了分析，暂停状态不变。\n"
             f"编号：{incident_id[:8]}"
         )
+    if scope.startswith(("TV_EVIDENCE:", "BYBIT_REFINEMENT:")):
+        return (
+            f"⚠️ 分析异常 · {symbol or scope}\n{error}\n"
+            f"该币本轮不发布方向；其他币继续分析。下一轮重新检查。\n编号：{incident_id[:8]}"
+        )
     return f"⚠️ 分析异常 · {symbol or scope}\n{error}\n本轮受影响的分析不发布交易信号；下轮重新取行情。\n编号：{incident_id[:8]}"

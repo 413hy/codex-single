@@ -11,6 +11,8 @@
 
 现场另一次只读复核曾遇到技术页 HTTP 403；403 仍按访问受限失败，不以其他页面绕开，也不重试。TradingView 网页接口及其可用性由第三方控制。官方说明 CEX 筛选器可筛选交易对并提供成交、技术指标；技术评级是均线和振荡指标的组合，可能随未收盘 K 线变化；最近成交时间可用于区分活跃与不活跃币。[CEX 筛选器](https://www.tradingview.com/support/solutions/43000746345-what-is-the-difference-between-crypto-%D1%81oins-dex-and-cex-screeners/)、[技术评级](https://www.tradingview.com/support/solutions/43000614331-technical-ratings/)、[最近成交时间](https://www.tradingview.com/support/solutions/43000753164-last-trade-time/)。
 
+14:14 的独立只读复核使用上线后的采集器成功采得 STONK 的同合约七周期数据，证实 technicals 404 → 同币主页身份核验 → 字段采集这条路径可运行，且没有发布交易信号。14:09 的 CEX 复核中 MSFU 已不在本轮待审池。两条原异常在核实后标记为已解决，诊断事件保留在分析库；外部页面以后仍可能再次失败。
+
 ## 交易信号怎样产生
 
 1. TradingView CEX 筛选器发现 Bybit USDT 永续合约。Bybit 公共合约清单只核实仍可交易，不参与全市场评分。发现候选时使用 24h 成交额、成交额变化、价格变化、15m/1h 技术评级和短周期栏时间构造最多 20 币的均衡池。
