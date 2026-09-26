@@ -31,7 +31,7 @@ async def test_real_publisher_both_consumers_and_hedge_snapshot(tmp_path):
             observed_at='fixture',
             now=now,
         )
-    worker = Path(__file__).parents[1]/'docs/audit-2026-09-16/cross_system_worker.py'
+    worker = Path(__file__).parent/'fixtures/cross_system_worker.py'
     for root in roots:
         proc = await asyncio.create_subprocess_exec(
             str(root/'.venv/bin/python'),str(worker),str(root),str(tmp_path),cwd=root,

@@ -84,6 +84,13 @@ def incident_text(scope, kind, error, incident_id, symbol=None):
         )
         impact = "受影响的候选已跳过，已有止盈及对冲保留。"
         action = "下一轮会重新取行情；也可点击下方按钮重试。"
+    elif category == "MONITOR":
+        title = "交易所状态核对未完成"
+        cause = "本次未取得完整的交易所状态。"
+        if "Bybit GET" in error:
+            cause = "Bybit只读查询失败：" + error[:240]
+        impact = "最新仓位及委托状态暂未确认；不代表保护单已失效。"
+        action = "系统会自动继续核对，成功后解除；也可点击按钮立即检查。"
     else:
         title = "交易状态检查异常" if kind == "monitor" else "系统操作未完成"
         cause = "未能完成最新状态核对，详细原因已记入日志。"

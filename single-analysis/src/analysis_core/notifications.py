@@ -40,7 +40,8 @@ def signal_heading(row):
     direction = {"LONG": "做多", "SHORT": "做空", "SKIP": "观望"}.get(row["side"], "未发布")
     if row["status"] != "PUBLISHED":
         direction = {
-            "SKIP_INSUFFICIENT_WEEK_HISTORY": "历史行情不足",
+            "SKIP_INSUFFICIENT_DIRECTION_HISTORY": "近期历史行情不足",
+            "SKIP_STALE_BYBIT_DIRECTION_HISTORY": "Bybit行情已过期",
             "ERROR_MODEL_SERVICE": "模型服务异常",
             "ERROR": "分析失败",
         }.get(row["status"], "未完成")

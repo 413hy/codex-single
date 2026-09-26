@@ -69,7 +69,7 @@ async def test_screening_route_remains_terra_and_rejects_direction_prompt(tmp_pa
     )
     assert event["purpose"] == "tv_discovery" and event["model"] == "gpt-5.6-terra"
     with pytest.raises(ValueError, match="profile and prompt"):
-        await runner.request("bad", {}, {}, "direction_v12.md")
+        await runner.request("bad", {}, {}, "wrong_prompt.md")
     assert len(store.rows("SELECT * FROM events WHERE kind='TV_SELECTION_MODEL_INPUT'")) == 1
 
 
@@ -229,7 +229,9 @@ async def test_real_child_upstream_errors_classified_once_without_fallback(
         store.rows("SELECT payload FROM events WHERE kind='TV_SELECTION_MODEL_FAILURE'")[0]["payload"]
     )
     assert failure["errors"] == ["ERROR: " + error]
-    assert not store.rows("SELECT * FROM orders")
+    assert "orders" not in {
+        row["name"] for row in store.rows("SELECT name FROM sqlite_master WHERE type='table'")
+    }
 
 
 async def test_real_child_missing_result_is_diagnosable(tmp_path):

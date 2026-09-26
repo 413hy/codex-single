@@ -61,7 +61,7 @@ def test_unknown_command_and_help(tmp_path):
 def test_status_empty_database(tmp_path):
     result = run_cli(tmp_path, "status")
     assert result.returncode == 0
-    assert json.loads(result.stdout) == {"cycles": [], "trades": []}
+    assert json.loads(result.stdout) == {"trades": []}
 
 
 def test_lock_blocks_second_process_without_touching_exchange(tmp_path):

@@ -35,8 +35,8 @@ TradingView 官方说明 CEX 与币种聚合筛选器范围不同；技术评级
 
 ## 可扩展接口与审计
 
-`tradingview_sources.py` 的适配器实现 `name/stage/collect`，注册到 `SourceRegistry`。核心同合约快照和合约身份为必需；币种级背景与新闻为可选。新增来源须说明对象范围、时间语义、数据缺失与身份校验，避免把同源派生指标当多份独立确认。模型只接收压缩后的近期关键证据，原始抓取结果另写审计事件。提示词版本为 `tv_selection_v1.md`、`direction_selection_v1.md`、`direction_v15.md`；旧扫描器、筛选契约和提示词在 `docs/legacy-20260926/` 留存以供回溯，生产路径无旧扫描入口。
+`tradingview_sources.py` 的适配器实现 `name/stage/collect`，注册到 `SourceRegistry`。核心同合约快照和合约身份为必需；币种级背景与新闻为可选。新增来源须说明对象范围、时间语义、数据缺失与身份校验，避免把同源派生指标当多份独立确认。模型只接收压缩后的近期关键证据，原始抓取结果另写审计事件。提示词版本为 `tv_selection_v1.md`、`direction_selection_v1.md`、`direction_v15.md`；重构前版本保留在仓库 `codex-select` 回滚标签，生产路径无旧扫描入口。
 
 ## 验证和发布状态
 
-隔离测试不向共享信号库写入；真实模型验证记录见 `model_validation.json`。模型讨论轮次见 `review_round1.json`、`review_round2.json`、`review_round3.json`。第三轮代码审阅指出两项确定问题：连续但过期的 Bybit K 线，以及消费端只取前 100 条有效信号造成的遗漏；现已分别增加主周期最新已收盘时间校验和读取全部有效记录，并加回归测试。上线前需让分析生产服务和两个交易消费者加载同一 600 秒信号合同；旧库信号不得修改有效期或重放。分析服务当前保持原有暂停状态，恢复仅由用户既有 Bot 控件触发。
+隔离测试不向共享信号库写入；真实模型验证记录见 `model_validation.json`。模型讨论轮次见 `review_round1.json`、`review_round2.json`、`review_round3.json`。第三轮代码审阅指出两项确定问题：连续但过期的 Bybit K 线，以及消费端只取前 100 条有效信号造成的遗漏；现已分别增加主周期最新已收盘时间校验和读取全部有效记录，并加回归测试。真实生产轮次与两端消费结果见 `LIVE-AUDIT.md`；旧库信号不得修改有效期或重放。

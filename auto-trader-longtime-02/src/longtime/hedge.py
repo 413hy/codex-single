@@ -8,7 +8,7 @@ from decimal import Decimal as D
 
 from longtime.exchange import LIVE, TERMINAL
 from longtime.execution import Executor, matches_position
-from longtime.risk import ceil, floor, number, reachable_tp
+from longtime.risk import ceil, floor, number
 from longtime.store import encode, identity
 from longtime.transport import BybitAPIError
 
@@ -205,7 +205,12 @@ class HedgeEngine:
         qty = number(p["size"])
         tick = number(d["tick"])
         reference = number(g["reference"])
-        tp = number(g["tp"]) if "tp" in g else number(t["tp_price"])
+        if g["generation"] == 0:
+            tp = number(t["tp_price"])
+        else:
+            if "tp" not in g:
+                raise ValueError("重新判向止盈价未持久化，禁止沿用旧止盈")
+            tp = number(g["tp"])
         hedge = distance_price(
             t["side"], reference, qty, number(d["sl_loss"]), tick, favorable=False
         )
@@ -282,14 +287,27 @@ class HedgeEngine:
             manual=manual,
         )
         self.store.update_trade(t["trade_id"], tp_order_id=order["orderId"])
-        # Protect the surviving direction before submitting the opposite opening.
-        # A TP may fill during its acknowledgement; never open a fresh hedge for
-        # a position that has already exited.
-        if await self.slot(t) is None:
+        # An order can fill after its acknowledgement while the position view
+        # still lags. Confirm the TP before opening the opposite slot.
+        latest_tp = await self.exchange.order(g["symbol"], order["orderLinkId"])
+        if latest_tp is None:
+            raise RuntimeError("止盈订单状态未确认，禁止提交反向开仓")
+        self.record(latest_tp)
+        if latest_tp["orderStatus"] not in LIVE | {"Filled"}:
+            raise RuntimeError("止盈订单已取消或拒绝，禁止提交反向开仓")
+        filled_tp = number(latest_tp.get("cumExecQty") or 0)
+        if latest_tp["orderStatus"] == "Filled" and filled_tp <= 0:
+            raise ValueError("止盈全成回执缺少成交数量")
+        remaining = await self.slot(t)
+        if filled_tp > 0 and remaining is not None:
+            return
+        if remaining is None:
             g["phase"] = "CLEANUP"
             self.save(g)
             await self.advance(g)
             return
+        if number(remaining["size"]) != qty:
+            raise ValueError("仓位数量与未成交止盈不符，禁止提交等量反向开仓")
         await self.intent(child_id, "ENTRY", 0, payload, manual=manual)
         g["phase"] = "SINGLE"
         self.save(g)
@@ -535,39 +553,21 @@ class HedgeEngine:
             p = await self.slot(winner)
             if p is None or await self.slot(loser) is None:
                 raise ValueError("判向前双向仓位不完整")
-            candles = await self.executor.markets.reachability(g["symbol"])
             instrument = await self.exchange.instrument(g["symbol"])
             bid, ask = await self.exchange.quote(g["symbol"])
             reference = ask if decision.decision == "LONG" else bid
-            qty = number(p["size"])
-            target = number(winner["tp_target_net_pnl"])
-            tp = distance_price(
-                decision.decision, reference, qty, target, instrument.tick, favorable=True
-            )
-            # Reuse the original 24h evidence rule against the EXACT proposed price.
-            reachable = reachable_tp(
-                decision.decision,
-                reference,
-                qty,
-                instrument,
-                D(0),
-                D(0),
-                ask - bid,
-                candles,
-                targets=(target,),
-                exact_price=tp,
-            )
-            self.store.event(
-                "HEDGE_TP_REACHABILITY",
-                dict(group_id=gid, signal_id=sid, reference=reference, result=reachable),
-            )
-            if reachable is None:
-                self.store.signal_result(sid, "SKIP_TP_UNREACHABLE", "SKIP")
-                return "SKIP_TP_UNREACHABLE"
             if deadline is not None and time.time() >= deadline:
                 return "SKIP_CYCLE_ENDED"
             if not self.executor.settings.trading_enabled:
                 return "DRY_RUN_ELIGIBLE"
+            tp = distance_price(
+                decision.decision,
+                reference,
+                number(p["size"]),
+                number(winner["tp_target_net_pnl"]),
+                instrument.tick,
+                favorable=True,
+            )
             g.update(
                 phase="UNLOCKING",
                 winner=winner["trade_id"],

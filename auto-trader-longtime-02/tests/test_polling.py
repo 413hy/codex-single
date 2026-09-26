@@ -59,7 +59,7 @@ async def test_timeout_retry_waits_for_lingering_server_request(tmp_path, clock)
         assert attempts[1] - (attempts[0] + 60) >= RECOVERY_SECONDS
         assert bot.store.state("telegram_offset") == 17
         assert bot.store.state("entries_paused") is True
-        assert not bot.store.rows("SELECT * FROM cycles")
+        assert not bot.store.rows("SELECT name FROM sqlite_master WHERE name='cycles'")
         assert bot.store.state(STATE_KEY)["phase"] == "completed"
     finally:
         await bot.close()

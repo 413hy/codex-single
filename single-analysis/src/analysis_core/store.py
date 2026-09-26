@@ -1,4 +1,4 @@
-"""Independent SQLite ledger. Intent durability precedes every exchange mutation."""
+"""Analysis-only SQLite ledger; this project never submits exchange orders."""
 
 from __future__ import annotations
 
@@ -37,23 +37,6 @@ class Store:
                     signal_id TEXT PRIMARY KEY,cycle_id TEXT NOT NULL,symbol TEXT NOT NULL,
                     status TEXT NOT NULL,side TEXT,analysis TEXT,evidence TEXT NOT NULL,
                     created_at REAL NOT NULL,UNIQUE(cycle_id,symbol));
-                CREATE TABLE IF NOT EXISTS trades (
-                    trade_id TEXT PRIMARY KEY,cycle_id TEXT,signal_id TEXT,symbol TEXT NOT NULL,
-                    side TEXT NOT NULL,position_idx INTEGER NOT NULL,status TEXT NOT NULL,
-                    owned INTEGER NOT NULL DEFAULT 1,analysis TEXT,entry_price TEXT,exit_price TEXT,
-                    qty TEXT,margin TEXT,leverage TEXT,tp_price TEXT,tp_target_net_pnl TEXT,
-                    sl_price TEXT,order_id TEXT,tp_order_id TEXT,sl_order_id TEXT,
-                    opened_at REAL,closed_at REAL,holding_duration REAL,realized_pnl TEXT,
-                    fees TEXT,net_pnl TEXT,close_reason TEXT,details TEXT NOT NULL);
-                CREATE UNIQUE INDEX IF NOT EXISTS owned_active_slot ON trades(symbol,position_idx)
-                    WHERE owned=1 AND status IN ('INTENT','OPEN');
-                CREATE TABLE IF NOT EXISTS hedge_groups (
-                    group_id TEXT PRIMARY KEY, document TEXT NOT NULL);
-                CREATE TABLE IF NOT EXISTS orders (
-                    link_id TEXT PRIMARY KEY,trade_id TEXT NOT NULL,kind TEXT NOT NULL,
-                    payload TEXT NOT NULL,status TEXT NOT NULL DEFAULT 'INTENT',
-                    exchange_id TEXT,attempts INTEGER NOT NULL DEFAULT 0,
-                    created_at REAL NOT NULL,receipt TEXT);
                 CREATE TABLE IF NOT EXISTS incidents (
                     incident_id TEXT PRIMARY KEY,scope TEXT NOT NULL,kind TEXT NOT NULL,
                     payload TEXT NOT NULL,status TEXT NOT NULL,created_at REAL NOT NULL,
@@ -128,43 +111,6 @@ class Store:
             (status, side, encode(analysis) if analysis is not None else None, signal_id),
         )
 
-    def insert_trade(self, trade):
-        columns = list(trade)
-        with self.connect() as db:
-            allowed = {r[1] for r in db.execute("PRAGMA table_info(trades)")}
-            if not set(columns) <= allowed:
-                raise ValueError("Invalid trade fields")
-            db.execute(
-                f"INSERT INTO trades({','.join(columns)}) VALUES ({','.join('?' for _ in columns)})",
-                tuple(trade[k] for k in columns),
-            )
-
-    def trade(self, trade_id):
-        rows = self.rows("SELECT * FROM trades WHERE trade_id=?", (trade_id,))
-        return rows[0] if rows else None
-
-    def update_trade(self, trade_id, *, notification=None, **fields):
-        with self.connect() as db:
-            allowed = {r[1] for r in db.execute("PRAGMA table_info(trades)")}
-            if not set(fields) <= allowed:
-                raise ValueError("Invalid trade fields")
-            db.execute(
-                f"UPDATE trades SET {','.join(k + '=?' for k in fields)} WHERE trade_id=?",
-                (*fields.values(), trade_id),
-            )
-            if notification:
-                db.execute(
-                    "INSERT OR IGNORE INTO outbox(event_key,text) VALUES (?,?)", notification
-                )
-
-    def reserved(self):
-        return {
-            r["symbol"]
-            for r in self.rows(
-                "SELECT symbol FROM trades WHERE status IN ('INTENT','OPEN','SETTLING')"
-            )
-        }
-
     def queue(self, key, text, markup=None):
         self.execute(
             "INSERT OR IGNORE INTO outbox(event_key,text,markup) VALUES (?,?,?)",
@@ -190,11 +136,6 @@ class Store:
                 (iid, scope, kind, encode(payload), time.time(), error),
             )
             symbol = payload.get("symbol")
-            if not symbol and payload.get("trade_id"):
-                trade = db.execute(
-                    "SELECT symbol FROM trades WHERE trade_id=?", (payload["trade_id"],)
-                ).fetchone()
-                symbol = trade[0] if trade else None
             text = incident_text(scope, kind, error, iid, symbol)
             markup = {"inline_keyboard": [[{"text": "🔄 重试", "callback_data": "retry:" + iid}]]}
             db.execute(

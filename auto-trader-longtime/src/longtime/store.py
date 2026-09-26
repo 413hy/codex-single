@@ -30,9 +30,6 @@ class Store:
             db.execute("PRAGMA journal_mode=WAL")
             db.executescript("""
                 CREATE TABLE IF NOT EXISTS state (key TEXT PRIMARY KEY,value TEXT NOT NULL);
-                CREATE TABLE IF NOT EXISTS cycles (
-                    cycle_id TEXT PRIMARY KEY,started_at REAL NOT NULL,completed_at REAL,
-                    status TEXT NOT NULL,details TEXT NOT NULL DEFAULT '{}');
                 CREATE TABLE IF NOT EXISTS signals (
                     signal_id TEXT PRIMARY KEY,cycle_id TEXT NOT NULL,symbol TEXT NOT NULL,
                     status TEXT NOT NULL,side TEXT,analysis TEXT,evidence TEXT NOT NULL,
@@ -102,14 +99,6 @@ class Store:
         self.execute(
             "INSERT INTO events(created_at,kind,payload) VALUES (?,?,?)",
             (time.time(), kind, encode(payload)),
-        )
-
-    def claim_cycle(self, cycle_id):
-        return bool(
-            self.execute(
-                "INSERT OR IGNORE INTO cycles(cycle_id,started_at,status) VALUES (?,?,'RUNNING')",
-                (cycle_id, time.time()),
-            )
         )
 
     def signal(self, signal_id, cycle_id, symbol, evidence):

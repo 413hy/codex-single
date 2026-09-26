@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from datetime import datetime
 from decimal import Decimal
-from enum import StrEnum
 from typing import Annotated, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints, model_validator
@@ -45,28 +44,3 @@ class Candle(ContractModel):
         if self.low > self.high:
             raise ValueError("low cannot exceed high")
         return self
-
-
-class CandidateRiskTag(StrEnum):
-    THIN_LIQUIDITY = "THIN_LIQUIDITY"
-    CHOPPY = "CHOPPY"
-    IMPACT_EXTENDED = "IMPACT_EXTENDED"
-    DATA_DEGRADED = "DATA_DEGRADED"
-
-
-class ScannerConfig(BaseModel):
-    preselect_limit: int = Field(default=60, ge=5, le=200)
-    candle_limit: int = Field(default=72, ge=49, le=300)
-    request_concurrency: int = Field(default=8, ge=1, le=20)
-    minimum_24h_turnover_usdt: float = Field(default=1_500_000, ge=0)
-    minimum_recent_30m_turnover_usdt: float = Field(default=50_000, ge=0)
-    maximum_spread_bps: float = Field(default=25, gt=0, le=500)
-    minimum_completed_candles: int = Field(default=48, ge=24, le=200)
-    maximum_missing_intervals: int = Field(default=2, ge=0, le=12)
-    minimum_median_range_percent: float = Field(default=0.15, ge=0, le=100)
-    minimum_max_return_percent: float = Field(default=0.35, ge=0, le=100)
-    depth_check_limit: int = Field(default=20, ge=5, le=60)
-    thin_depth_notional_usdt: float = Field(default=5_000, ge=0)
-    choppy_overlap_ratio: float = Field(default=0.72, ge=0, le=1)
-    impact_extension_atr: float = Field(default=2.5, gt=0, le=20)
-    minimum_tradability_score: float = Field(default=60, ge=0, le=100)

@@ -59,7 +59,7 @@ async def test_timeout_retry_waits_for_lingering_server_request(tmp_path, clock)
         assert attempts[1] - (attempts[0] + 60) >= RECOVERY_SECONDS
         assert bot.store.state("telegram_offset") == 17
         assert bot.store.state("entries_paused") is True
-        assert not bot.store.rows("SELECT * FROM cycles")
+        assert not bot.store.rows("SELECT name FROM sqlite_master WHERE name='cycles'")
         assert bot.store.state(STATE_KEY)["phase"] == "completed"
     finally:
         await bot.close()
@@ -269,5 +269,89 @@ async def test_total_timeout_keeps_drain_window_and_safe_diagnostic(tmp_path, mo
         with pytest.raises(TelegramAPIError, match="TimeoutError"):
             await bot.poll()
         assert bot.store.state(STATE_KEY)["phase"] == "uncertain"
+    finally:
+        await bot.close()
+
+
+@pytest.mark.parametrize("retry_after", [180, None, -1, "10", True])
+async def test_rate_limit_shared_cooldown_survives_restart(tmp_path, clock, retry_after):
+    from longtime.telegram import RATE_LIMIT_KEY
+
+    calls = []
+    settings = Settings(_env_file=None, telegram_token="rate-test")
+    store = Store(tmp_path / "db")
+
+    async def wire(request):
+        calls.append((request.url.path.rsplit("/", 1)[-1], clock[0]))
+        if len(calls) == 1:
+            return httpx.Response(
+                429,
+                json={
+                    "ok": False,
+                    "error_code": 429,
+                    "parameters": {"retry_after": retry_after},
+                    "description": "private body",
+                },
+            )
+        return httpx.Response(200, json={"ok": True, "result": []})
+
+    bot = Telegram(settings, store, httpx.AsyncClient(transport=httpx.MockTransport(wire)))
+    try:
+        with pytest.raises(TelegramAPIError) as error:
+            await bot.poll()
+        assert error.value.transient and "private" not in str(error.value)
+        expected = 180 if retry_after == 180 else 60
+        assert store.state(RATE_LIMIT_KEY) == 1000 + expected
+        store.queue("test", "message")
+        await bot.deliver()
+        assert store.rows("SELECT attempts FROM outbox WHERE event_key='test'")[0]["attempts"] == 0
+        assert len(calls) == 1
+        await bot.close()
+        bot = Telegram(
+            settings, Store(store.path), httpx.AsyncClient(transport=httpx.MockTransport(wire))
+        )
+        await bot.call("getMe")
+        assert calls[-1][1] >= 1000 + expected
+        await bot.poll()
+        assert store.state(STATE_KEY)["phase"] == "completed"
+        assert store.state("telegram_offset", 0) == 0
+    finally:
+        await bot.close()
+
+
+async def test_delivery_429_preserves_two_attempt_budget_and_defers_queue(tmp_path, clock):
+    from longtime.telegram import RATE_LIMIT_KEY
+
+    calls = []
+
+    async def wire(request):
+        calls.append(clock[0])
+        return httpx.Response(
+            429, json={"ok": False, "error_code": 429, "parameters": {"retry_after": 180}}
+        )
+
+    store = Store(tmp_path / "db")
+    bot = Telegram(
+        Settings(_env_file=None), store, httpx.AsyncClient(transport=httpx.MockTransport(wire))
+    )
+    store.queue("alert:first", "one")
+    store.queue("alert:second", "two")
+    try:
+        await bot.deliver()
+        assert len(calls) == 1
+        rows = store.rows("SELECT * FROM outbox ORDER BY rowid")
+        assert rows[0]["attempts"] == 1 and rows[0]["next_attempt"] == 1180
+        assert rows[1]["attempts"] == 0
+        clock[0] = store.state(RATE_LIMIT_KEY)
+        await bot.deliver()
+        assert len(calls) == 2
+        assert (
+            store.rows("SELECT status FROM outbox WHERE event_key='alert:first'")[0]["status"]
+            == "FAILED"
+        )
+        assert (
+            store.rows("SELECT attempts FROM outbox WHERE event_key='alert:second'")[0]["attempts"]
+            == 0
+        )
     finally:
         await bot.close()

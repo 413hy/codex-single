@@ -19,14 +19,14 @@
 
 ## 修改前
 
-- 阅读README.md、docs/OPERATING_RULES.md及所修改模块对应测试。模块来源见docs/REUSE.md，真实测试证据见docs/ACCEPTANCE.md。
+- 阅读 README.md、docs/OPERATING_RULES.md 及所修改模块对应测试；当前三系统验收和现场审计见 /root/single-analysis/docs/refactor-20260926/。
 - 不修改或重启其他交易项目；复用通过本项目适配层和vendor代码完成。
 - 不读取输出、提交或在日志中暴露.env、Bot Token、API Secret和Codex认证文件。
 
 ## 代码边界
 
 - 私有接口只允许Bybit Demo；不能静默改为正式盘或Testnet。
-- 选币参考信号系统：前10候选采集、6份有效证据横向复核，筛选模型最多选0—3个；仅入选币进入方向模型，不凑数或递补。两层均严格Schema；资金、杠杆、数量、订单、TP/SL完全由程序决定。
+- 本系统不选币、不调用模型；仅消费共享 signals.db 的有效方向信号。资金、杠杆、数量、订单、TP/SL 完全由程序决定。
 - Decimal处理金额、价格、数量，按交易所精度舍入；杠杆不得超过5x，保留资金边界。
 - 下单前持久化意图；响应不确定先按原ID核对，不直接重新开仓。
 - 已有仓位退出策略分析。禁止增加主动平仓、反手、加减仓、移动TP/SL或持仓时间限制。

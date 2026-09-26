@@ -19,13 +19,14 @@ from longtime.polling import STATE_KEY, PollingGuard
 from longtime.trading_settings import EntryDefaults
 
 log = logging.getLogger(__name__)
+RATE_LIMIT_KEY = "telegram_rate_limit_until"
 
 
 def main_keyboard(paused):
     return {
         "keyboard": [
             ["📊 当前持仓", "🧭 运行状态"],
-            ["🧾 最近交易", "▶️ 恢复开仓" if paused else "⏸️ 暂停开仓"],
+            ["📥 最近开仓结果", "▶️ 恢复开仓" if paused else "⏸️ 暂停开仓"],
             ["⚠️ 最近异常", "⚙️ 开仓设置"],
         ],
         "resize_keyboard": True,
@@ -42,7 +43,13 @@ def local_time(value):
 
 
 def direction(value):
-    return {"LONG": "做多", "SHORT": "做空", "Buy": "做多", "Sell": "做空"}.get(value, value)
+    return {
+        "LONG": "做多",
+        "SHORT": "做空",
+        "SKIP": "观望",
+        "Buy": "做多",
+        "Sell": "做空",
+    }.get(value, value)
 
 
 class TelegramAPIError(RuntimeError):
@@ -68,6 +75,17 @@ class Telegram:
         self._poll_failures = 0
 
     async def call(self, method, payload=None):
+        # Shared durable cooldown: a poll rejection must also stop notification
+        # requests. Sleep in cancellable chunks without consuming retry budgets.
+        while self.store:
+            try:
+                delay = self.store.state(RATE_LIMIT_KEY, 0) - time.time()
+            except sqlite3.Error:
+                # The independent emergency channel must work without SQLite.
+                break
+            if delay <= 0:
+                break
+            await asyncio.sleep(min(delay, 30))
         if method != "getUpdates":
             return await self._call(method, payload)
         try:
@@ -112,7 +130,36 @@ class Telegram:
                 raise TelegramAPIError(
                     f"Telegram {method} rejected (HTTP {r.status_code})", transient=True
                 )
-            d = r.json()
+            try:
+                d = r.json()
+            except ValueError:
+                if r.status_code != 429:
+                    raise
+                d = {}
+            if r.status_code == 429 or d.get("error_code") == 429:
+                parameters = d.get("parameters")
+                retry_after = (
+                    parameters.get("retry_after") if isinstance(parameters, dict) else None
+                )
+                # Missing/malformed server guidance never becomes a tight retry loop.
+                seconds = retry_after if type(retry_after) is int and retry_after > 0 else 60
+                if self.store:
+                    self.store.set(
+                        RATE_LIMIT_KEY,
+                        max(self.store.state(RATE_LIMIT_KEY, 0), time.time() + seconds),
+                    )
+                    self.store.event(
+                        "TELEGRAM_RATE_LIMIT",
+                        {
+                            "method": method,
+                            "retry_after": seconds,
+                            "server_retry_after": seconds == retry_after,
+                        },
+                    )
+                raise TelegramAPIError(
+                    f"Telegram {method} rate limited (429, retry_after={seconds}s)",
+                    transient=True,
+                )
             if r.status_code >= 400 or d.get("ok") is not True:
                 raise TelegramAPIError(
                     f"Telegram {method} rejected (HTTP {r.status_code}, code {d.get('error_code')})"
@@ -163,11 +210,18 @@ class Telegram:
             await self._deliver()
 
     async def _deliver(self):
+        try:
+            if self.store.state(RATE_LIMIT_KEY, 0) > time.time():
+                return
+        except sqlite3.Error:
+            pass  # Deliver the independent database emergency notice first.
         await self.deliver_emergency()
         for row in self.store.rows(
             "SELECT * FROM outbox WHERE status='PENDING' AND next_attempt<=? ORDER BY rowid LIMIT 10",
             (time.time(),),
         ):
+            if self.store.state(RATE_LIMIT_KEY, 0) > time.time():
+                break
             if row["attempts"] >= 2:
                 # A process may stop after submitting but before persisting the reply.
                 # The already-consumed automatic budget must survive that restart.
@@ -212,12 +266,16 @@ class Telegram:
                     "UPDATE outbox SET attempts=?,next_attempt=?,status=? WHERE event_key=?",
                     (
                         attempt,
-                        time.time() + 30,
+                        max(time.time() + 30, self.store.state(RATE_LIMIT_KEY, 0)),
                         "FAILED" if attempt >= 2 else "PENDING",
                         row["event_key"],
                     ),
                 )
-                log.error("Telegram delivery failed: %s", type(error).__name__)
+                log.error(
+                    "Telegram delivery failed event=%s: %s",
+                    row["event_key"],
+                    str(error) if isinstance(error, TelegramAPIError) else type(error).__name__,
+                )
                 # Delivery failure cannot reliably alert through the same failed transport.
                 # Persist a single incident for recovery; avoid an alert-of-alert loop.
                 if not row["event_key"].startswith("alert:"):
@@ -308,6 +366,7 @@ class Telegram:
         command = {
             "📊 当前持仓": "/positions",
             "🧭 运行状态": "/status",
+            "📥 最近开仓结果": "/entry_results",
             "🧾 最近交易": "/history",
             "🧠 最近分析": "/analysis",
             "▶️ 恢复开仓": "/resume",
@@ -351,6 +410,8 @@ class Telegram:
             text = self.positions_text()
         elif command == "/analysis":
             text = self.analysis_text()
+        elif command == "/entry_results":
+            text = self.entry_results_text()
         elif command == "/alerts":
             rows = self.store.rows(
                 "SELECT * FROM incidents WHERE status IN ('OPEN','RUNNING') ORDER BY created_at DESC LIMIT 5"
@@ -383,8 +444,8 @@ class Telegram:
         elif command in ("/strategy", "/help"):
             text = (
                 "⚙️ 交易执行系统 · Bybit Demo\n"
-                "等待single-analysis信号，发布后60秒有效；重复或过期信号不执行。\n"
-                "保留资金、精度、杠杆和止盈可达性检查。\n"
+                "等待single-analysis信号，发布后10分钟有效；重复或过期信号不执行。\n"
+                "保留资金、精度和杠杆检查；暂不使用止盈可达性过滤。\n"
                 "按接收方向开仓，设置原策略止盈止损；持仓后由交易所执行退出。\n"
                 "分析与频率设置请使用分析Bot。\n\n" + EntryDefaults.load(self.store).description()
             )
@@ -463,6 +524,67 @@ class Telegram:
 
     def analysis_text(self):
         return "选币、方向分析、分析异常和频率设置已迁移至独立分析Bot。"
+
+    def entry_results_text(self):
+        latest = self.store.rows(
+            "SELECT cycle_id,MAX(created_at) latest FROM signals "
+            "GROUP BY cycle_id ORDER BY latest DESC LIMIT 1"
+        )
+        if not latest:
+            return "📥 最近一轮分析开仓结果\n\n暂无收到的分析方向信号。"
+        rows = self.store.rows(
+            "SELECT * FROM signals WHERE cycle_id=? ORDER BY created_at,signal_id",
+            (latest[0]["cycle_id"],),
+        )
+        evidence = json.loads(rows[0]["evidence"])
+        analyzed_at = evidence.get("analysis_started_at", evidence.get("published_at"))
+        lines = [
+            "📥 最近一轮分析开仓结果",
+            "🕒 分析时间："
+            + (local_time(analyzed_at) + "（北京时间）" if analyzed_at else "时间未记录"),
+            f"📡 本系统共收到 {len(rows)} 条方向信号",
+        ]
+        labels = {
+            "SELECTED": "⏳ 已接收，正在处理",
+            "OPEN": "✅ 开仓成功",
+            "HEDGE_DIRECTION_APPLIED": "✅ 双仓判向已执行",
+            "SKIP_MODEL": "⏭️ 分析结论为观望，未开仓",
+            "SKIP_EXISTING_POSITION": "⏭️ 已有该币仓位，未重复开仓",
+            "SKIP_EXISTING_ORDERS": "⏭️ 已有该币在途订单，未开仓",
+            "SKIP_TP_UNREACHABLE": "⏭️ 止盈可达性未通过，未开仓",
+            "SKIP_PAUSED": "⏸️ 当时已暂停新开仓",
+            "SKIP_SIGNAL_EXPIRED": "⏭️ 信号处理前已过期",
+            "SKIP_CYCLE_ENDED": "⏭️ 下单前信号已过期",
+            "SKIP_SETTINGS_CHANGED": "⏭️ 处理期间开仓设置已变化",
+            "SKIP_NOT_NORMAL_CANDIDATE": "⏭️ 仅供双仓复核，不是普通开仓候选",
+            "SKIP_HEDGE_GENERATION": "⏭️ 双仓轮次已变化，未执行旧信号",
+            "STOP_INSUFFICIENT_MARGIN": "⛔ 可用资金不足，未开仓",
+            "DRY_RUN_ELIGIBLE": "🔎 只读验证通过，未提交订单",
+            "UNFILLED": "❌ 已提交但未成交",
+            "INTERRUPTED": "⚠️ 处理被中断，旧信号不会重放",
+            "ERROR": "⚠️ 处理异常，未确认开仓成功",
+        }
+        for index, row in enumerate(rows, 1):
+            item = json.loads(row["evidence"])
+            analyzed_side = direction(item.get("decision", row["side"] or "SKIP"))
+            kind = " · 双仓复核" if item.get("hedge") else ""
+            result = labels.get(row["status"], "⏳ 状态正在核对")
+            trade = self.store.rows(
+                "SELECT entry_price,qty FROM trades WHERE signal_id=? "
+                "ORDER BY COALESCE(opened_at,0) DESC LIMIT 1",
+                (row["signal_id"],),
+            )
+            if row["status"] == "OPEN" and trade:
+                details = trade[0]
+                filled = []
+                if details["entry_price"]:
+                    filled.append("成交价 " + details["entry_price"])
+                if details["qty"]:
+                    filled.append("数量 " + details["qty"])
+                if filled:
+                    result += " · " + " · ".join(filled)
+            lines += ["", f"{index}. {row['symbol']} · {analyzed_side}{kind}", result]
+        return "\n".join(lines)
 
     async def run_retry(self, iid, callback_id, retry):
         rows = self.store.rows("SELECT * FROM incidents WHERE incident_id=?", (iid,))

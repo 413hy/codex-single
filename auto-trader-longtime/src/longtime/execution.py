@@ -9,7 +9,7 @@ from decimal import Decimal as D
 
 from longtime import emergency
 from longtime.exchange import LIVE, TERMINAL
-from longtime.risk import RESERVE, SLIPPAGE, number, reachable_tp, sl_price, tp_price
+from longtime.risk import RESERVE, SLIPPAGE, number, sl_price, tp_price
 from longtime.store import encode, identity
 from longtime.trading_settings import EntryDefaults
 from longtime.transport import BybitAPIError
@@ -64,38 +64,13 @@ class Executor:
                 return "SKIP_EXISTING_POSITION"
             instrument = await self.exchange.instrument(symbol)
             taker, maker = await self.exchange.fees(symbol)
-            candles = await self.markets.reachability(symbol)
             bid, ask = await self.exchange.quote(symbol)
             price = ask if side == "LONG" else bid
             defaults = EntryDefaults.load(self.store)
             qty, leverage, margin = instrument.size(
                 price, margin_target=defaults.margin, leverage_target=defaults.leverage
             )
-            target = reachable_tp(
-                side,
-                price,
-                qty,
-                instrument,
-                taker,
-                maker,
-                ask - bid,
-                candles,
-                targets=(defaults.tp,),
-            )
-            self.store.event(
-                "TP_REACHABILITY",
-                {
-                    "signal_id": signal_id,
-                    "target": target,
-                    "quote": [str(bid), str(ask)],
-                    "candles": [c.model_dump(mode="json") for c in candles],
-                    "taker_fee_rate": str(taker),
-                    "maker_fee_rate": str(maker),
-                },
-            )
-            if target is None:
-                self.store.signal_result(signal_id, "SKIP_TP_UNREACHABLE")
-                return "SKIP_TP_UNREACHABLE"
+            target = {"target": str(defaults.tp)}
             # Full account and positions re-read immediately before each new order.
             account = await self.exchange.account()
             positions = await self.exchange.active_positions()

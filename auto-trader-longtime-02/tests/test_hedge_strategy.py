@@ -196,28 +196,35 @@ async def test_skip_direction_leaves_locked_pair(hedge):
     assert result == "SKIP_MODEL" and len(ex.submissions) == before
 
 
-async def test_unreachable_direction_does_not_close_reverse(hedge):
+async def test_direction_proceeds_without_tp_reachability_history(hedge):
     e, store, ex, g, link = hedge
     ex.fill(link, ex.orders[link]["qty"])
     await e.hedge.tick()
 
-    async def no_candles(symbol):
-        return []
+    async def unavailable_history(symbol):
+        raise AssertionError("TP reachability history must not be requested")
 
-    e.markets.reachability = no_candles
+    e.markets.reachability = unavailable_history
     before = len(ex.submissions)
     result = await e.hedge.decide(
         g["group_id"], "review", Decision(symbol="TESTUSDT", decision="LONG", reason="test")
     )
-    assert result == "SKIP_TP_UNREACHABLE"
-    assert len(ex.submissions) == before
+    assert result == "HEDGE_DIRECTION_APPLIED"
+    assert len(ex.submissions) == before + 3
 
 
 @pytest.mark.parametrize("side", ["LONG", "SHORT"])
-async def test_direction_closes_loser_rebases_and_arms_next_hedge(hedge, side):
+async def test_direction_closes_loser_and_prices_both_orders_from_review_quote(hedge, side):
     e, store, ex, g, link = hedge
+    original = store.trade(g["active"])
+    original_tp = D(original["tp_price"])
     ex.fill(link, ex.orders[link]["qty"])
     await e.hedge.tick()
+
+    async def moved_quote(symbol):
+        return D(120), D(121)
+
+    ex.quote = moved_quote
     before = len(ex.submissions)
     decision = Decision(symbol="TESTUSDT", decision=side, reason="test")
     result = await e.hedge.decide(g["group_id"], "review", decision)
@@ -231,13 +238,81 @@ async def test_direction_closes_loser_rebases_and_arms_next_hedge(hedge, side):
     assert len(submitted) == 3
     assert submitted[1]["reduceOnly"] is True and submitted[1]["orderType"] == "Limit"
     assert submitted[2]["reduceOnly"] is False and submitted[2]["orderType"] == "Limit"
-    reference = D(new["reference"])
+    reference = D(121 if side == "LONG" else 120)
     qty = D(active["qty"])
-    pnl_distance = (D(active["tp_price"]) - reference) * qty * (1 if side == "LONG" else -1)
-    assert D(".5") <= pnl_distance <= D(".5") + D(".01") * qty
+    tick = D(json.loads(active["details"])["tick"])
+    expected_tp = distance_price(
+        side, reference, qty, D(active["tp_target_net_pnl"]), tick, favorable=True
+    )
+    expected_hedge = distance_price(side, reference, qty, D("1.7"), tick, favorable=False)
+    assert D(new["reference"]) == reference
+    assert D(new["tp"]) == expected_tp
+    assert D(active["tp_price"]) == expected_tp
+    assert D(ex.submissions[before + 1]["price"]) == expected_tp
+    assert D(ex.submissions[before + 2]["price"]) == expected_hedge
+    assert ex.submissions[before + 2]["orderType"] == "Limit"
+    assert ex.submissions[before + 2]["reduceOnly"] is False
+    assert expected_tp != original_tp
     assert store.trade(new["loser"])["status"] == "SETTLING"
     await e.hedge.tick()
     assert len(ex.submissions) == before + 3
+
+
+async def test_redecision_above_original_tp_uses_new_quote(hedge):
+    e, store, ex, g, link = hedge
+    original = store.trade(g["active"])
+    initial_tp = original["tp_price"]
+    ex.fill(link, ex.orders[link]["qty"])
+    await e.hedge.tick()
+
+    async def quote(symbol):
+        return D(120), D(121)
+
+    ex.quote = quote
+    restarted = HedgeExecutor(e.settings, store, ex, e.markets)
+    result = await restarted.hedge.decide(
+        g["group_id"], "review", Decision(symbol="TESTUSDT", decision="LONG", reason="test")
+    )
+    assert result == "HEDGE_DIRECTION_APPLIED"
+    active = store.trade(g["active"])
+    assert D(active["tp_price"]) > D(121) > D(initial_tp)
+    latest_tp = store.rows(
+        "SELECT payload FROM orders WHERE trade_id=? AND kind='TP' ORDER BY created_at DESC LIMIT 1",
+        (g["active"],),
+    )[0]
+    assert D(json.loads(latest_tp["payload"])["price"]) == D(active["tp_price"])
+
+
+async def test_redecision_tp_fills_before_position_view_updates_without_orphan(hedge):
+    e, store, ex, g, link = hedge
+    ex.fill(link, ex.orders[link]["qty"])
+    await e.hedge.tick()
+    before = len(ex.submissions)
+    submit = ex.submit
+
+    async def immediate_tp_with_stale_position(payload):
+        oid = await submit(payload)
+        if payload["reduceOnly"] and payload["orderType"] == "Limit":
+            ex.orders[payload["orderLinkId"]].update(
+                orderStatus="Filled", cumExecQty=payload["qty"]
+            )
+        return oid
+
+    ex.submit = immediate_tp_with_stale_position
+    result = await e.hedge.decide(
+        g["group_id"], "review", Decision(symbol="TESTUSDT", decision="LONG", reason="test")
+    )
+    assert result == "HEDGE_DIRECTION_APPLIED"
+    current = e.hedge.get(g["group_id"])
+    assert current["phase"] == "ARMING"
+    assert len(ex.submissions[before:]) == 2
+    assert not [o for o in ex.submissions[before:] if not o["reduceOnly"]]
+    ex.position_rows = [p for p in ex.position_rows if p["positionIdx"] != 1]
+    await e.hedge.tick()
+    await e.hedge.tick()
+    current = e.hedge.get(g["group_id"])
+    assert current["phase"] == "DONE"
+    assert store.trade(current["child"])["status"] == "UNFILLED"
 
 
 async def test_ambiguous_hedge_submit_recovers_without_duplicate(tmp_path):

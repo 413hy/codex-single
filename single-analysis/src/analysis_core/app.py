@@ -25,7 +25,7 @@ class AnalysisApp:
         self.store = Store(settings.runtime_dir / "analysis.db")
         self.bus = SignalBus(settings.runtime_dir / "signals.db")
         self.markets = markets or Markets(
-            include_tradingview=settings.tradingview_enabled,
+            include_tradingview=True,
             tradingview_extra_fields=settings.tradingview_extra_fields,
         )
         self.model = model or DirectionModel(settings, self.store)
@@ -76,8 +76,10 @@ class AnalysisApp:
                                 "discovery": candidate,
                                 "tradingview": reference,
                             })
+                            self.store.resolve("TV_EVIDENCE:" + candidate["symbol"])
                         except Exception as error:
                             ok = False
+                            self.incident("TV_EVIDENCE:" + candidate["symbol"], error)
                             self.store.event("TV_EVIDENCE_FAILURE", {
                                 "cycle_id": cid, "symbol": candidate["symbol"],
                                 "error": type(error).__name__ + ": " + str(error)[:300],
@@ -100,8 +102,10 @@ class AnalysisApp:
                                 "symbol": item.symbol, "tv_initial": item.model_dump(),
                                 "tradingview": evidence["tradingview"], "bybit": evidence,
                             })
+                            self.store.resolve("BYBIT_REFINEMENT:" + item.symbol)
                         except Exception as error:
                             ok = False
+                            self.incident("BYBIT_REFINEMENT:" + item.symbol, error)
                             self.store.event("BYBIT_REFINEMENT_FAILURE", {
                                 "cycle_id": cid, "symbol": item.symbol,
                                 "error": type(error).__name__ + ": " + str(error)[:300],
@@ -143,6 +147,9 @@ class AnalysisApp:
                     if not self.store.signal(sid, cid, symbol, candidate):
                         continue
                     try:
+                        age = time.time() - datetime.fromisoformat(context["observed_at"]).timestamp()
+                        if not -5 <= age <= 600:
+                            raise ValueError("Bybit方向证据在发布时已过期或时间异常")
                         decision = final_decision(item)
                         payload = self.bus.publish(
                             sid, decision, cycle_id=cid, analysis_started_at=now,
@@ -190,8 +197,8 @@ class AnalysisApp:
                         self.store.execute("UPDATE signals SET evidence=? WHERE signal_id=?",
                                            (encode(context), sid))
                         age = time.time() - datetime.fromisoformat(context["observed_at"]).timestamp()
-                        if age < -5:
-                            raise ValueError("方向分析行情时间在未来")
+                        if not -5 <= age <= 600:
+                            raise ValueError("Bybit方向证据在发布时已过期或时间异常")
                         decision = await self.model.decide(sid, context)
                         payload = self.bus.publish(
                             sid, decision, cycle_id=cid, analysis_started_at=now,
@@ -219,7 +226,7 @@ class AnalysisApp:
                 raise
             except Exception as error:
                 ok = False
-                self.incident("SNIFFER", error)
+                self.incident("CYCLE", error)
                 return False
             finally:
                 self.store.execute(
@@ -229,6 +236,10 @@ class AnalysisApp:
                         time.time(),
                         cid,
                     ),
+                )
+                self.store.execute(
+                    "UPDATE signals SET status='INTERRUPTED' "
+                    "WHERE cycle_id=? AND status='SELECTED'", (cid,),
                 )
                 if cid.startswith("scheduled:"):
                     reset_schedule(self.store, time.time(), only_overdue=True)
@@ -257,6 +268,10 @@ async def run(settings, mode):
         app.store.execute(
             "UPDATE cycles SET status='INTERRUPTED',completed_at=? WHERE status='RUNNING'",
             (time.time(),),
+        )
+        app.store.execute(
+            "UPDATE signals SET status='INTERRUPTED' WHERE status='SELECTED' "
+            "AND cycle_id IN (SELECT cycle_id FROM cycles WHERE status='INTERRUPTED')"
         )
 
         # Startup skips downtime slots and migrates old start-relative schedules.

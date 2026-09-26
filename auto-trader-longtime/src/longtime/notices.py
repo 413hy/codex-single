@@ -70,6 +70,9 @@ def incident_text(scope, kind, error, incident_id, symbol=None):
             cause = "Telegram连接超时、中断或服务暂不可用。"
         impact = "Bot指令可能延迟；此错误不代表交易所仓位或保护单异常。"
         action = "系统会继续接收，连续正常5分钟后解除；也可点击按钮检查状态。"
+        if "429" in error:
+            cause = "Telegram返回429限流，系统正在遵守服务端要求的等待时间。"
+            action = "等待时间到后自动恢复接收；无需反复点击重试。"
     elif category in ("SCAN_DATA", "CANDIDATE", "CYCLE", "MODEL"):
         title = "本轮分析未完成"
         cause = (

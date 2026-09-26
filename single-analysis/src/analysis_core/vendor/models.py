@@ -31,7 +31,7 @@ class Candle(ContractModel):
     volume: Decimal = Field(ge=0)
     turnover: Decimal = Field(ge=0)
     completed: bool
-    source: Literal["BYBIT", "BINANCE", "OKX"]
+    source: Literal["BYBIT"]
 
     @model_validator(mode="after")
     def validate_candle(self) -> Candle:

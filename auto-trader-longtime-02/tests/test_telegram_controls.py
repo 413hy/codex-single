@@ -5,7 +5,7 @@ import pytest
 
 from longtime.config import Settings
 from longtime.store import Store
-from longtime.telegram import Telegram
+from longtime.telegram import Telegram, main_keyboard
 
 
 @pytest.mark.parametrize("user,chat", [(1, 20), (10, 2)])
@@ -46,7 +46,7 @@ async def test_keyboard_pause_resume_delivery_and_views(tmp_path):
                 "▶️ 恢复开仓",
                 "📊 当前持仓",
                 "🧭 运行状态",
-                "🧾 最近交易",
+                "📥 最近开仓结果",
                 "🧠 最近分析",
                 "⚠️ 异常处理",
                 "⚙️ 策略说明",
@@ -65,6 +65,55 @@ async def test_keyboard_pause_resume_delivery_and_views(tmp_path):
                 assert s.state("entries_paused") is False
                 assert "⏸️ 暂停开仓" in str(sent[-1]["reply_markup"])
         assert len(sent) == 8
+    finally:
+        await bot.close()
+
+
+async def test_latest_analysis_entry_results_are_grouped_by_exact_cycle(tmp_path):
+    s = Store(tmp_path / "db")
+    bot = Telegram(Settings(_env_file=None), s)
+    try:
+        old = {
+            "version": 1,
+            "decision": "LONG",
+            "published_at": 1_700_000_000.0,
+        }
+        s.signal("feed:old", "legacy", "OLDUSDT", old)
+        s.signal_result("feed:old", "OPEN", "LONG")
+        base = {
+            "version": 2,
+            "cycle_id": "latest-cycle",
+            "analysis_started_at": 1_780_000_000.0,
+            "published_at": 1_780_000_010.0,
+            "normal_candidate": True,
+            "hedge": None,
+        }
+        s.signal("feed:btc", "latest-cycle", "BTCUSDT", {**base, "decision": "LONG"})
+        s.signal_result("feed:btc", "OPEN", "LONG")
+        s.insert_trade(
+            {
+                "trade_id": "trade-btc",
+                "signal_id": "feed:btc",
+                "symbol": "BTCUSDT",
+                "side": "LONG",
+                "position_idx": 1,
+                "status": "OPEN",
+                "entry_price": "65000",
+                "qty": "0.001",
+                "details": "{}",
+            }
+        )
+        s.signal("feed:eth", "latest-cycle", "ETHUSDT", {**base, "decision": "SHORT"})
+        s.signal_result("feed:eth", "SKIP_TP_UNREACHABLE", "SHORT")
+
+        text = bot.entry_results_text()
+        assert "最近一轮分析开仓结果" in text and "分析时间" in text
+        assert "共收到 2 条方向信号" in text
+        assert "BTCUSDT · 做多" in text and "开仓成功" in text
+        assert "成交价 65000 · 数量 0.001" in text
+        assert "ETHUSDT · 做空" in text and "止盈可达性未通过" in text
+        assert "OLDUSDT" not in text
+        assert "📥 最近开仓结果" in str(main_keyboard(False))
     finally:
         await bot.close()
 
@@ -109,7 +158,7 @@ async def test_navigation_inline_edit_and_restart_preserve_reply_keyboard(tmp_pa
     bot = make_bot()
     try:
         for i, text in enumerate(
-            ["/start", "📊 当前持仓", "🧭 运行状态", "🧾 最近交易", "⏸️ 暂停开仓", "/strategy"]
+            ["/start", "📊 当前持仓", "🧭 运行状态", "📥 最近开仓结果", "⏸️ 暂停开仓", "/strategy"]
         ):
             await bot.handle(
                 {"update_id": i, "message": {"from": {"id": 10}, "chat": {"id": 20}, "text": text}},

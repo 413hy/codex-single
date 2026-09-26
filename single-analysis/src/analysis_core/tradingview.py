@@ -273,10 +273,23 @@ def normalize(raw: dict, symbol: str, fetched: float, extra_fields: tuple[str, .
             "Ratings are correlated technical summaries, not probabilities or directions.",
             "Pivot.M.* are provider pivot labels, not measured volume-profile support.",
             "No 3m/10m, historical indicator series, private Pine, news or footprint in this source.",
-            "4h/1d only background; original weekly 15m/30m/1h/2h structure remains primary.",
+            "15m/30m/1h support the next 1-2h question; 2h, 4h, 1d and available weekly structure are background.",
             "Context metrics are same-contract website snapshots; absent/null is not zero.",
         ],
     }
+
+
+def require_recent_core(result: dict) -> None:
+    """A short-horizon direction needs populated, recent TradingView core bars."""
+    fetched = datetime.fromisoformat(result["fetched_at"])
+    for timeframe, minutes in (("15m", 15), ("30m", 30), ("1h", 60)):
+        period = result["periods"][timeframe]
+        opened = period["bar_open_at"]
+        if not period["ohlcv_complete"] or opened is None:
+            raise TradingViewError("TradingView core direction fields unavailable: " + timeframe)
+        age = (fetched - datetime.fromisoformat(opened)).total_seconds()
+        if not -5 <= age <= minutes * 120:
+            raise TradingViewError("TradingView core direction bar is stale: " + timeframe)
 
 
 class TradingViewWeb:
@@ -421,6 +434,7 @@ class TradingViewWeb:
                 "http_age": response.headers.get("age"),
             })
         result = normalize(raw, symbol, time.time(), self.extra_fields)
+        require_recent_core(result)
         result["provenance"] = {
             "page_url": page_url, "page_sha256": hashlib.sha256(page.content).hexdigest(),
             "requests": requests, "raw_fields": raw,

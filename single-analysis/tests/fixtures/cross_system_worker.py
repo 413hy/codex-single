@@ -1,4 +1,5 @@
 """Isolated real consumer/executor/ledger; only exchange and markets are fixtures."""
+# ruff: noqa: E402, I001
 import asyncio
 import json
 import sys

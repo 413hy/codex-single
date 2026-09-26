@@ -3,8 +3,8 @@ from pathlib import Path
 from pydantic import Field, SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-SCREENING_MODEL = "gpt-5.6-terra"
-SCREENING_REASONING = "medium"
+TV_SELECTION_MODEL = "gpt-5.6-terra"
+TV_SELECTION_REASONING = "medium"
 DIRECTION_MODEL = "gpt-6-sol"
 DIRECTION_REASONING = "medium"
 
@@ -14,7 +14,6 @@ class Settings(BaseSettings):
     telegram_token: SecretStr = SecretStr("")
     telegram_chat_id: int = 0
     telegram_user_id: int = 0
-    tradingview_enabled: bool = True
     tradingview_extra_fields: str = ""
     codex_bin: str = "/root/.local/bin/codex"
     runtime_dir: Path = Path("runtime")

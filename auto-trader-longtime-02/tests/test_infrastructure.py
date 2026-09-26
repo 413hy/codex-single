@@ -7,7 +7,7 @@ import pytest
 
 from longtime.config import Settings
 from longtime.exchange import Exchange
-from longtime.service import ProcessLock, cycle_id
+from longtime.service import ProcessLock
 from longtime.store import Store
 from longtime.telegram import Telegram
 from longtime.transport import DemoTransport
@@ -83,16 +83,11 @@ async def test_private_pagination_and_repeat_cursor_rejected():
     await ex.close()
 
 
-def test_cycle_claim_and_process_lock_survive_multiple_instances(tmp_path):
-    store = Store(tmp_path / "test.db")
-    assert store.claim_cycle("10")
-    assert not Store(store.path).claim_cycle("10")
+def test_process_lock_survives_multiple_instances(tmp_path):
     lock = ProcessLock(tmp_path / "lock")
     with pytest.raises(RuntimeError, match="Another"):
         ProcessLock(tmp_path / "lock")
     lock.close()
-    assert cycle_id(1200) == cycle_id(2399) == "1"
-    assert cycle_id(2400) == "2"
 
 
 def test_incident_dedup_and_callback_claim_are_durable(tmp_path):
@@ -241,3 +236,65 @@ async def test_callback_ack_failure_does_not_strand_retry(tmp_path):
     assert seen == [1]
     assert store.rows("SELECT status FROM incidents")[0]["status"] == "RESOLVED"
     await bot.close()
+
+
+@pytest.mark.parametrize('fault', ['timeout', 'json', 'gateway'])
+async def test_private_read_recovers_once_with_fresh_signature(fault, monkeypatch):
+    from longtime import transport
+
+    stamps = iter([1000, 2000])
+    monkeypatch.setattr(transport, '_local_ms', lambda: next(stamps))
+    seen = []
+
+    async def handler(request):
+        seen.append(request)
+        if len(seen) == 1:
+            if fault == 'timeout':
+                raise httpx.ReadTimeout('secret must not appear', request=request)
+            if fault == 'json':
+                return httpx.Response(502, text='secret gateway body')
+            return httpx.Response(503, json={'retCode': 0})
+        return httpx.Response(200, json={'retCode': 0, 'result': {'list': []}})
+
+    client = httpx.AsyncClient(base_url='https://api-demo.bybit.com',
+                              transport=httpx.MockTransport(handler))
+    ex = Exchange(Settings(_env_file=None), client)
+    assert await ex.active_positions() == []
+    assert [r.headers['X-BAPI-TIMESTAMP'] for r in seen] == ['1000', '2000']
+    await ex.close()
+
+
+@pytest.mark.parametrize('method,code,expected', [('GET', -1, 2), ('POST', -1, 1),
+                                                  ('GET', 10003, 1)])
+async def test_private_retry_is_bounded_and_never_repeats_mutations(method, code, expected):
+    from longtime.transport import BybitAPIError
+
+    calls = []
+
+    async def handler(request):
+        calls.append(request)
+        if code == -1:
+            raise httpx.ReadTimeout('secret must not appear', request=request)
+        return httpx.Response(200, json={'retCode': code, 'retMsg': 'invalid key'})
+
+    client = httpx.AsyncClient(base_url='https://api-demo.bybit.com',
+                              transport=httpx.MockTransport(handler))
+    ex = Exchange(Settings(_env_file=None, trading_enabled=True), client)
+    with pytest.raises(BybitAPIError) as caught:
+        await ex._private(method, '/v5/position/list')
+    assert len(calls) == expected
+    assert 'secret' not in str(caught.value)
+    if code == -1:
+        assert 'ReadTimeout' in str(caught.value)
+        assert not caught.value.definitive_rejection
+    await ex.close()
+
+
+def test_monitor_notice_identifies_exchange_read_failure():
+    from longtime.notices import incident_text
+
+    text = incident_text('MONITOR', 'monitor',
+                         'Bybit GET /v5/position/list failed: -1 network ReadTimeout', 'abcdef12')
+    assert 'ReadTimeout' in text
+    assert '自动继续核对' in text
+    assert '不代表保护单已失效' in text

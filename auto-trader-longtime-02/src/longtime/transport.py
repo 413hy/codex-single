@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import hmac
 import json
+import logging
 import time
 from typing import Any, cast
 from urllib.parse import urlencode
@@ -12,6 +14,8 @@ from urllib.parse import urlencode
 import httpx
 
 from longtime.config import DEMO_URL
+
+log = logging.getLogger(__name__)
 
 
 class BybitAPIError(RuntimeError):
@@ -52,13 +56,14 @@ class DemoTransport:
     async def _public(
         self, method: str, path: str, params: dict[str, Any] | None = None
     ) -> dict[str, Any]:
+        response = None
         try:
             response = await self._client.request(method, path, params=params)
             document = response.json()
         except (httpx.HTTPError, ValueError) as error:
             raise BybitAPIError(
                 -1,
-                "network or invalid JSON response",
+                _response_error(error, response),
                 method=method,
                 path=path,
                 definitive_rejection=False,
@@ -66,6 +71,21 @@ class DemoTransport:
         return _validate_document(document, response.status_code, method=method, path=path)
 
     async def _private(
+        self, method: str, path: str, params: dict[str, Any] | None = None
+    ) -> dict[str, Any]:
+        # Retry only read transport failures. Mutations keep their original durable budget.
+        for attempt in range(2):
+            try:
+                return await self._private_once(method, path, params)
+            except BybitAPIError as error:
+                transient = error.code == -1 or error.code in (502, 503, 504)
+                if method != "GET" or not transient or error.definitive_rejection or attempt:
+                    raise
+                log.warning("Bybit read retry 1/1: %s", error)
+                await asyncio.sleep(0.5)
+        raise AssertionError("unreachable")
+
+    async def _private_once(
         self, method: str, path: str, params: dict[str, Any] | None = None
     ) -> dict[str, Any]:
         if not path.startswith("/v5/") or "://" in path:
@@ -97,18 +117,27 @@ class DemoTransport:
                 "X-BAPI-SIGN": signature,
             }
         )
+        response = None
         try:
             response = await self._client.request(method, path, **request_kwargs)
             document = response.json()
         except (httpx.HTTPError, ValueError) as error:
             raise BybitAPIError(
                 -1,
-                "network or invalid JSON response",
+                _response_error(error, response),
                 method=method,
                 path=path,
                 definitive_rejection=False,
             ) from error
         return _validate_document(document, response.status_code, method=method, path=path)
+
+
+def _response_error(error, response):
+    # Never include exception text, headers or response bodies: they may contain secrets.
+    if isinstance(error, httpx.HTTPError):
+        return "network " + type(error).__name__
+    status = response.status_code if response is not None else "unknown"
+    return f"invalid JSON response (HTTP {status})"
 
 
 def _validate_document(value: Any, status_code: int, *, method: str, path: str) -> dict[str, Any]:

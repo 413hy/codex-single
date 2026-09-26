@@ -9,8 +9,8 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 from analysis_core.config import (
     DIRECTION_MODEL,
     DIRECTION_REASONING,
-    SCREENING_MODEL,
-    SCREENING_REASONING,
+    TV_SELECTION_MODEL,
+    TV_SELECTION_REASONING,
 )
 from analysis_core.model import Decision, ModelProfile, ModelService
 from analysis_core.store import identity
@@ -61,7 +61,7 @@ class FinalSelection(BaseModel):
 
 
 TV_SELECTION_PROFILE = ModelProfile(
-    "tv_discovery", SCREENING_MODEL, SCREENING_REASONING,
+    "tv_discovery", TV_SELECTION_MODEL, TV_SELECTION_REASONING,
     frozenset({"tv_selection_v1.md"}), "TV_SELECTION_MODEL",
 )
 FINAL_SELECTION_PROFILE = ModelProfile(

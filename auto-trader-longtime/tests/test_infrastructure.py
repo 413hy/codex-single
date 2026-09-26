@@ -7,7 +7,7 @@ import pytest
 
 from longtime.config import Settings
 from longtime.exchange import Exchange
-from longtime.service import ProcessLock, cycle_id
+from longtime.service import ProcessLock
 from longtime.store import Store
 from longtime.telegram import Telegram
 from longtime.transport import DemoTransport
@@ -83,16 +83,11 @@ async def test_private_pagination_and_repeat_cursor_rejected():
     await ex.close()
 
 
-def test_cycle_claim_and_process_lock_survive_multiple_instances(tmp_path):
-    store = Store(tmp_path / "test.db")
-    assert store.claim_cycle("10")
-    assert not Store(store.path).claim_cycle("10")
+def test_process_lock_survives_multiple_instances(tmp_path):
     lock = ProcessLock(tmp_path / "lock")
     with pytest.raises(RuntimeError, match="Another"):
         ProcessLock(tmp_path / "lock")
     lock.close()
-    assert cycle_id(1200) == cycle_id(2399) == "1"
-    assert cycle_id(2400) == "2"
 
 
 def test_incident_dedup_and_callback_claim_are_durable(tmp_path):

@@ -119,6 +119,10 @@ class HedgeSniffer:
                     pair.append(actual)
                 if {int(p["positionIdx"]) for p in pair} != {1, 2}:
                     raise RuntimeError("双向仓位槽位无效")
+                if {p["side"] for p in pair} != {"Buy", "Sell"}:
+                    raise RuntimeError("双向仓位方向无效")
+                if g["symbol"] in result:
+                    raise RuntimeError("同一币种存在多个LOCKED双仓组，归属不明确")
                 result[g["symbol"]] = dict(
                     group_id=g["group_id"], generation=g["generation"], positions=pair
                 )

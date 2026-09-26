@@ -30,7 +30,7 @@ systemctl status bybit-longtime.service
 journalctl -u bybit-longtime.service -f
 ```
 
-`cycle`命令现在只接收当前有效信号，不运行模型；`scan`命令提示使用独立分析项目。
+`cycle` 命令仅消费当前有效信号；选币与方向分析由独立分析服务执行。
 运行中的进程锁阻止第二个交易进程使用同一runtime。
 
 ## Bot
@@ -48,5 +48,4 @@ journalctl -u bybit-longtime.service -f
 ```
 
 重构前源码和在线SQLite备份位于 `runtime/backups/before-signal-split-*`。
-旧分析源码、旧接口测试及旧脚本存于 `docs/retired-analysis/`，不在运行包中。
-详见 [三系统重构验收](docs/SIGNAL_SPLIT_ACCEPTANCE.md)。
+重构前完整版本可通过共享仓库的 `codex-select` 标签回滚；当前三系统联调记录见 `/root/single-analysis/docs/refactor-20260926/LIVE-AUDIT.md`。

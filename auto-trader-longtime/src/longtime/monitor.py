@@ -43,10 +43,6 @@ class Monitor:
             "STARTUP_EXCHANGE_STATE", {"account": account, "positions": positions, "orders": orders}
         )
         self.store.execute("UPDATE incidents SET status='OPEN' WHERE status='RUNNING'")
-        self.store.execute(
-            "UPDATE cycles SET status='INTERRUPTED',completed_at=? WHERE status='RUNNING'",
-            (time.time(),),
-        )
         await self.tick()
 
     async def tick(self):

@@ -104,6 +104,47 @@ async def test_snapshot_failure_blocks_publication_after_normal_refinement(produ
     assert producer.store.rows("SELECT status FROM cycles WHERE cycle_id='stale'")[0]["status"] == "PARTIAL_ERROR"
 
 
+async def test_old_bybit_evidence_cannot_be_repackaged_as_new_signal(producer):
+    original = producer.markets.evidence.side_effect
+
+    async def stale(symbol, candidate):
+        result = await original(symbol, candidate)
+        result["observed_at"] = datetime.fromtimestamp(time.time() - 601, UTC).isoformat()
+        return result
+
+    producer.markets.evidence.side_effect = stale
+    assert not await producer.cycle("expired-evidence")
+    assert publications(producer) == []
+    assert producer.store.rows("SELECT * FROM incidents WHERE scope='PRIMARY_DIRECTION'")
+
+
+async def test_one_tradingview_page_failure_is_audited_without_stopping_other_symbols(producer):
+    original = producer.markets.tradingview_evidence.side_effect
+
+    async def one_bad_page(candidate):
+        if candidate["symbol"] == "BUSDT":
+            raise ValueError("TradingView technical page HTTP 404")
+        return await original(candidate)
+
+    producer.markets.tradingview_evidence.side_effect = one_bad_page
+    producer.selection.choose_tv.return_value = [
+        TVCandidate(symbol="AUSDT", rank=1, direction="LONG", confidence="LOW",
+                    reason="TradingView preliminary direction")
+    ]
+    producer.selection.choose_final.return_value = [
+        FinalCandidate(symbol="AUSDT", rank=1, direction="LONG", confidence="LOW",
+                       reason="Bybit and TradingView support a cautious direction")
+    ]
+    assert not await producer.cycle("one-bad-page")
+    assert {row["symbol"] for row in publications(producer)} == {"AUSDT", "HEDGEUSDT"}
+    assert producer.store.rows(
+        "SELECT * FROM incidents WHERE scope='TV_EVIDENCE:BUSDT' AND status='OPEN'"
+    )
+    assert producer.store.rows(
+        "SELECT * FROM events WHERE kind='TV_EVIDENCE_FAILURE'"
+    )
+
+
 async def test_normal_data_failure_still_analyzes_locked_hedge(producer):
     producer.markets.discover.side_effect = ValueError("TV unavailable")
     assert not await producer.cycle("tv-error")
@@ -159,10 +200,12 @@ async def test_cycle_has_one_notification_and_scheduled_slot_is_not_replayed(pro
     assert producer.selection.choose_tv.await_count == 1
 
 
-@pytest.mark.parametrize("invalid", [None, "unowned", "wrong_symbol"])
+@pytest.mark.parametrize("invalid", [None, "unowned", "wrong_symbol", "duplicate_group", "same_side"])
 def test_sniffer_reads_only_fresh_owned_locked_pairs(tmp_path, invalid):
     store = Store(tmp_path / "hedge.db")
-    store.execute("DROP INDEX owned_active_slot")
+    store.execute("CREATE TABLE trades (trade_id TEXT PRIMARY KEY, symbol TEXT, side TEXT, "
+                  "position_idx INTEGER, status TEXT, owned INTEGER, qty TEXT, entry_price TEXT)")
+    store.execute("CREATE TABLE hedge_groups (group_id TEXT PRIMARY KEY, document TEXT)")
     now = time.time()
     store.set("monitor_heartbeat", now)
     store.set("exchange_positions", [
@@ -171,11 +214,8 @@ def test_sniffer_reads_only_fresh_owned_locked_pairs(tmp_path, invalid):
         for idx, side in ((1, "Buy"), (2, "Sell"))
     ])
     for tid, side, idx in (("a", "LONG", 1), ("b", "SHORT", 2)):
-        store.insert_trade({
-            "trade_id": tid, "symbol": "TESTUSDT", "side": side,
-            "position_idx": idx, "status": "OPEN", "qty": "1",
-            "entry_price": "100", "details": "{}",
-        })
+        store.execute("INSERT INTO trades VALUES (?,?,?,?,?,?,?,?)", (
+            tid, "TESTUSDT", side, idx, "OPEN", 1, "1", "100"))
     store.execute("INSERT INTO hedge_groups VALUES (?,?)", (
         "g", json.dumps({"group_id": "g", "symbol": "TESTUSDT", "generation": 2,
                          "active": "a", "child": "b", "phase": "LOCKED"}),
@@ -184,6 +224,17 @@ def test_sniffer_reads_only_fresh_owned_locked_pairs(tmp_path, invalid):
         store.execute("UPDATE trades SET owned=0 WHERE trade_id='a'")
     elif invalid == "wrong_symbol":
         store.execute("UPDATE hedge_groups SET document=json_set(document,'$.symbol','OTHERUSDT')")
+    elif invalid == "duplicate_group":
+        store.execute("INSERT INTO hedge_groups VALUES (?,?)", (
+            "g2", json.dumps({"group_id": "g2", "symbol": "TESTUSDT", "generation": 1,
+                              "active": "a", "child": "b", "phase": "LOCKED"}),
+        ))
+    elif invalid == "same_side":
+        store.execute("UPDATE trades SET side='LONG' WHERE trade_id='b'")
+        store.set("exchange_positions", [
+            {"symbol": "TESTUSDT", "side": "Buy", "positionIdx": idx,
+             "size": "1", "avgPrice": "100"} for idx in (1, 2)
+        ])
     sniffer = HedgeSniffer(store.path)
     if invalid:
         with pytest.raises(RuntimeError):

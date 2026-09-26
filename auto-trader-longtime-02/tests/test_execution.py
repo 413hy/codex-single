@@ -25,6 +25,17 @@ async def test_open_uses_real_fill_reduce_only_and_static_protection(setup):
     assert len(x.submissions) == 3
 
 
+async def test_entry_does_not_request_tp_reachability_history(setup):
+    e, s, x, m, d = setup
+
+    async def unavailable_history(symbol):
+        raise AssertionError("TP reachability history must not be requested")
+
+    m.reachability = unavailable_history
+    assert await e.enter("123", "sig", d) == "OPEN"
+    assert s.rows("SELECT tp_target_net_pnl FROM trades")[0]["tp_target_net_pnl"] == "0.5"
+
+
 async def test_existing_position_skips_all_economics(setup):
     e, s, x, m, d = setup
     x.position_rows = [{"symbol": "TESTUSDT", "size": "1"}]
@@ -516,7 +527,7 @@ async def test_settlement_sync_within_grace_only_sends_close(setup, monkeypatch)
     assert not s.rows("SELECT * FROM incidents")
 
 
-async def test_entry_scientific_decimal_is_persisted_before_submission(setup, monkeypatch):
+async def test_entry_scientific_decimal_is_persisted_before_submission(setup):
     from dataclasses import replace
 
     from longtime.transport import BybitAPIError
@@ -537,7 +548,6 @@ async def test_entry_scientific_decimal_is_persisted_before_submission(setup, mo
         raise BybitAPIError(10001, "test rejection", method="POST", path="/v5/order/create")
 
     x.instrument, x.quote, x.submit = instrument, quote, submit
-    monkeypatch.setattr("longtime.execution.reachable_tp", lambda *args, **kwargs: {"target": "0.5"})
     await e.enter("fixed", "fixed-sig", d)
     assert json.loads(s.rows("SELECT payload FROM orders")[0]["payload"])["qty"] == "120"
 

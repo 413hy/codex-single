@@ -139,55 +139,6 @@ async def test_concurrent_delivery_sends_one_event_once(tmp_path):
 
 
 
-async def test_rolling_24h_nonminute_boundary_counts_only_fully_inside_minutes(monkeypatch):
-    from datetime import UTC, datetime, timedelta
-    from decimal import Decimal as D
-
-    from longtime.market import Markets
-    from longtime.risk import Instrument, reachable_tp
-    from longtime.vendor.models import Candle
-
-    now = datetime(2026, 9, 11, 12, 34, 30, tzinfo=UTC)
-
-    class Clock(datetime):
-        @classmethod
-        def now(cls, tz=None):
-            return now
-
-    monkeypatch.setattr("longtime.market.datetime", Clock)
-    monkeypatch.setattr("longtime.risk.datetime", Clock)
-
-    class Client:
-        async def recent_candles(self, symbol, timeframe, limit):
-            end = now.replace(second=0)
-            return tuple(
-                Candle(
-                    symbol=symbol,
-                    timeframe="1m",
-                    open_time=end - timedelta(minutes=1440 - i),
-                    close_time=end - timedelta(minutes=1439 - i),
-                    open=D(110),
-                    high=D(111),
-                    low=D(109),
-                    close=D(110),
-                    volume=D(1),
-                    turnover=D(110),
-                    completed=i < 1440,
-                    source="BYBIT",
-                )
-                for i in range(limit)
-            )
-
-    rows = await Markets(Client()).reachability("TESTUSDT")
-    assert len([c for c in rows if c.completed]) == 1439
-    assert all(c.open_time >= now - timedelta(hours=24) for c in rows)
-    inst = Instrument(
-        "TESTUSDT", D(".01"), D(".001"), D(".001"), D(5), D(10000), D(10000), D(3), D(".01")
-    )
-    result = reachable_tp("LONG", D(100), D(".5"), inst, D(".00055"), D(".0002"), D(".01"), rows)
-    assert result["confirmed_seconds"] == 1439 * 60
-
-
 async def test_recovered_intent_missing_fill_evidence_alerts_once_without_resubmit(setup):
     from longtime.store import Store
 

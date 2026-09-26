@@ -10,7 +10,6 @@ import time
 
 from longtime.exchange import Exchange
 from longtime.execution import Executor
-from longtime.market import Markets
 from longtime.monitor import Monitor
 from longtime.signal_consumer import SignalConsumer
 from longtime.store import Store
@@ -19,17 +18,12 @@ from longtime.telegram import Telegram
 log = logging.getLogger(__name__)
 
 
-def cycle_id(now=None, seconds=1200):
-    bucket = int(time.time() if now is None else now) // seconds
-    return str(bucket) if seconds == 1200 else f"interval:{seconds}:{bucket}"
-
-
 class App:
     def __init__(self, settings, *, store=None, exchange=None, markets=None):
         self.settings = settings
         self.store = store or Store(settings.runtime_dir / "trader.db")
         self.exchange = exchange or Exchange(settings)
-        self.markets = markets or Markets()
+        self.markets = markets
         self.executor = Executor(settings, self.store, self.exchange, self.markets)
         self.monitor = Monitor(self.executor)
         self.cycle_lock = asyncio.Lock()
@@ -79,7 +73,8 @@ class App:
         )
 
     async def close(self):
-        await self.markets.close()
+        if self.markets is not None:
+            await self.markets.close()
         await self.exchange.close()
 
 

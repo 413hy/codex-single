@@ -93,12 +93,14 @@ class NewsPageSource:
         )
         try:
             output, _ = await asyncio.wait_for(proc.communicate(), timeout=20)
-        except (TimeoutError, asyncio.CancelledError):
+        except (TimeoutError, asyncio.CancelledError) as error:
             try:
                 os.killpg(proc.pid, signal.SIGKILL)
             except ProcessLookupError:
                 pass
             await proc.wait()
+            if isinstance(error, asyncio.CancelledError):
+                raise
             raise TradingViewError("TradingView news page render timed out") from None
         if proc.returncode or len(output) > 3_000_000:
             raise TradingViewError("TradingView news page render failed")

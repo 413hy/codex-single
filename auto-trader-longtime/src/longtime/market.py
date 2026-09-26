@@ -2,7 +2,6 @@ from datetime import UTC, datetime, timedelta
 from decimal import Decimal as D
 
 from longtime.vendor.models import Candle
-from longtime.vendor.public import BybitPublicClient
 
 
 def verify_candles(rows, minutes, now, minimum):
@@ -39,21 +38,6 @@ def validate_direction_rows(rows, symbol, timeframe, minutes, now):
             )
         ):
             raise ValueError("Invalid direction candle identity/OHLCV/completion")
-
-
-class Markets:
-    def __init__(self, client=None):
-        self.client = client or BybitPublicClient()
-
-    async def reachability(self, symbol):
-        rows = await self.client.recent_candles(symbol, timeframe="1m", limit=1441)
-        now = datetime.now(UTC)
-        validate_direction_rows(rows, symbol, "1m", 1, now)
-        verify_candles(rows, 1, now, 1440)
-        return tuple(c for c in rows if c.open_time >= now - timedelta(hours=24))
-
-    async def close(self):
-        await self.client.close()
 
 
 def aggregate_ten_minutes(rows):

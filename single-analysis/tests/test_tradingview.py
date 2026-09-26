@@ -24,6 +24,7 @@ from analysis_core.tradingview import (
     field,
     normalize,
     normalize_rankings,
+    require_recent_core,
 )
 
 
@@ -38,6 +39,19 @@ def snapshot(now):
         values.update(dict.fromkeys(RATINGS, 0.5))
         raw.update({field(k, interval): v for k, v in values.items()})
     return raw
+
+
+def test_core_web_bars_must_be_recent_and_complete_for_live_selection():
+    now = time.time()
+    require_recent_core(normalize(snapshot(now), "BTCUSDT", now))
+    old = snapshot(now)
+    old[field("time", "15")] -= 3600
+    with pytest.raises(TradingViewError, match="stale"):
+        require_recent_core(normalize(old, "BTCUSDT", now))
+    missing = snapshot(now)
+    missing.pop(field("close", "30"))
+    with pytest.raises(TradingViewError, match="unavailable"):
+        require_recent_core(normalize(missing, "BTCUSDT", now))
 
 
 def test_unconfirmed_snapshot_preserves_values_and_missing():
@@ -300,41 +314,3 @@ async def test_model_uses_versioned_prompt_without_mutating_raw_evidence(tmp_pat
     assert args[2]["properties"]["decision"]["enum"] == ["LONG", "SHORT"]
     assert model.request.await_count == 1
     assert "raw_fields" not in json.dumps(args[1])
-
-
-async def test_validation_service_isolated_and_single_model_call(tmp_path, monkeypatch):
-    from decimal import Decimal
-
-    from analysis_core import tradingview_validation as validation
-    from analysis_core.model import Decision
-
-    class Markets:
-        def __init__(self, **kwargs):
-            assert kwargs == {"include_tradingview": True}
-
-        async def evidence(self, symbol, candidate):
-            return {"symbol": symbol, "numeric": Decimal("1.25"), "selection": candidate}
-
-        async def close(self):
-            pass
-
-    class Model:
-        def __init__(self, settings, store):
-            self.store = store
-
-        async def decide(self, sid, context):
-            assert context["direction_required"] is True
-            self.store.event("MODEL_INPUT", {"prompt_sha256": "fixture"})
-            self.store.event("MODEL_OUTPUT", {})
-            return Decision(symbol="BTCUSDT", decision="LONG", reason="fixture")
-
-    monkeypatch.setattr(validation, "Markets", Markets)
-    monkeypatch.setattr(validation, "DirectionModel", Model)
-    output = tmp_path / "isolated"
-    await validation.validate(output)
-    result = json.loads((output / "result.json").read_text())
-    assert result["published_signals"] == 0 and result["model_calls"] == 1
-    assert not (output / "signals.db").exists()
-    assert json.loads((output / "context.json").read_text())["numeric"] == "1.25"
-    with pytest.raises(FileExistsError):
-        await validation.validate(output)

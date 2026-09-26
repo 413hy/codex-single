@@ -43,15 +43,10 @@ async def command(name, settings):
                     {"success": await app.cycle(), "trading_enabled": settings.trading_enabled}
                 )
             )
-        elif name == "scan":
-            raise ValueError("选币已迁移至 /root/single-analysis")
         elif name == "status":
             print(
                 json.dumps(
                     {
-                        "cycles": app.store.rows(
-                            "SELECT * FROM cycles ORDER BY started_at DESC LIMIT 3"
-                        ),
                         "trades": app.store.rows(
                             "SELECT symbol,side,status,tp_price,sl_price,net_pnl FROM trades ORDER BY opened_at DESC LIMIT 20"
                         ),
@@ -66,7 +61,7 @@ async def command(name, settings):
 def main():
     parser = argparse.ArgumentParser(description="Independent Bybit Mainnet Demo trader")
     parser.add_argument(
-        "command", choices=["config-check", "preflight", "scan", "cycle", "serve", "status"]
+        "command", choices=["config-check", "preflight", "cycle", "serve", "status"]
     )
     args = parser.parse_args()
     settings = Settings()
