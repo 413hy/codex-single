@@ -216,6 +216,60 @@ async def test_public_page_and_per_period_requests_preserve_provenance(monkeypat
     assert result["market_rankings"]["metrics"]["24h_vol|5"]["rank_desc"] == 1
 
 
+async def test_technicals_404_uses_exact_contract_overview_with_scanner_fields(monkeypatch):
+    async def sleep(_):
+        pass
+
+    monkeypatch.setattr("analysis_core.tradingview.asyncio.sleep", sleep)
+    raw = snapshot(time.time())
+    pages = []
+
+    def handler(request):
+        if request.url.host == "www.tradingview.com":
+            pages.append(str(request.url))
+            if request.url.path.endswith("/technicals/"):
+                return httpx.Response(404)
+            if request.url.path.endswith("/news/") or request.url.path.endswith("/ideas/"):
+                return httpx.Response(404)
+            return httpx.Response(200, text='window.initData.symbolInfo = '
+                                  '{"resolved_symbol":"BYBIT:BTCUSDT.P"};')
+        fields = request.url.params["fields"].split(",")
+        return httpx.Response(200, json={key: raw.get(key) for key in fields})
+
+    client = TradingViewWeb(httpx.AsyncClient(transport=httpx.MockTransport(handler)))
+    try:
+        result = await client.collect("BTCUSDT", market_rankings={})
+    finally:
+        await client.close()
+    assert len(result["provenance"]["requests"]) == len(PERIODS)
+    assert result["source_provenance"]["verified_symbol_page_url"].endswith(
+        "/symbols/BTCUSDT.P/?exchange=BYBIT"
+    )
+    assert result["source_provenance"]["technical_page_unavailable"] == "HTTP_404"
+    assert result["source_provenance"]["technical_page_url"] is None
+    assert len([url for url in pages if "/technicals/" in url]) == 1
+
+
+async def test_technicals_404_fallback_rejects_wrong_contract(monkeypatch):
+    async def sleep(_):
+        pass
+
+    monkeypatch.setattr("analysis_core.tradingview.asyncio.sleep", sleep)
+
+    def handler(request):
+        if request.url.path.endswith("/technicals/"):
+            return httpx.Response(404)
+        return httpx.Response(200, text='window.initData.symbolInfo = '
+                              '{"resolved_symbol":"BYBIT:OTHERUSDT.P"};')
+
+    client = TradingViewWeb(httpx.AsyncClient(transport=httpx.MockTransport(handler)))
+    try:
+        with pytest.raises(TradingViewError, match="different instrument"):
+            await client.collect("BTCUSDT", market_rankings={})
+    finally:
+        await client.close()
+
+
 async def test_additional_verified_numeric_field_uses_same_instrument(monkeypatch):
     async def sleep(_):
         pass

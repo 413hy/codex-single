@@ -106,6 +106,7 @@ def compact_tradingview(data):
     coin = data.get("coin_context") or {}
     return {
         "source_symbol": data.get("source_provenance", {}).get("verified_source_symbol"),
+        "technical_page_unavailable": data.get("source_provenance", {}).get("technical_page_unavailable"),
         "collected_at": data.get("fetched_at"),
         "quote_freshness_verified": data.get("quote_freshness_verified", False),
         "provider_update_mode": data.get("provider_update_mode"),

@@ -122,7 +122,9 @@ def extract_ideas(page_html: str, symbol: str, fetched: float) -> list[dict]:
     return ideas
 
 
-def normalize_rankings(pages: list[dict], symbol: str, fetched: float) -> dict:
+def normalize_rankings(
+    pages: list[dict], symbol: str, fetched: float, *, columns: tuple[str, ...] = RANK_COLUMNS,
+) -> dict:
     """Rank only exact BYBIT USDT perpetual rows within the reported scan scope."""
     rows: dict[str, dict] = {}
     total = None
@@ -134,9 +136,9 @@ def normalize_rankings(pages: list[dict], symbol: str, fetched: float) -> dict:
         elif total != page["totalCount"]:
             raise TradingViewError("TradingView screener scope changed across pages")
         for row in page["data"]:
-            if not isinstance(row, dict) or not isinstance(row.get("d"), list) or len(row["d"]) != len(RANK_COLUMNS):
+            if not isinstance(row, dict) or not isinstance(row.get("d"), list) or len(row["d"]) != len(columns):
                 raise TradingViewError("TradingView screener row shape changed")
-            item = dict(zip(RANK_COLUMNS, row["d"], strict=True))
+            item = dict(zip(columns, row["d"], strict=True))
             key = row.get("s")
             if (not isinstance(key, str) or not re.fullmatch(r"BYBIT:[A-Z0-9]{1,24}USDT\.P", key)
                     or item["name"] != key.split(":", 1)[1]
@@ -302,12 +304,12 @@ class TradingViewWeb:
         self._lock = asyncio.Lock()
         self._last_request = 0.0
 
-    async def _get(self, url, **kwargs):
+    async def _get(self, url, *, allow_404=False, **kwargs):
         async with self._lock:
             await asyncio.sleep(max(0, 1 - (time.monotonic() - self._last_request)))
             self._last_request = time.monotonic()
             response = await self.client.get(url, **kwargs)
-        if response.status_code != 200:
+        if response.status_code != 200 and not (allow_404 and response.status_code == 404):
             raise TradingViewError(f"TradingView website HTTP {response.status_code}; no retry")
         if len(response.content) > 2_000_000:
             raise TradingViewError("TradingView oversized response")
@@ -367,7 +369,12 @@ class TradingViewWeb:
         if not re.fullmatch(r"[A-Z0-9]{1,24}USDT", symbol):
             raise TradingViewError("Invalid TradingView symbol")
         page_url = f"https://www.tradingview.com/symbols/{symbol}.P/technicals/?exchange=BYBIT"
-        page = await self._get(page_url)
+        page = await self._get(page_url, allow_404=True)
+        technical_page_available = page.status_code == 200
+        verified_page_url = page_url
+        if not technical_page_available:
+            verified_page_url = f"https://www.tradingview.com/symbols/{symbol}.P/?exchange=BYBIT"
+            page = await self._get(verified_page_url)
         match = re.search(r"window\.initData\.symbolInfo\s*=\s*", page.text)
         if not match:
             raise TradingViewError("TradingView page identity missing; blocked or changed HTML")
@@ -436,12 +443,15 @@ class TradingViewWeb:
         result = normalize(raw, symbol, time.time(), self.extra_fields)
         require_recent_core(result)
         result["provenance"] = {
-            "page_url": page_url, "page_sha256": hashlib.sha256(page.content).hexdigest(),
+            "page_url": verified_page_url, "page_sha256": hashlib.sha256(page.content).hexdigest(),
+            "technical_page_unavailable": None if technical_page_available else "HTTP_404",
             "requests": requests, "raw_fields": raw,
         }
         result["source_provenance"] = {
-            "technical_page_url": page_url,
-            "technical_page_sha256": hashlib.sha256(page.content).hexdigest(),
+            "technical_page_url": page_url if technical_page_available else None,
+            "technical_page_sha256": hashlib.sha256(page.content).hexdigest() if technical_page_available else None,
+            "verified_symbol_page_url": verified_page_url,
+            "technical_page_unavailable": None if technical_page_available else "HTTP_404",
             "scanner_symbol_url": "https://scanner.tradingview.com/symbol",
             "scanner_symbol_response_sha256": [item["response_sha256"] for item in requests],
             "verified_source_symbol": f"BYBIT:{symbol}.P",

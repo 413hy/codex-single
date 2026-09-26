@@ -49,6 +49,7 @@ class Markets:
         self.include_orderflow = include_orderflow
         self.tradingview = TradingViewWeb(extra_fields=tradingview_extra_fields) if include_tradingview else None
         self.discovery = TradingViewDiscovery(self.tradingview) if self.tradingview else None
+        self.discovery_exclusions: list[dict] = []
         self.tv_sources = (
             SourceRegistry((CoinContextSource(self.tradingview), NewsPageSource()))
             if self.tradingview else None
@@ -63,7 +64,9 @@ class Markets:
             if item.status == "Trading" and item.contract_type == "LinearPerpetual"
             and item.quote_coin == "USDT" and item.settle_coin == "USDT"
         }
-        return await self.discovery.collect(tradable)
+        pool = await self.discovery.collect(tradable)
+        self.discovery_exclusions = self.discovery.exclusions
+        return pool
 
     async def tradingview_evidence(self, candidate):
         if self.tradingview is None:

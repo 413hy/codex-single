@@ -67,7 +67,20 @@ def signal_detail(store, sid):
     row = rows[0]
     stamp = datetime.fromtimestamp(row["started_at"], TZ).strftime("%Y年%m月%d日 %H:%M")
     payload = json.loads(row["analysis"] or "{}")
+    evidence = json.loads(row["evidence"])
     reason = payload.get("reason") or "本轮未产生完整分析结果，请查看分析异常，等待下一轮。"
-    text = f"📊 币种分析详情\n北京时间 {stamp}\n{signal_heading(row)}\n\n{reason}"
+    text = f"📊 币种分析详情\n北京时间 {stamp}\n{signal_heading(row)}"
+    initial = evidence.get("tv_initial")
+    if isinstance(initial, dict):
+        tv_side = {"LONG": "做多", "SHORT": "做空"}.get(str(initial.get("direction")), "未确定")
+        text += (
+            f"\n\nTradingView 初判：{tv_side} · {initial.get('confidence', '未知')}"
+            f"\n依据：{initial.get('reason', '未记录')}"
+            f"\n\nTradingView＋Bybit 复核后的最终理由：{reason}"
+        )
+    else:
+        if evidence.get("tradingview"):
+            text += "\n\nTradingView 与 Bybit 联合分析双仓"
+        text += "\n\n" + reason
     text += "\n\n本轮历史分析 · 不重新发布信号"
     return text, cycle_keyboard(store, row["cycle_id"])

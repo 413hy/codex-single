@@ -16,6 +16,11 @@ from analysis_core.tradingview import (
 SCREENER_URL = "https://scanner.tradingview.com/crypto/scan"
 SCREENER_PAGE = "https://www.tradingview.com/crypto-screener/"
 SYMBOL_RE = re.compile(r"BYBIT:([A-Z0-9]{1,24}USDT)\.P")
+DISCOVERY_COLUMNS = RANK_COLUMNS + (
+    "time|15", "time|30", "time|60", "volume|15",
+    "Recommend.All|15", "Recommend.All|60",
+)
+CORE_BAR_MINUTES = (("time|15", 15), ("time|30", 30), ("time|60", 60))
 
 
 class TradingViewDiscovery:
@@ -28,8 +33,10 @@ class TradingViewDiscovery:
             raise ValueError("TradingView discovery pool must contain 10—50 rows")
         self.web = web
         self.pool_limit = pool_limit
+        self.exclusions: list[dict] = []
 
     async def collect(self, tradable: set[str]) -> list[dict]:
+        self.exclusions = []
         pages: list[dict] = []
         start = 0
         while True:
@@ -39,7 +46,7 @@ class TradingViewDiscovery:
                     {"left": "type", "operation": "equal", "right": "swap"},
                     {"left": "name", "operation": "match", "right": "USDT.P"},
                 ],
-                "columns": RANK_COLUMNS,
+                "columns": DISCOVERY_COLUMNS,
                 "range": [start, start + 1000],
             }
             response = await self.web._post(
@@ -60,7 +67,7 @@ class TradingViewDiscovery:
             if not page["data"]:
                 raise TradingViewError("TradingView CEX screener pagination stalled")
         # The existing validator checks every row, duplicates, pagination, identity and metrics.
-        normalize_rankings(pages, "BTCUSDT", time.time())
+        normalize_rankings(pages, "BTCUSDT", time.time(), columns=DISCOVERY_COLUMNS)
         fetched = time.time()
         rows: list[dict] = []
         for page in pages:
@@ -68,11 +75,30 @@ class TradingViewDiscovery:
                 match = SYMBOL_RE.fullmatch(raw["s"])
                 if match is None or match[1] not in tradable:
                     continue
-                values = dict(zip(RANK_COLUMNS, raw["d"], strict=True))
+                values = dict(zip(DISCOVERY_COLUMNS, raw["d"], strict=True))
+                stale = []
+                for name, minutes in CORE_BAR_MINUTES:
+                    opened = values[name]
+                    age = fetched - opened if type(opened) in (int, float) and opened is not None else None
+                    if (
+                        age is None or not isinstance(opened, (int, float))
+                        or not 0 <= opened or not float(opened).is_integer()
+                        or opened % (minutes * 60) or not -5 <= age <= minutes * 120
+                    ):
+                        stale.append(name)
+                if stale:
+                    self.exclusions.append({
+                        "symbol": match[1], "reason": "stale_or_missing_tradingview_core_bars",
+                        "fields": stale,
+                    })
+                    continue
                 rows.append({
                     "symbol": match[1],
                     "source_symbol": raw["s"],
-                    "metrics": {key: values[key] for key in RANK_METRICS},
+                    "metrics": {
+                        key: values[key] for key in (*RANK_METRICS, "Recommend.All|15", "Recommend.All|60")
+                    },
+                    "discovery_core_bars": {name: values[name] for name, _ in CORE_BAR_MINUTES},
                     "source_url": SCREENER_PAGE,
                     "collected_at": datetime.fromtimestamp(fetched, UTC).isoformat(),
                 })
@@ -94,6 +120,14 @@ class TradingViewDiscovery:
             value = row["metrics"][metric]
             return -(value if value is not None else -float("inf"))
 
+        def technical_score(row):
+            ratings = [row["metrics"][name] for name in ("Recommend.All|15", "Recommend.All|60")]
+            if any(type(value) not in (int, float) or not -1 <= value <= 1 for value in ratings):
+                return 0.0
+            volume_rank = row.get("discovery_ranks", {}).get("24h_vol|5:desc", len(rows))
+            liquidity_weight = (len(rows) - volume_rank + 1) / len(rows)
+            return abs(sum(ratings) / 2) * liquidity_weight
+
         buckets = {
             "volume": sorted(rows, key=lambda row: (
                 descending(row, "24h_vol|5"), row["symbol"])),
@@ -104,7 +138,7 @@ class TradingViewDiscovery:
             "activity": sorted(rows, key=lambda row: (
                 descending(row, "24h_vol_change|5"), row["symbol"])),
             "technical": sorted(rows, key=lambda row: (
-                -abs(row["metrics"]["Recommend.All"] or 0), row["symbol"])),
+                -technical_score(row), row["symbol"])),
         }
         selected: list[dict] = []
         seen: set[str] = set()
@@ -129,5 +163,7 @@ class TradingViewDiscovery:
         for rank, row in enumerate(selected, 1):
             row["discovery_rank"] = rank
         for row in selected:
-            row["market_rankings"] = normalize_rankings(pages, row["symbol"], fetched)
+            row["market_rankings"] = normalize_rankings(
+                pages, row["symbol"], fetched, columns=DISCOVERY_COLUMNS
+            )
         return selected

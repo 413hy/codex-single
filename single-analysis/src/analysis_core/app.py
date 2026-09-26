@@ -62,7 +62,17 @@ class AnalysisApp:
                 by_symbol = {}
                 try:
                     pool = await self.markets.discover()
-                    self.store.event("TV_DISCOVERY", {"cycle_id": cid, "pool": pool})
+                    exclusions = getattr(self.markets, "discovery_exclusions", [])
+                    self.store.event("TV_DISCOVERY", {
+                        "cycle_id": cid, "pool": pool, "excluded": exclusions,
+                    })
+                    pool_symbols = {item["symbol"] for item in pool}
+                    for old in self.store.rows(
+                        "SELECT scope FROM incidents WHERE scope LIKE 'TV_EVIDENCE:%' "
+                        "AND status IN ('OPEN','RUNNING')"
+                    ):
+                        if old["scope"].removeprefix("TV_EVIDENCE:") not in pool_symbols:
+                            self.store.resolve(old["scope"])
                     tv_bundles = []
                     for candidate in pool:
                         try:

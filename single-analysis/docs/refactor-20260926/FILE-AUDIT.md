@@ -21,8 +21,8 @@
 | `selection.py` | TV 初选严格 1—10；Bybit 最终严格 1—3 且首选方向明确；输入币必须来自有效证据。 |
 | `signals.py` | 每轮每币唯一 ID、600 秒 TTL；LOCKED 双仓按 20 秒新鲜快照、唯一组、双向槽位和账本归属核实。 |
 | `store.py` | 仅分析事件、轮次、信号、异常与通知表；空的旧交易表已移除。 |
-| `tradingview.py` | 同合约技术页、Ideas 和榜单身份/字段校验；15m/30m/1h 核心技术快照必须完整且近期。 |
-| `tradingview_discovery.py` | CEX 全页验证和限额均衡待审池；没有旧 Bybit 评分、绝对阈值或二次递补。 |
+| `tradingview.py` | 同合约技术页、Ideas 和榜单身份/字段校验；15m/30m/1h 核心技术快照必须完整且近期。技术页单独 404 时用身份一致的合约主页核实，403 等访问失败仍拒绝。 |
+| `tradingview_discovery.py` | CEX 全页验证和限额均衡待审池；先排除短周期栏过期币，按 15m/1h 技术评级和相对流动性排列技术候选；没有旧 Bybit 评分、绝对阈值或二次递补。 |
 | `tradingview_sources.py` | 可扩展的币种背景、新闻适配器；可选来源显式记缺失，取消渲染时终止子进程并传递取消信号。 |
 | `vendor/__init__.py`、`vendor/models.py`、`vendor/public.py`、`vendor/PROVENANCE.json` | Bybit 公共行情合同、读取器及来源记录；无私有交易请求。 |
 | `prompts/tv_selection_v1.md`、`direction_selection_v1.md`、`direction_v15.md` | 当前三阶段提示词与 1—2 小时主时域一致；真实模型验证见 `model_validation.json`。 |

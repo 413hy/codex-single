@@ -33,3 +33,4 @@ cd /root/single-analysis
 `single-analysis cycle` 会真实分析并向交易系统发布信号，联调时必须明确其影响。`serve` 由 `deploy/single-analysis.service` 管理。分析 Bot 只支持管理菜单、暂停/恢复、频率设置、历史分析与异常查询；每轮币种详情固定对应原轮次，不重新调用模型或发布信号。
 
 新流程与来源说明见 [重构报告](docs/refactor-20260926/REPORT.md)。
+14:02 TradingView 异常与一轮信号的实际来源见 [根因和信号追踪](docs/refactor-20260926/ROOT-CAUSE-20260926.md)。

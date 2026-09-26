@@ -145,6 +145,20 @@ async def test_one_tradingview_page_failure_is_audited_without_stopping_other_sy
     )
 
 
+async def test_discovery_ineligibility_resolves_old_evidence_alarm(producer):
+    producer.store.incident("TV_EVIDENCE:MSFUUSDT", "analysis", {}, "stale core bar")
+    producer.markets.discovery_exclusions = [{
+        "symbol": "MSFUUSDT", "reason": "stale_or_missing_tradingview_core_bars",
+        "fields": ["time|15"],
+    }]
+    assert await producer.cycle("fresh-pool")
+    assert producer.store.rows(
+        "SELECT status FROM incidents WHERE scope='TV_EVIDENCE:MSFUUSDT'"
+    )[0]["status"] == "RESOLVED"
+    event = producer.store.rows("SELECT payload FROM events WHERE kind='TV_DISCOVERY'")[0]
+    assert json.loads(event["payload"])["excluded"][0]["symbol"] == "MSFUUSDT"
+
+
 async def test_normal_data_failure_still_analyzes_locked_hedge(producer):
     producer.markets.discover.side_effect = ValueError("TV unavailable")
     assert not await producer.cycle("tv-error")

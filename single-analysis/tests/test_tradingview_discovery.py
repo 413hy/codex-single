@@ -3,16 +3,22 @@ from types import SimpleNamespace
 
 import pytest
 
-from analysis_core.tradingview import RANK_COLUMNS, TradingViewError
-from analysis_core.tradingview_discovery import TradingViewDiscovery
+from analysis_core.tradingview import TradingViewError
+from analysis_core.tradingview_discovery import DISCOVERY_COLUMNS, TradingViewDiscovery
 from analysis_core.tradingview_sources import CoinContextSource, SourceRegistry
 
 
-def cex_row(symbol, *, volume=100, change=1, rating=0.2):
+def cex_row(symbol, *, volume=100, change=1, rating=0.2, stale=False):
+    now = int(time.time())
     values = {"name": symbol + ".P", "exchange": "BYBIT", "type": "swap",
               "24h_vol|5": volume, "24h_vol_change|5": change,
-              "24h_close_change|5": change, "Recommend.All": rating}
-    return {"s": "BYBIT:" + symbol + ".P", "d": [values[k] for k in RANK_COLUMNS]}
+              "24h_close_change|5": change, "Recommend.All": rating,
+              "Recommend.All|15": rating, "Recommend.All|60": rating,
+              "volume|15": 1,
+              "time|15": now // 900 * 900 - (3600 if stale else 0),
+              "time|30": now // 1800 * 1800,
+              "time|60": now // 3600 * 3600}
+    return {"s": "BYBIT:" + symbol + ".P", "d": [values[k] for k in DISCOVERY_COLUMNS]}
 
 
 class Web:
@@ -37,6 +43,21 @@ async def test_tv_discovery_only_returns_verified_tradable_contracts():
     assert all(row["source_symbol"] == f"BYBIT:{row['symbol']}.P" for row in rows)
     assert len(web.calls) == 1
     assert web.calls[0][1]["json"]["filter"][0]["right"] == "BYBIT"
+
+
+async def test_discovery_excludes_stale_short_horizon_bars_before_model():
+    web = Web({"totalCount": 2, "data": [
+        cex_row("ACTIVEUSDT", volume=1000),
+        cex_row("STALEUSDT", volume=500, rating=1, stale=True),
+    ]})
+    source = TradingViewDiscovery(web)
+    rows = await source.collect({"ACTIVEUSDT", "STALEUSDT"})
+    assert [row["symbol"] for row in rows] == ["ACTIVEUSDT"]
+    assert source.exclusions == [{
+        "symbol": "STALEUSDT", "reason": "stale_or_missing_tradingview_core_bars",
+        "fields": ["time|15"],
+    }]
+    assert "Recommend.All|15" in web.calls[0][1]["json"]["columns"]
 
 
 async def test_tv_discovery_fails_closed_on_wrong_contract_identity():
