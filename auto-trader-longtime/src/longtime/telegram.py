@@ -402,7 +402,7 @@ class Telegram:
             text = (
                 "已恢复新开仓，等待分析系统发布新的有效信号。"
                 if self.settings.trading_enabled
-                else "已恢复扫描；当前为只读验证模式，不提交订单。"
+                else "已恢复信号接收；当前为只读验证模式，不提交订单。"
             )
         elif command in ("/start", "/status"):
             text = self.status_text()

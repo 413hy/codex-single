@@ -12,7 +12,7 @@ from analysis_core.config import (
     TV_SELECTION_MODEL,
     TV_SELECTION_REASONING,
 )
-from analysis_core.model import Decision, ModelProfile, ModelService
+from analysis_core.model import Decision, ModelProfile, ModelService, ModelServiceError
 from analysis_core.store import identity
 
 
@@ -66,7 +66,7 @@ TV_SELECTION_PROFILE = ModelProfile(
 )
 FINAL_SELECTION_PROFILE = ModelProfile(
     "direction_selection", DIRECTION_MODEL, DIRECTION_REASONING,
-    frozenset({"direction_selection_v1.md"}), "FINAL_SELECTION_MODEL",
+    frozenset({"direction_selection_v2.md"}), "FINAL_SELECTION_MODEL",
 )
 
 
@@ -196,12 +196,20 @@ class SelectionModels:
         self.store.event("TV_SELECTION_EVIDENCE", context)
         schema = TVSelection.model_json_schema()
         strict_schema(schema)
-        raw = await self.tv_runner.request(
-            "tv_" + identity(cid), context, schema, "tv_selection_v1.md"
-        )
-        result = TVSelection.model_validate(raw)
-        if not {item.symbol for item in result.candidates} <= set(symbols):
-            raise ValueError("TradingView model selected a symbol outside the evidence pool")
+        try:
+            raw = await self.tv_runner.request(
+                "tv_" + identity(cid), context, schema, "tv_selection_v1.md"
+            )
+            result = TVSelection.model_validate(raw)
+            if not {item.symbol for item in result.candidates} <= set(symbols):
+                raise ValueError("TradingView model selected a symbol outside the evidence pool")
+        except ModelServiceError:
+            raise
+        except Exception as error:
+            raise ModelServiceError(
+                f"TradingView初选模型调用或输出无效（{type(error).__name__}）；"
+                "本轮停止模型调用，保留原始审计，下一轮使用新行情"
+            ) from error
         self.store.event("TV_SELECTION_RESULT", {"cycle_id": cid, "result": result.model_dump()})
         return sorted(result.candidates, key=lambda item: item.rank)
 
@@ -225,12 +233,20 @@ class SelectionModels:
         self.store.event("FINAL_SELECTION_EVIDENCE", context)
         schema = FinalSelection.model_json_schema()
         strict_schema(schema)
-        raw = await self.final_runner.request(
-            "final_" + identity(cid), context, schema, "direction_selection_v1.md"
-        )
-        result = FinalSelection.model_validate(raw)
-        if not {item.symbol for item in result.selected} <= set(symbols):
-            raise ValueError("Final model selected a symbol without valid Bybit evidence")
+        try:
+            raw = await self.final_runner.request(
+                "final_" + identity(cid), context, schema, "direction_selection_v2.md"
+            )
+            result = FinalSelection.model_validate(raw)
+            if not {item.symbol for item in result.selected} <= set(symbols):
+                raise ValueError("Final model selected a symbol without valid Bybit evidence")
+        except ModelServiceError:
+            raise
+        except Exception as error:
+            raise ModelServiceError(
+                f"最终方向模型调用或输出无效（{type(error).__name__}）；"
+                "本轮停止模型调用，保留原始审计，下一轮使用新行情"
+            ) from error
         self.store.event("FINAL_SELECTION_RESULT", {"cycle_id": cid, "result": result.model_dump()})
         return sorted(result.selected, key=lambda item: item.rank)
 

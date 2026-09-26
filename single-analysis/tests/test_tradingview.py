@@ -364,7 +364,7 @@ async def test_model_uses_versioned_prompt_without_mutating_raw_evidence(tmp_pat
                                           "reason": "参考未收盘，置信度偏低"})
     await model.decide("validation-only", context)
     args = model.request.call_args.args
-    assert args[3] == "direction_v15.md"
+    assert args[3] == "direction_v16.md"
     assert args[2]["properties"]["decision"]["enum"] == ["LONG", "SHORT"]
     assert model.request.await_count == 1
     assert "raw_fields" not in json.dumps(args[1])

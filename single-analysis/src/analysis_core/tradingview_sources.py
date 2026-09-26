@@ -13,6 +13,8 @@ from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
 from typing import Protocol
 
+import httpx
+
 from analysis_core.tradingview import TradingViewError
 
 COIN_COLUMNS = (
@@ -162,6 +164,6 @@ class SourceRegistry:
                 continue
             try:
                 result[source.name] = await source.collect(symbol)
-            except (TradingViewError, OSError, TimeoutError) as error:
+            except (TradingViewError, OSError, TimeoutError, httpx.HTTPError) as error:
                 result[source.name + "_unavailable"] = type(error).__name__ + ": " + str(error)[:160]
         return result

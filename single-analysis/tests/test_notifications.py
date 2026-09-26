@@ -25,7 +25,11 @@ def test_detail_shows_tv_initial_direction_and_bybit_final_reason(tmp_path):
                        "reason": "15m与1h均线偏空，网页值未确认收盘"},
     })
     store.signal_result("one", "PUBLISHED", "LONG", {"reason": "Bybit已收盘K线反转"})
+    store.event("FINAL_SELECTION_RESULT", {"cycle_id": "c", "result": {"selected": [
+        {"symbol": "BTCUSDT", "direction": "LONG", "confidence": "MEDIUM"},
+    ]}})
     text, _ = signal_detail(store, "one")
     assert "TradingView 初判：做空 · LOW" in text
     assert "15m与1h均线偏空" in text
+    assert "最终复核：做多 · MEDIUM" in text
     assert "TradingView＋Bybit 复核后的最终理由：Bybit已收盘K线反转" in text

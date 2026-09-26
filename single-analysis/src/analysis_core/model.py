@@ -73,7 +73,7 @@ class ModelProfile:
 
 DIRECTION_PROFILE = ModelProfile(
     "direction", DIRECTION_MODEL, DIRECTION_REASONING,
-    frozenset({"direction_v15.md"}), "MODEL",
+    frozenset({"direction_v16.md"}), "MODEL",
 )
 
 
@@ -388,7 +388,7 @@ class DirectionModel(ModelService):
                 "tradingview": compact_tradingview(context["tradingview"]),
                 "bybit": compact_bybit(context),
             }
-        raw = await self.request(signal_id, checked, schema, "direction_v15.md")
+        raw = await self.request(signal_id, checked, schema, "direction_v16.md")
         result = Decision.model_validate(raw)
         if result.symbol != context["symbol"]:
             raise ValueError("Model symbol mismatch")

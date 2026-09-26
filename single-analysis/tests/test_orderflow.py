@@ -173,7 +173,56 @@ async def test_http_trade_identity_and_book_event_time():
 
 def test_equal_sequence_is_disclosed_not_counted_as_new_update():
     now, books, trades = samples()
-    books = [book.model_copy(update={"sequence": 1}) for book in books]
+    books = [book.model_copy(update={"sequence": 1, "update_id": 1}) for book in books]
     evidence = orderflow_evidence("TESTUSDT", books, trades, now)
     assert evidence["distinct_book_sequences"] == 1
+    assert evidence["distinct_book_samples"] == 1
+    assert evidence["repeated_book_samples"] == 2
     assert not evidence["coverage_complete"]
+
+
+def test_identical_rest_snapshot_does_not_fail_or_inflate_sample_count():
+    now, books, trades = samples()
+    books[1] = books[0].model_copy()
+    evidence = orderflow_evidence("TESTUSDT", books, trades, now)
+    assert evidence["book_sample_count"] == 3
+    assert evidence["distinct_book_samples"] == 2
+    assert evidence["repeated_book_samples"] == 1
+    assert not evidence["coverage_complete"]
+
+
+@pytest.mark.parametrize("identity", ["sequence", "update_id"])
+def test_same_book_identity_with_changed_content_rejected(identity):
+    now, books, trades = samples()
+    books[1] = books[0].model_copy(update={
+        "bids": (books[0].bids[0].model_copy(update={"size": D(11)}), *books[0].bids[1:]),
+    })
+    with pytest.raises(ValueError, match="Conflicting orderflow book"):
+        orderflow_evidence("TESTUSDT", books, trades, now)
+    now, books, trades = samples()
+    books[1] = books[1].model_copy(update={identity: getattr(books[0], identity)})
+    with pytest.raises(ValueError, match="Conflicting orderflow book"):
+        orderflow_evidence("TESTUSDT", books, trades, now)
+
+
+@pytest.mark.parametrize("field,value", [("sequence", 0), ("update_id", 0)])
+def test_book_identity_regression_rejected(field, value):
+    now, books, trades = samples()
+    books[-1] = books[-1].model_copy(update={field: value})
+    with pytest.raises(ValueError, match="Regressing book"):
+        orderflow_evidence("TESTUSDT", books, trades, now)
+
+
+def test_book_event_time_regression_rejected():
+    now, books, trades = samples()
+    books[-1] = books[-1].model_copy(update={"observed_at": books[0].observed_at})
+    with pytest.raises(ValueError, match="Regressing book"):
+        orderflow_evidence("TESTUSDT", books, trades, now)
+
+
+def test_distinct_updates_in_same_millisecond_are_allowed():
+    now, books, trades = samples()
+    books = [book.model_copy(update={"observed_at": books[0].observed_at}) for book in books]
+    evidence = orderflow_evidence("TESTUSDT", books, trades, now)
+    assert evidence["distinct_book_samples"] == 3
+    assert evidence["repeated_book_samples"] == 0

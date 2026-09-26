@@ -2,11 +2,13 @@
 
 import asyncio
 import json
+import math
 import sqlite3
 import time
 from pathlib import Path
 
 from longtime.model import Decision
+from longtime.store import encode, identity
 
 
 class SignalConsumer:
@@ -38,8 +40,11 @@ class SignalConsumer:
             self.store.set("signal_heartbeat", time.time())
             self.store.resolve("SIGNAL_FEED")
 
-    async def consume(self, row):
+    @staticmethod
+    def validate(row):
         payload = json.loads(row["payload"])
+        if not isinstance(payload, dict):
+            raise ValueError("信号必须是对象")
         required = {
             "version",
             "signal_id",
@@ -57,17 +62,23 @@ class SignalConsumer:
             required |= {"cycle_id", "analysis_started_at"}
         if (
             set(payload) != required
+            or type(version) is not int
             or version not in (1, 2)
             or type(payload["normal_candidate"]) is not bool
         ):
             raise ValueError("信号结构无效")
         if payload["signal_id"] != row["signal_id"] or payload["symbol"] != row["symbol"]:
             raise ValueError("信号身份不匹配")
-        now = time.time()
+        if not isinstance(payload["signal_id"], str) or not 1 <= len(payload["signal_id"]) <= 200:
+            raise ValueError("信号编号无效")
+        if any(type(payload[key]) not in (int, float) for key in ("published_at", "expires_at")):
+            raise ValueError("信号时间类型无效")
         published = float(payload["published_at"])
         expires = float(payload["expires_at"])
         if (
-            published != row["published_at"]
+            not math.isfinite(published)
+            or not math.isfinite(expires)
+            or published != row["published_at"]
             or expires != row["expires_at"]
             or expires - published != 600
         ):
@@ -84,8 +95,6 @@ class SignalConsumer:
                 or not 0 < float(started) <= published
             ):
                 raise ValueError("分析轮次字段无效")
-        if not published <= now < expires:
-            return
         decision = Decision.model_validate(
             {k: payload[k] for k in ("symbol", "decision", "reason")}
         )
@@ -93,9 +102,48 @@ class SignalConsumer:
         if hedge is not None and (
             not isinstance(hedge, dict)
             or set(hedge) != {"group_id", "generation"}
+            or not isinstance(hedge["group_id"], str)
+            or not 1 <= len(hedge["group_id"]) <= 200
             or type(hedge["generation"]) is not int
+            or hedge["generation"] < 0
         ):
             raise ValueError("对冲信号归属无效")
+        return payload, decision, cycle_id, published, expires
+
+    def reject(self, row, key):
+        # Keep only bounded identity metadata: validation errors can contain raw input.
+        at = time.time()
+        evidence = {"publication_id": row["id"], "rejection_id": key, "status": "REJECTED"}
+        with self.store.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            if not db.execute(
+                "INSERT OR IGNORE INTO state(key,value) VALUES (?,?)",
+                (key, encode(evidence)),
+            ).rowcount:
+                return
+            db.execute(
+                "INSERT INTO events(created_at,kind,payload) VALUES (?,?,?)",
+                (at, "SIGNAL_REJECTED", encode(evidence)),
+            )
+        self.app.executor.alert(
+            key, "monitor", evidence, ValueError("发布信号结构、身份或时间字段无效，已拒绝且不重放")
+        )
+
+    async def consume(self, row):
+        key = "SIGNAL_REJECTED:" + identity(str(self.path.resolve()), row["id"], row["signal_id"])
+        if self.store.state(key) is not None:
+            return
+        try:
+            payload, decision, cycle_id, published, expires = self.validate(row)
+        except (ValueError, TypeError, KeyError, OverflowError):
+            # Only decoding/validation is isolated here. Storage failures still fail the
+            # feed tick, and execution failures retain the existing durable-claim path.
+            self.reject(row, key)
+            return
+        if not published <= time.time() < expires:
+            return
+        sid = "feed:" + payload["signal_id"]
+        hedge = payload["hedge"]
         # Atomic durable claim: any failure/crash after claim is handled through order
         # intent reconciliation, NEVER by replaying an old direction.
         if not self.store.signal(sid, cycle_id, decision.symbol, payload):

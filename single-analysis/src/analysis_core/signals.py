@@ -81,10 +81,11 @@ class HedgeSniffer:
             values = {
                 r["key"]: json.loads(r["value"])
                 for r in db.execute(
-                    "SELECT key,value FROM state WHERE key IN ('monitor_heartbeat','exchange_positions')"
+                    "SELECT key,value FROM state WHERE key IN "
+                    "('exchange_positions_observed_at','exchange_positions')"
                 )
             }
-            age = now - values.get("monitor_heartbeat", 0)
+            age = now - values.get("exchange_positions_observed_at", 0)
             if not 0 <= age <= 20:
                 raise RuntimeError("对冲仓位快照超过20秒或时间异常，无法确认待判向币种")
             positions = values.get("exchange_positions", [])

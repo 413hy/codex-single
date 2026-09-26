@@ -16,7 +16,7 @@ TradingView 网站内部请求并非公开稳定数据 API；无需登录即可�
 ## 模型与调度
 
 - TradingView 初选：`gpt-5.6-terra / medium`，`tv_selection_v1.md`。
-- Bybit 复核最终方向和额外双仓：`gpt-6-sol / medium`，分别使用 `direction_selection_v1.md` 与 `direction_v15.md`。
+- Bybit 复核最终方向和额外双仓：`gpt-6-sol / medium`，分别使用 `direction_selection_v2.md` 与 `direction_v16.md`。
 - 仅隔离模型服务进程调用模型；失败不二次追问、不降级旧扫描流程。提示词、Schema、输入与输出审计保存在本地分析库。
 - 频率可由分析 Bot 设置为 10—1440 分钟且为 10 的整数倍，以 1970-01-01 上海时间 00:00 为固定锚点跨日连续计算。交易 Bot 不修改频率。
 
@@ -34,3 +34,5 @@ cd /root/single-analysis
 
 新流程与来源说明见 [重构报告](docs/refactor-20260926/REPORT.md)。
 14:02 TradingView 异常与一轮信号的实际来源见 [根因和信号追踪](docs/refactor-20260926/ROOT-CAUSE-20260926.md)。
+
+需求矩阵、逐文件复审、模型优化与剩余建议见 [本次审核报告](docs/audit-20260926/REPORT.md)。

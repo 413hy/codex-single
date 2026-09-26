@@ -6,6 +6,6 @@
 
 两套交易系统只读查询尚未过期的发布，各自将 `feed:<signal_id>` 原子认领到独立账本。普通方向由各交易系统按自身资金、仓位和风控决定是否执行。非普通对冲方向只由归属匹配且 generation 有效的对冲系统处理；普通交易系统记录后跳过。SKIP 仅记录，不下单。失败或重启后不得重新认领旧 ID 制造成交。
 
-对冲快照取自对冲系统交易所同步的仓位及监控心跳。分析端核对 20 秒时效、LOCKED 阶段、两侧账本归属、双向槽位、数量和均价；消费端再次核对组状态及 generation。
+对冲快照取自对冲系统交易所同步的仓位及同事务保存的独立观测时间。分析端核对 20 秒时效、LOCKED 阶段、两侧账本归属、双向槽位、数量和均价；消费端再次核对组状态及 generation。
 
 采集器在 `src/analysis_core/tradingview.py`、`tradingview_discovery.py` 和 `tradingview_sources.py`。新增公开数据源按 `name/stage/collect` 适配，明确身份、范围、时间和缺失语义。TradingView 网页内部接口不是稳定公共 API；不可用时显式失败或记录可选背景缺失。

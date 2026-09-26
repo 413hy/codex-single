@@ -3,6 +3,7 @@ from datetime import UTC, datetime
 import pytest
 
 from analysis_core.config import Settings
+from analysis_core.model import ModelServiceError
 from analysis_core.selection import (
     FinalSelection,
     SelectionModels,
@@ -94,7 +95,7 @@ async def test_tradingview_initial_selection_and_bybit_final_ranking(tmp_path):
 async def test_tv_stage_rejects_empty_unknown_or_discontinuous(tmp_path, answer):
     models = SelectionModels(Settings(_env_file=None), Store(tmp_path / "db"),
                              tv_runner=Runner(answer))
-    with pytest.raises(ValueError):
+    with pytest.raises(ModelServiceError):
         await models.choose_tv("cycle", [{"symbol": "AUSDT", "discovery": {},
                                            "tradingview": tv("AUSDT")}])
 
@@ -107,7 +108,7 @@ async def test_tv_stage_rejects_empty_unknown_or_discontinuous(tmp_path, answer)
 async def test_final_stage_rejects_empty_unknown_or_duplicate(tmp_path, answer):
     models = SelectionModels(Settings(_env_file=None), Store(tmp_path / "db"),
                              final_runner=Runner(answer))
-    with pytest.raises(ValueError):
+    with pytest.raises(ModelServiceError):
         await models.choose_final("cycle", [{"symbol": "AUSDT", "tv_initial": {},
                                              "tradingview": tv("AUSDT"),
                                              "bybit": bybit("AUSDT")}])
@@ -122,3 +123,22 @@ def test_compaction_keeps_1h_evidence_and_source_scope():
         TVSelection.model_validate({"candidates": []})
     with pytest.raises(ValueError):
         FinalSelection.model_validate({"selected": []})
+
+
+@pytest.mark.parametrize("stage", ["tv", "final"])
+async def test_model_request_failure_stops_after_one_call(tmp_path, stage):
+    from unittest.mock import AsyncMock
+
+    runner = AsyncMock()
+    runner.request.side_effect = ValueError("invalid model JSON")
+    models = SelectionModels(Settings(_env_file=None), Store(tmp_path / "db"),
+                             tv_runner=runner, final_runner=runner)
+    bundle = {"symbol": "AUSDT", "discovery": {}, "tv_initial": {},
+              "tradingview": tv("AUSDT"), "bybit": bybit("AUSDT")}
+    with pytest.raises(ModelServiceError):
+        await getattr(models, "choose_" + stage)("cycle", [bundle])
+    runner.request.assert_awaited_once()
+    runner.reset_mock()
+    with pytest.raises(ValueError):
+        await getattr(models, "choose_" + stage)("empty", [])
+    runner.request.assert_not_awaited()

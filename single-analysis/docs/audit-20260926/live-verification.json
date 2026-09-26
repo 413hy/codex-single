@@ -1,0 +1,105 @@
+{
+  "checked_at": "2026-09-26T15:05:38.930508+08:00",
+  "cycle": {
+    "cycle_id": "scheduled:c2ffcbd3d17123c6138034ed",
+    "started_at": 1790406000.520274,
+    "completed_at": 1790406308.9390397,
+    "status": "SUCCESS",
+    "details": "{}"
+  },
+  "state": {
+    "analysis_interval": 60,
+    "analysis_paused": false,
+    "next_analysis_at": 1790409600.0
+  },
+  "publications": [
+    {
+      "signal_id": "d402e252fecda754c16bb92c",
+      "symbol": "FILUSDT",
+      "published_at": 1790406280.3617449,
+      "expires_at": 1790406880.3617449,
+      "decision": "LONG"
+    },
+    {
+      "signal_id": "2b4206d28ce9bfff1871653b",
+      "symbol": "LONGXIAUSDT",
+      "published_at": 1790406280.3786695,
+      "expires_at": 1790406880.3786695,
+      "decision": "SHORT"
+    },
+    {
+      "signal_id": "f15b9bd752caa17fdc080b40",
+      "symbol": "LTCUSDT",
+      "published_at": 1790406280.3920398,
+      "expires_at": 1790406880.3920398,
+      "decision": "LONG"
+    },
+    {
+      "signal_id": "345f83a8b1faaad9f8274c38",
+      "symbol": "RAREUSDT",
+      "published_at": 1790406308.8898332,
+      "expires_at": 1790406908.8898332,
+      "decision": "LONG"
+    }
+  ],
+  "consumers": [
+    {
+      "system": "auto-trader-longtime",
+      "receipts": [
+        {
+          "symbol": "FILUSDT",
+          "status": "OPEN",
+          "side": "LONG"
+        },
+        {
+          "symbol": "LONGXIAUSDT",
+          "status": "OPEN",
+          "side": "SHORT"
+        },
+        {
+          "symbol": "LTCUSDT",
+          "status": "SKIP_SIZE_LIMIT",
+          "side": null
+        },
+        {
+          "symbol": "RAREUSDT",
+          "status": "SKIP_NOT_NORMAL_CANDIDATE",
+          "side": "LONG"
+        }
+      ],
+      "open_incidents": []
+    },
+    {
+      "system": "auto-trader-longtime-02",
+      "receipts": [
+        {
+          "symbol": "FILUSDT",
+          "status": "OPEN",
+          "side": "LONG"
+        },
+        {
+          "symbol": "LONGXIAUSDT",
+          "status": "OPEN",
+          "side": "SHORT"
+        },
+        {
+          "symbol": "LTCUSDT",
+          "status": "SKIP_SIZE_LIMIT",
+          "side": null
+        },
+        {
+          "symbol": "RAREUSDT",
+          "status": "HEDGE_DIRECTION_APPLIED",
+          "side": "LONG"
+        }
+      ],
+      "open_incidents": []
+    }
+  ],
+  "notification": [
+    {
+      "status": "SENT",
+      "attempts": 1
+    }
+  ]
+}

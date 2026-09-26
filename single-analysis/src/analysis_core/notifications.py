@@ -71,13 +71,26 @@ def signal_detail(store, sid):
     reason = payload.get("reason") or "本轮未产生完整分析结果，请查看分析异常，等待下一轮。"
     text = f"📊 币种分析详情\n北京时间 {stamp}\n{signal_heading(row)}"
     initial = evidence.get("tv_initial")
+    final = evidence.get("final_selection")
+    if not final and initial:
+        events = store.rows(
+            "SELECT payload FROM events WHERE kind='FINAL_SELECTION_RESULT' "
+            "AND json_extract(payload,'$.cycle_id')=? ORDER BY id DESC LIMIT 1",
+            (row["cycle_id"],),
+        )
+        if events:
+            final = next((item for item in json.loads(events[0]["payload"])["result"]["selected"]
+                          if item["symbol"] == row["symbol"]), None)
     if isinstance(initial, dict):
         tv_side = {"LONG": "做多", "SHORT": "做空"}.get(str(initial.get("direction")), "未确定")
         text += (
             f"\n\nTradingView 初判：{tv_side} · {initial.get('confidence', '未知')}"
             f"\n依据：{initial.get('reason', '未记录')}"
-            f"\n\nTradingView＋Bybit 复核后的最终理由：{reason}"
         )
+        if final and row["status"] == "PUBLISHED":
+            final_side = {"LONG": "做多", "SHORT": "做空"}.get(final["direction"], "未确定")
+            text += f"\n\n最终复核：{final_side} · {final['confidence']}"
+        text += f"\n\nTradingView＋Bybit 复核后的最终理由：{reason}"
     else:
         if evidence.get("tradingview"):
             text += "\n\nTradingView 与 Bybit 联合分析双仓"

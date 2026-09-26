@@ -196,3 +196,39 @@ async def test_total_timeout_keeps_drain_window_and_safe_diagnostic(tmp_path, mo
         assert bot.store.state(STATE_KEY)['phase'] == 'uncertain'
     finally:
         await bot.close()
+
+
+@pytest.mark.parametrize('retry_after', [180, None, -1, True])
+async def test_analysis_rate_limit_defers_delivery_and_survives_restart(tmp_path, clock, retry_after):
+    from analysis_core.bot import RATE_LIMIT_KEY
+
+    calls = []
+
+    async def wire(request):
+        calls.append(clock[0])
+        if len(calls) == 1:
+            return httpx.Response(429, json={
+                'ok': False, 'parameters': {'retry_after': retry_after},
+                'description': 'private body',
+            })
+        return httpx.Response(200, json={'ok': True, 'result': []})
+
+    settings = Settings(_env_file=None, telegram_token='rate-analysis')
+    store = Store(tmp_path / 'db')
+    bot = AnalysisBot(settings, store, httpx.AsyncClient(transport=httpx.MockTransport(wire)))
+    try:
+        with pytest.raises(BotAPIError, match='429'):
+            await bot.call('getMe')
+        expected = 180 if retry_after == 180 else 60
+        assert store.state(RATE_LIMIT_KEY) == 1000 + expected
+        store.queue('pending', 'message')
+        await bot.deliver()
+        assert store.rows('SELECT attempts FROM outbox')[0]['attempts'] == 0
+        assert len(calls) == 1
+        await bot.close()
+        bot = AnalysisBot(settings, Store(store.path),
+                          httpx.AsyncClient(transport=httpx.MockTransport(wire)))
+        await bot.call('getMe')
+        assert calls[-1] >= 1000 + expected
+    finally:
+        await bot.close()

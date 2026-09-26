@@ -40,12 +40,25 @@ def orderflow_evidence(symbol, books, trades, now):
                 raise ValueError("Invalid orderflow ladder")
         if book.bids[0].price >= book.asks[0].price:
             raise ValueError("Crossed orderflow book")
-    # Equal sequence is a repeated market state, not a new independent update.
+    # REST returns exchange-generated snapshots, not a fresh market event per
+    # request. Repeated snapshots are valid but provide no independent update.
     if any(
-        b.observed_at <= a.observed_at or b.sequence < a.sequence
+        b.observed_at < a.observed_at
+        or b.sequence < a.sequence
+        or b.update_id < a.update_id
         for a, b in zip(books, books[1:], strict=False)
     ):
-        raise ValueError("Non-increasing book time or regressing sequence")
+        raise ValueError("Regressing book time, sequence or update ID")
+    for previous, current in zip(books, books[1:], strict=False):
+        if previous.sequence == current.sequence or previous.update_id == current.update_id:
+            if (
+                previous.sequence != current.sequence
+                or previous.update_id != current.update_id
+                or previous.bids != current.bids
+                or previous.asks != current.asks
+            ):
+                raise ValueError("Conflicting orderflow book sequence/update ID")
+    distinct_book_samples = len({(book.sequence, book.update_id) for book in books})
     unique: dict[str, BybitPublicTrade] = {}
     for trade in trades:
         if (
@@ -133,6 +146,9 @@ def orderflow_evidence(symbol, books, trades, now):
         ),
         "book_latest_age_seconds": D(str((now - latest.observed_at).total_seconds())),
         "book_snapshots": [b.model_dump(mode="json") for b in books],
+        "book_sample_count": len(books),
+        "distinct_book_samples": distinct_book_samples,
+        "repeated_book_samples": len(books) - distinct_book_samples,
         "distinct_book_sequences": len({b.sequence for b in books}),
         "spread_bps": (latest.asks[0].price - latest.bids[0].price) / midpoint * 10000,
         "large_displayed_levels": sorted(walls, key=lambda x: x["size_ratio"], reverse=True)[:10],
@@ -147,6 +163,7 @@ def orderflow_evidence(symbol, books, trades, now):
         ],
         "limitations": [
             "三次REST快照不证明期间连续存在；价位聚合量不是单一订单或交易者身份。",
+            "相同序列和更新ID的重复快照只算一个独立盘口状态，不能据请求次数推断挂单持续性。",
             "数量减少可能是成交或撤单；增加可能是新挂单；不能确认撤单、补单、冰山或吸收。",
             "大挂单定义为同侧附近最多六个已显示价位数量中位数的至少3倍，仅描述相对规模。",
             "逐笔最多1000条、仅保留近300秒，30/60/300秒嵌套窗口不是完整覆盖也不是独立投票。",

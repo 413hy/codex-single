@@ -1,0 +1,42 @@
+{
+  "final": {
+    "prompt": "direction_selection_v2.md",
+    "prompt_sha256": "082641d1ce0c4bcc177a7d03e12a97126129391d3fc8e8d2966edeeb605c214d",
+    "result": {
+      "selected": [
+        {
+          "symbol": "ARKUSDT",
+          "rank": 1,
+          "direction": "LONG",
+          "confidence": "MEDIUM",
+          "reason": "TradingView初判偏多，但快照均未确认收盘；Bybit截至06:00 UTC的已收盘15m、30m、1h均显示反弹后收于近期高位，1h收盘0.28288，成交量为此前20根均量的约1.50倍，支持初判。相比RARE的单段放量和ZEC的缩量下行，ARK的多周期上行更连贯，因此排第一。主要反证是04:00—05:00的1h曾从0.27930跌至0.25923，且2h RSI约85，急涨后的回撤风险压低置信度。"
+        },
+        {
+          "symbol": "RAREUSDT",
+          "rank": 2,
+          "direction": "LONG",
+          "confidence": "LOW",
+          "reason": "TradingView初判偏多，但其06:02 UTC快照处于形成中；Bybit截至06:00的最后一根15m从0.015115升至0.015587，成交量为此前20根均量的约3.56倍，30m和1h也收高，支持初判。它的近端放量强于ZEC的缩量下行，因此排第二，但上行主要集中在最后一段，连贯性弱于ARK。主要反证是1h收盘仍低于前夜0.01583，且最近8小时1h窗口仍下跌约1.57%；06:00后的急涨只见于1m和不完整成交样本，不能据此提高置信度。"
+        },
+        {
+          "symbol": "ZECUSDT",
+          "rank": 3,
+          "direction": "SHORT",
+          "confidence": "LOW",
+          "reason": "TradingView初判偏空，但06:00 UTC附近的技术快照未确认收盘；Bybit截至06:00的已收盘30m从00:00的1555.85降至1534.58，1h最近8小时窗口约跌1.01%，支持初判。相较入选的ARK和RARE，它缺少近期放量延续，故排第三。主要反证是最后三小时15m走势近乎持平、最后一根30m回升，且1h成交量仅为此前20根均量的约0.21倍；盘口与主动成交仅是短暂、不完整样本，方向把握较低。"
+        }
+      ]
+    }
+  },
+  "hedge": {
+    "prompt": "direction_v16.md",
+    "prompt_sha256": "9b74d2f0075e8e4bf437b33bb884866d28ec4c07f1831be440e695071c3672e7",
+    "result": {
+      "symbol": "MUBARAKUSDT",
+      "decision": "SHORT",
+      "reason": "未来约1—2小时偏空：Bybit同合约已收盘15m连续从0.059717回落至0.054622，末两根30m下跌且放量，05:00—06:00的1h以6355万成交量收跌。TradingView的15m、30m方向评级偏空，价格低于相应EMA20，但其06:04附近数据仍在形成中，不能当作已收盘K线。主要反证是Bybit已收盘1h仍高于EMA20、MACD柱为正，且不完整的近期主动成交样本买量略占优，提示急跌后可能反弹；这些证据削弱空头把握，但尚未扭转已收盘量价方向。"
+    }
+  },
+  "published": false,
+  "data_role": "historical offline validation, not live directions"
+}

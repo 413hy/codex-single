@@ -66,13 +66,6 @@ class AnalysisApp:
                     self.store.event("TV_DISCOVERY", {
                         "cycle_id": cid, "pool": pool, "excluded": exclusions,
                     })
-                    pool_symbols = {item["symbol"] for item in pool}
-                    for old in self.store.rows(
-                        "SELECT scope FROM incidents WHERE scope LIKE 'TV_EVIDENCE:%' "
-                        "AND status IN ('OPEN','RUNNING')"
-                    ):
-                        if old["scope"].removeprefix("TV_EVIDENCE:") not in pool_symbols:
-                            self.store.resolve(old["scope"])
                     tv_bundles = []
                     for candidate in pool:
                         try:
@@ -152,6 +145,7 @@ class AnalysisApp:
                         "direction_required": item.rank == 1,
                         "priority_hedge": symbol in hedged,
                         "tv_initial": by_symbol[symbol]["tv_initial"],
+                        "final_selection": item.model_dump(),
                         "observed_at": context["observed_at"],
                     }
                     if not self.store.signal(sid, cid, symbol, candidate):
@@ -210,6 +204,9 @@ class AnalysisApp:
                         if not -5 <= age <= 600:
                             raise ValueError("Bybit方向证据在发布时已过期或时间异常")
                         decision = await self.model.decide(sid, context)
+                        age = time.time() - datetime.fromisoformat(context["observed_at"]).timestamp()
+                        if not -5 <= age <= 600:
+                            raise ValueError("Bybit方向证据在发布时已过期或时间异常")
                         payload = self.bus.publish(
                             sid, decision, cycle_id=cid, analysis_started_at=now,
                             normal=False,

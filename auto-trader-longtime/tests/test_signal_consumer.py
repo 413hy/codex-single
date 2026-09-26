@@ -208,3 +208,51 @@ async def test_shutdown_records_interruption_without_replaying_claim(consumer):
     await consumer.consumer.tick()
     assert consumer.executor.enter.await_count == 1
     assert consumer.store.rows("SELECT * FROM events WHERE kind='SIGNAL_INTERRUPTED'")
+
+
+@pytest.mark.parametrize("malformation", ["json", "list", "decision", "time", "hedge"])
+async def test_rejected_publication_does_not_block_later_signal_or_repeat_after_restart(
+    consumer, malformation
+):
+    publication(consumer.settings.signal_db, sid="invalid")
+    publication(consumer.settings.signal_db, sid="valid")
+    with sqlite3.connect(consumer.settings.signal_db) as db:
+        raw = db.execute("SELECT payload FROM publications WHERE signal_id='invalid'").fetchone()[0]
+        payload = json.loads(raw)
+        if malformation == "json":
+            raw = "private-marker:invalid-json"
+        elif malformation == "list":
+            raw = json.dumps(["private-marker"])
+        else:
+            if malformation == "decision":
+                payload["decision"] = "private-marker"
+            elif malformation == "time":
+                payload["expires_at"] += 1
+            else:
+                payload["hedge"] = {"group_id": ["private-marker"], "generation": 1}
+            raw = json.dumps(payload)
+        db.execute("UPDATE publications SET payload=? WHERE signal_id='invalid'", (raw,))
+    await consumer.consumer.tick()
+    await consumer.consumer.tick()
+    consumer.executor.enter.assert_awaited_once()
+    assert consumer.executor.enter.call_args.args[1] == "feed:valid"
+    events = consumer.store.rows("SELECT * FROM events WHERE kind='SIGNAL_REJECTED'")
+    assert len(events) == 1
+    assert json.loads(events[0]["payload"])["status"] == "REJECTED"
+    assert "private-marker" not in json.dumps(consumer.store.rows("SELECT * FROM events"))
+    assert "private-marker" not in json.dumps(consumer.store.rows("SELECT * FROM incidents"))
+    restarted = App(consumer.settings, exchange=AsyncMock(), markets=AsyncMock())
+    restarted.executor.enter = AsyncMock()
+    await restarted.consumer.tick()
+    restarted.executor.enter.assert_not_awaited()
+    assert len(restarted.store.rows("SELECT * FROM events WHERE kind='SIGNAL_REJECTED'")) == 1
+    with sqlite3.connect(consumer.settings.signal_db) as db:
+        assert db.execute("SELECT payload FROM publications WHERE signal_id='invalid'").fetchone()[0] == raw
+
+
+async def test_execution_value_error_is_not_misclassified_as_bad_publication(consumer):
+    publication(consumer.settings.signal_db)
+    consumer.executor.enter.side_effect = ValueError("exchange position changed")
+    await consumer.consumer.tick()
+    assert consumer.store.rows("SELECT status FROM signals")[0]["status"] == "ERROR"
+    assert consumer.store.rows("SELECT * FROM events WHERE kind='SIGNAL_REJECTED'") == []

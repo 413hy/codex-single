@@ -27,12 +27,12 @@ def incident_text(scope, kind, error, incident_id, symbol=None):
         title = "分析额度暂不可用" if quota else "分析服务暂时繁忙"
         cause = "模型上游返回容量不足（capacity），未能完成本轮分析。"
         impact = "本轮剩余分析已跳过，已有止盈及对冲继续有效。"
-        action = "检查模型额度后重试。" if quota else "下一轮自动重新分析，也可点击下方按钮重试。"
+        action = "请到独立分析Bot检查模型额度。" if quota else "请到独立分析Bot查看后续轮次；交易Bot不会调用模型。"
         if quota:
             cause = "模型上游返回额度不足，当前无法继续分析。"
         elif "认证" in error or "401" in error:
             title, cause = "分析服务认证失败", "模型上游拒绝当前登录或凭据（401）。"
-            action = "检查模型服务登录或凭据，恢复后再重试。"
+            action = "请到独立分析系统检查模型登录状态；交易Bot不会调用模型。"
         elif "超时" in error:
             title, cause = "分析服务响应超时", "本次分析超过等待时限，调用已终止。"
         elif "429" in error:
@@ -51,7 +51,7 @@ def incident_text(scope, kind, error, incident_id, symbol=None):
         if kind == "candidate":
             title, cause = "开仓被交易所拒绝", "交易所明确拒绝了本次开仓请求。"
             impact = "本次请求未开仓；已有仓位及保护单不受此拒单影响。"
-            action = "排除拒单原因后再重试；按钮会重新取行情并筛选，不重发旧方向。"
+            action = "排除拒单原因后等待下一轮新信号；按钮只核对原记录，不重发旧方向。"
             if "110126" in error:
                 cause = "该合约要求的交易协议尚未签署（110126）。"
                 action = "需在Bybit账户确认该合约协议；处理后再重试，程序不能代签。"
@@ -76,14 +76,10 @@ def incident_text(scope, kind, error, incident_id, symbol=None):
         impact = "Bot指令可能延迟；此错误不代表交易所仓位或保护单异常。"
         action = "系统会继续接收，连续正常5分钟后解除；也可点击按钮检查状态。"
     elif category in ("SCAN_DATA", "CANDIDATE", "CYCLE", "MODEL"):
-        title = "本轮分析未完成"
-        cause = (
-            "有效行情证据不足6份，无法完成六币复核。"
-            if "6份" in error or "不足6" in error
-            else "行情采集或模型分析未通过检查。"
-        )
-        impact = "受影响的候选已跳过，已有止盈及对冲保留。"
-        action = "下一轮会重新取行情；也可点击下方按钮重试。"
+        title = "历史分析异常"
+        cause = "这是迁移前保留的分析记录。"
+        impact = "当前交易端仅消费共享方向信号，不执行选币或模型分析。"
+        action = "新的分析结果请查看独立分析Bot；此按钮不会重新分析或重放旧方向。"
     elif category == "MONITOR":
         title = "交易所状态核对未完成"
         cause = "本次未取得完整的交易所状态。"
@@ -91,6 +87,11 @@ def incident_text(scope, kind, error, incident_id, symbol=None):
             cause = "Bybit只读查询失败：" + error[:240]
         impact = "最新仓位及委托状态暂未确认；不代表保护单已失效。"
         action = "系统会自动继续核对，成功后解除；也可点击按钮立即检查。"
+    elif category == "SIGNAL_REJECTED":
+        title = "发布信号已拒绝"
+        cause = "信号结构、身份或时间字段未通过校验。"
+        impact = "该信号不会执行；其他有效信号继续独立处理。"
+        action = "检查分析端发布记录；本地保留拒绝记录，不重放该信号。"
     else:
         title = "交易状态检查异常" if kind == "monitor" else "系统操作未完成"
         cause = "未能完成最新状态核对，详细原因已记入日志。"

@@ -17,6 +17,20 @@ class Monitor:
         self.executor = executor
         self.store, self.exchange = executor.store, executor.exchange
 
+    async def capture_positions(self):
+        # Use the request start as the conservative age of a possibly paginated
+        # exchange read. A later monitor heartbeat must never refresh old data.
+        observed_at = time.time()
+        positions = await self.exchange.active_positions()
+        with self.store.connect() as db:
+            db.executemany(
+                "INSERT INTO state VALUES (?,?) "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                [("exchange_positions", encode(positions)),
+                 ("exchange_positions_observed_at", encode(observed_at))],
+            )
+        return positions
+
     async def capture_entry_evidence(self, tid):
         t = self.store.trade(tid)
         d = json.loads(t["details"])
@@ -49,8 +63,7 @@ class Monitor:
         if hasattr(self.executor, "hedge"):
             async with self.executor.lock:
                 await self.executor.hedge.tick()
-        positions = await self.exchange.active_positions()
-        self.store.set("exchange_positions", positions)
+        positions = await self.capture_positions()
         own = self.store.rows(
             "SELECT * FROM trades WHERE owned=1 AND status IN ('INTENT','OPEN','SETTLING')"
         )
@@ -142,8 +155,7 @@ class Monitor:
                 "SELECT symbol,position_idx FROM trades WHERE owned=1 AND status IN ('INTENT','OPEN','SETTLING')"
             )
         }
-        positions = await self.exchange.active_positions()
-        self.store.set("exchange_positions", positions)
+        positions = await self.capture_positions()
         observed = {
             (p["symbol"], int(p["positionIdx"])): p
             for p in positions

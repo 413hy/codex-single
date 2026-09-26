@@ -19,6 +19,7 @@ from longtime.polling import STATE_KEY, PollingGuard
 from longtime.trading_settings import EntryDefaults
 
 log = logging.getLogger(__name__)
+RATE_LIMIT_KEY = "telegram_rate_limit_until"
 
 
 def main_keyboard(paused):
@@ -74,6 +75,17 @@ class Telegram:
         self._poll_failures = 0
 
     async def call(self, method, payload=None):
+        # Shared durable cooldown: a poll rejection must also stop notification
+        # requests. Sleep in cancellable chunks without consuming retry budgets.
+        while self.store:
+            try:
+                delay = self.store.state(RATE_LIMIT_KEY, 0) - time.time()
+            except sqlite3.Error:
+                # The independent emergency channel must work without SQLite.
+                break
+            if delay <= 0:
+                break
+            await asyncio.sleep(min(delay, 30))
         if method != "getUpdates":
             return await self._call(method, payload)
         try:
@@ -118,7 +130,36 @@ class Telegram:
                 raise TelegramAPIError(
                     f"Telegram {method} rejected (HTTP {r.status_code})", transient=True
                 )
-            d = r.json()
+            try:
+                d = r.json()
+            except ValueError:
+                if r.status_code != 429:
+                    raise
+                d = {}
+            if r.status_code == 429 or d.get("error_code") == 429:
+                parameters = d.get("parameters")
+                retry_after = (
+                    parameters.get("retry_after") if isinstance(parameters, dict) else None
+                )
+                # Missing/malformed server guidance never becomes a tight retry loop.
+                seconds = retry_after if type(retry_after) is int and retry_after > 0 else 60
+                if self.store:
+                    self.store.set(
+                        RATE_LIMIT_KEY,
+                        max(self.store.state(RATE_LIMIT_KEY, 0), time.time() + seconds),
+                    )
+                    self.store.event(
+                        "TELEGRAM_RATE_LIMIT",
+                        {
+                            "method": method,
+                            "retry_after": seconds,
+                            "server_retry_after": seconds == retry_after,
+                        },
+                    )
+                raise TelegramAPIError(
+                    f"Telegram {method} rate limited (429, retry_after={seconds}s)",
+                    transient=True,
+                )
             if r.status_code >= 400 or d.get("ok") is not True:
                 raise TelegramAPIError(
                     f"Telegram {method} rejected (HTTP {r.status_code}, code {d.get('error_code')})"
@@ -169,11 +210,18 @@ class Telegram:
             await self._deliver()
 
     async def _deliver(self):
+        try:
+            if self.store.state(RATE_LIMIT_KEY, 0) > time.time():
+                return
+        except sqlite3.Error:
+            pass  # Deliver the independent database emergency notice first.
         await self.deliver_emergency()
         for row in self.store.rows(
             "SELECT * FROM outbox WHERE status='PENDING' AND next_attempt<=? ORDER BY rowid LIMIT 10",
             (time.time(),),
         ):
+            if self.store.state(RATE_LIMIT_KEY, 0) > time.time():
+                break
             if row["attempts"] >= 2:
                 # A process may stop after submitting but before persisting the reply.
                 # The already-consumed automatic budget must survive that restart.
@@ -218,12 +266,16 @@ class Telegram:
                     "UPDATE outbox SET attempts=?,next_attempt=?,status=? WHERE event_key=?",
                     (
                         attempt,
-                        time.time() + 30,
+                        max(time.time() + 30, self.store.state(RATE_LIMIT_KEY, 0)),
                         "FAILED" if attempt >= 2 else "PENDING",
                         row["event_key"],
                     ),
                 )
-                log.error("Telegram delivery failed: %s", type(error).__name__)
+                log.error(
+                    "Telegram delivery failed event=%s: %s",
+                    row["event_key"],
+                    str(error) if isinstance(error, TelegramAPIError) else type(error).__name__,
+                )
                 # Delivery failure cannot reliably alert through the same failed transport.
                 # Persist a single incident for recovery; avoid an alert-of-alert loop.
                 if not row["event_key"].startswith("alert:"):
@@ -350,7 +402,7 @@ class Telegram:
             text = (
                 "已恢复新开仓，等待分析系统发布新的有效信号。"
                 if self.settings.trading_enabled
-                else "已恢复扫描；当前为只读验证模式，不提交订单。"
+                else "已恢复信号接收；当前为只读验证模式，不提交订单。"
             )
         elif command in ("/start", "/status"):
             text = self.status_text()

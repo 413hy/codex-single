@@ -118,6 +118,40 @@ async def test_old_bybit_evidence_cannot_be_repackaged_as_new_signal(producer):
     assert producer.store.rows("SELECT * FROM incidents WHERE scope='PRIMARY_DIRECTION'")
 
 
+@pytest.mark.parametrize("initial_age,model_elapsed,expected", [(0, 601, False), (590, 11, False), (0, 300, True)])
+async def test_hedge_evidence_is_checked_again_after_model(
+    producer, monkeypatch, initial_age, model_elapsed, expected,
+):
+    clock = [1000.0]
+    monkeypatch.setattr("time.time", lambda: clock[0])
+    original_evidence = producer.markets.evidence.side_effect
+    original_decide = producer.model.decide.side_effect
+
+    async def evidence(symbol, candidate):
+        result = await original_evidence(symbol, candidate)
+        result["observed_at"] = datetime.fromtimestamp(clock[0] - initial_age, UTC).isoformat()
+        return result
+
+    async def delayed_decide(sid, context):
+        clock[0] += model_elapsed
+        return original_decide(sid, context)
+
+    producer.markets.evidence.side_effect = evidence
+    producer.model.decide.side_effect = delayed_decide
+    assert await producer.cycle("hedge-model-delay") is expected
+    producer.model.decide.assert_awaited_once()
+    rows = publications(producer)
+    assert {r["symbol"] for r in rows if r["normal_candidate"]} == {"AUSDT", "BUSDT"}
+    assert any(r["symbol"] == "HEDGEUSDT" for r in rows) is expected
+    if not expected:
+        assert producer.store.rows(
+            "SELECT status FROM signals WHERE symbol='HEDGEUSDT'"
+        )[0]["status"] == "ERROR"
+        assert producer.store.rows(
+            "SELECT * FROM incidents WHERE scope='DIRECTION:HEDGEUSDT' AND status='OPEN'"
+        )
+
+
 async def test_one_tradingview_page_failure_is_audited_without_stopping_other_symbols(producer):
     original = producer.markets.tradingview_evidence.side_effect
 
@@ -145,7 +179,7 @@ async def test_one_tradingview_page_failure_is_audited_without_stopping_other_sy
     )
 
 
-async def test_discovery_ineligibility_resolves_old_evidence_alarm(producer):
+async def test_discovery_ineligibility_does_not_claim_source_recovery(producer):
     producer.store.incident("TV_EVIDENCE:MSFUUSDT", "analysis", {}, "stale core bar")
     producer.markets.discovery_exclusions = [{
         "symbol": "MSFUUSDT", "reason": "stale_or_missing_tradingview_core_bars",
@@ -154,7 +188,7 @@ async def test_discovery_ineligibility_resolves_old_evidence_alarm(producer):
     assert await producer.cycle("fresh-pool")
     assert producer.store.rows(
         "SELECT status FROM incidents WHERE scope='TV_EVIDENCE:MSFUUSDT'"
-    )[0]["status"] == "RESOLVED"
+    )[0]["status"] == "OPEN"
     event = producer.store.rows("SELECT payload FROM events WHERE kind='TV_DISCOVERY'")[0]
     assert json.loads(event["payload"])["excluded"][0]["symbol"] == "MSFUUSDT"
 
@@ -175,9 +209,10 @@ async def test_model_service_failure_stops_remaining_model_calls(producer):
 
 
 async def test_final_model_cannot_publish_unknown_or_missing_primary(producer):
-    producer.selection.choose_final.side_effect = ValueError("outside evidence pool")
+    producer.selection.choose_final.side_effect = ModelServiceError("outside evidence pool")
     assert not await producer.cycle("bad-final")
-    assert all(not r["normal_candidate"] for r in publications(producer))
+    assert publications(producer) == []
+    producer.model.decide.assert_not_awaited()
     assert producer.store.rows("SELECT * FROM incidents WHERE scope='PRIMARY_DIRECTION' AND status='OPEN'")
 
 
@@ -214,7 +249,10 @@ async def test_cycle_has_one_notification_and_scheduled_slot_is_not_replayed(pro
     assert producer.selection.choose_tv.await_count == 1
 
 
-@pytest.mark.parametrize("invalid", [None, "unowned", "wrong_symbol", "duplicate_group", "same_side"])
+@pytest.mark.parametrize("invalid", [
+    None, "unowned", "wrong_symbol", "duplicate_group", "same_side",
+    "stale_positions", "missing_observation", "future_observation",
+])
 def test_sniffer_reads_only_fresh_owned_locked_pairs(tmp_path, invalid):
     store = Store(tmp_path / "hedge.db")
     store.execute("CREATE TABLE trades (trade_id TEXT PRIMARY KEY, symbol TEXT, side TEXT, "
@@ -222,6 +260,7 @@ def test_sniffer_reads_only_fresh_owned_locked_pairs(tmp_path, invalid):
     store.execute("CREATE TABLE hedge_groups (group_id TEXT PRIMARY KEY, document TEXT)")
     now = time.time()
     store.set("monitor_heartbeat", now)
+    store.set("exchange_positions_observed_at", now)
     store.set("exchange_positions", [
         {"symbol": "TESTUSDT", "side": side, "positionIdx": idx,
          "size": "1", "avgPrice": "100"}
@@ -234,7 +273,13 @@ def test_sniffer_reads_only_fresh_owned_locked_pairs(tmp_path, invalid):
         "g", json.dumps({"group_id": "g", "symbol": "TESTUSDT", "generation": 2,
                          "active": "a", "child": "b", "phase": "LOCKED"}),
     ))
-    if invalid == "unowned":
+    if invalid == "stale_positions":
+        store.set("exchange_positions_observed_at", now - 21)
+    elif invalid == "missing_observation":
+        store.execute("DELETE FROM state WHERE key='exchange_positions_observed_at'")
+    elif invalid == "future_observation":
+        store.set("exchange_positions_observed_at", now + 1)
+    elif invalid == "unowned":
         store.execute("UPDATE trades SET owned=0 WHERE trade_id='a'")
     elif invalid == "wrong_symbol":
         store.execute("UPDATE hedge_groups SET document=json_set(document,'$.symbol','OTHERUSDT')")

@@ -13,6 +13,8 @@ from analysis_core.polling import STATE_KEY, PollingGuard
 from analysis_core.scheduling import next_slot
 from analysis_core.store import encode, identity
 
+RATE_LIMIT_KEY = "telegram_rate_limit_until"
+
 
 class BotAPIError(RuntimeError):
     def __init__(self, message, *, conflict=False):
@@ -35,6 +37,11 @@ class AnalysisBot:
         return httpx.AsyncClient(timeout=httpx.Timeout(60, connect=10))
 
     async def call(self, method, payload=None):
+        while True:
+            delay = self.store.state(RATE_LIMIT_KEY, 0) - time.time()
+            if delay <= 0:
+                break
+            await asyncio.sleep(min(delay, 30))
         if method != "getUpdates":
             return await self._call(method, payload)
         try:
@@ -70,7 +77,21 @@ class AnalysisBot:
                 + method,
                 json=payload or {},
             )
-            doc = response.json()
+            try:
+                doc = response.json()
+            except ValueError:
+                if response.status_code != 429:
+                    raise
+                doc = {}
+            if response.status_code == 429 or doc.get("error_code") == 429:
+                parameters = doc.get("parameters")
+                retry_after = parameters.get("retry_after") if isinstance(parameters, dict) else None
+                seconds = retry_after if type(retry_after) is int and retry_after > 0 else 60
+                self.store.set(RATE_LIMIT_KEY, max(
+                    self.store.state(RATE_LIMIT_KEY, 0), time.time() + seconds,
+                ))
+                self.store.event("TELEGRAM_RATE_LIMIT", {"method": method, "retry_after": seconds})
+                raise BotAPIError(f"分析Bot {method} 请求受限（429），等待{seconds}秒")
             if response.status_code >= 400 or not doc.get("ok"):
                 description = str(doc.get("description", "")).lower()
                 reason = ""
@@ -365,6 +386,8 @@ class AnalysisBot:
         except RuntimeError:
             pass
     async def deliver(self):
+        if self.store.state(RATE_LIMIT_KEY, 0) > time.time():
+            return
         for r in self.store.rows(
             "SELECT * FROM outbox WHERE status='PENDING' AND next_attempt<=? ORDER BY rowid LIMIT 10",
             (time.time(),),
@@ -397,7 +420,7 @@ class AnalysisBot:
             except Exception:
                 self.store.execute(
                     "UPDATE outbox SET next_attempt=? WHERE event_key=?",
-                    (time.time() + 5, r["event_key"]),
+                    (max(time.time() + 5, self.store.state(RATE_LIMIT_KEY, 0)), r["event_key"]),
                 )
                 raise
 

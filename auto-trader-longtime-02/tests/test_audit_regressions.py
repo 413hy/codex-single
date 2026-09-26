@@ -83,6 +83,34 @@ async def test_closed_during_monitor_not_recorded_as_external(setup):
     assert store.state("exchange_positions") == []
 
 
+async def test_position_snapshot_age_is_not_refreshed_by_slow_monitor(setup, monkeypatch):
+    from types import SimpleNamespace
+
+    from longtime import monitor as monitor_module
+
+    executor, store, exchange, _, _ = setup
+    clock = [1000.0]
+    monkeypatch.setattr(monitor_module, "time", SimpleNamespace(time=lambda: clock[0]))
+    positions = [{"symbol": "EXTERNALUSDT", "positionIdx": 1, "side": "Buy",
+                  "size": "1", "avgPrice": "100"}]
+
+    async def active_positions():
+        clock[0] += 2  # Include network/pagination time in snapshot age.
+        return positions
+
+    async def slow_external_check(symbol):
+        clock[0] += 21
+
+    exchange.active_positions = active_positions
+    monitor = Monitor(executor)
+    monitor.check_external = slow_external_check
+    await monitor.tick()
+    assert store.state("exchange_positions") == positions
+    assert store.state("exchange_positions_observed_at") == 1002.0
+    assert store.state("monitor_heartbeat") == 1025.0
+    assert store.state("monitor_heartbeat") - store.state("exchange_positions_observed_at") > 20
+
+
 async def test_delivery_success_does_not_hide_other_failed_messages(tmp_path):
     from longtime.store import Store
     from longtime.telegram import Telegram
@@ -253,7 +281,6 @@ async def test_external_uncovered_or_wrong_trigger_order_is_not_confirmed(setup)
     }
     assert not await Monitor(e).check_external("TESTUSDT")
     assert not exchange.submissions
-
 
 
 

@@ -137,7 +137,9 @@ class Store:
             )
             symbol = payload.get("symbol")
             text = incident_text(scope, kind, error, iid, symbol)
-            markup = {"inline_keyboard": [[{"text": "🔄 重试", "callback_data": "retry:" + iid}]]}
+            markup = {"inline_keyboard": [[
+                {"text": "查看分析异常", "callback_data": "errors"},
+            ]]}
             db.execute(
                 "INSERT INTO outbox(event_key,text,markup) VALUES (?,?,?)",
                 ("alert:" + iid, text, encode(markup)),
@@ -149,17 +151,3 @@ class Store:
             "UPDATE incidents SET status='RESOLVED' WHERE scope=? AND status IN ('OPEN','RUNNING')",
             (scope,),
         )
-
-    def claim_callback(self, callback_id, iid):
-        with self.connect() as db:
-            db.execute("BEGIN IMMEDIATE")
-            if not db.execute(
-                "INSERT OR IGNORE INTO callbacks VALUES (?,?)", (callback_id, time.time())
-            ).rowcount:
-                return False
-            return bool(
-                db.execute(
-                    "UPDATE incidents SET status='RUNNING' WHERE incident_id=? AND status='OPEN'",
-                    (iid,),
-                ).rowcount
-            )

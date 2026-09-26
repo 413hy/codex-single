@@ -1,6 +1,7 @@
 import time
 from types import SimpleNamespace
 
+import httpx
 import pytest
 
 from analysis_core.tradingview import TradingViewError
@@ -109,3 +110,19 @@ async def test_optional_source_failure_is_reported_without_fabrication():
 
     result = await SourceRegistry((Failing(),)).enrich("BTCUSDT", {"fetched_at": time.time()}, stage="final")
     assert "news" not in result and "news_unavailable" in result
+
+
+@pytest.mark.parametrize("error", [httpx.ConnectError("offline"), httpx.ReadTimeout("timeout")])
+async def test_optional_transport_error_keeps_core_evidence(error):
+    class Source:
+        name = "coin_context"
+        stage = "initial"
+
+        async def collect(self, symbol):
+            raise error
+
+    result = await SourceRegistry((Source(),)).enrich(
+        "BTCUSDT", {"periods": {"1h": {"close": 100}}}, stage="initial"
+    )
+    assert result["periods"]["1h"]["close"] == 100
+    assert type(error).__name__ in result["coin_context_unavailable"]
