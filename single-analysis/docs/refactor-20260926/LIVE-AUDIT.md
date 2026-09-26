@@ -26,6 +26,7 @@
 - 本轮分析通知从 `PENDING` 变为 `SENT`，只投递一次。两端重启后，该轮各自仍只有 4 个消费记录，没有新旧信号重放。
 - 分析库旧 `trades`、`orders`、`hedge_groups` 表原先均为 0 行。在线备份至 `/root/single-analysis-pre-refactor-archive/analysis-before-schema-cleanup-20260926.db` 后移除了三张空表；交易账本及其历史 `cycles` 记录保留。
 - 旧验证临时 unit 的失败状态已清除。生产提示词仅保留当前三个版本；旧扫描器、旧模型文档和过时部署文档已移出活动源码树，仓库 `codex-select` 标签仍可用于重构前回滚。
+- 普通交易端另有 5 条 9 月上旬的历史开仓拒单异常；逐条核实交易为 `UNFILLED` 且原订单为 `REJECTED` 后，仅将异常标记为 `RESOLVED` 并记录审计事件，原交易/订单/错误记录未删除。本次轮次未产生未处理的开仓异常。
 
 ## 验证边界
 
