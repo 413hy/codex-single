@@ -353,7 +353,8 @@ def test_status_shows_latest_round_and_shanghai_schedule(bot, monkeypatch):
     monkeypatch.setattr("time.time", lambda: 0)
     bot.store.claim_cycle("latest")
     bot.store.execute("UPDATE cycles SET status='SUCCESS', completed_at=60")
-    bot.store.event("SCREENING_RESULT", {"cycle_id": "latest", "selected": ["BTC", "ETH", "SOL"]})
+    bot.store.event("FINAL_SELECTION_RESULT", {"cycle_id": "latest", "result": {
+        "selected": [{"symbol": "BTCUSDT"}, {"symbol": "ETHUSDT"}, {"symbol": "SOLUSDT"}]}})
     bot.store.set("analysis_interval", 120)
     bot.store.set("next_analysis_at", 7200)
     bot.handle(update(1, "🧭 分析状态"))
@@ -361,7 +362,7 @@ def test_status_shows_latest_round_and_shanghai_schedule(bot, monkeypatch):
     for expected in ("系统状态", "服务状态: 运行中", "分析频率: 120 分钟",
                      "下次运行: 1970-01-01 10:00:00（Asia/Shanghai）",
                      "最后分析: latest", "完成时间: 1970-01-01 08:01:00（Asia/Shanghai）",
-                     "本轮候选数: 3", "分析状态: SUCCESS", "Top10"):
+                     "本轮候选数: 3", "分析状态: SUCCESS", "TradingView 初选"):
         assert expected in text
     bot.store.set("analysis_paused", True)
     bot.handle(update(2, "/status"))

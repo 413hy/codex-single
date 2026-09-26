@@ -1,4 +1,6 @@
-# 三系统重构与Demo联调验收
+# 2026-09-15 三系统重构与Demo联调验收（历史版本）
+
+当前 TradingView 方向分析流程及验收见 [重构报告](refactor-20260926/REPORT.md)。
 
 日期：2026-09-15。范围：`/root/auto-trader-longtime`、`/root/auto-trader-longtime-02`、`/root/single-analysis`。
 

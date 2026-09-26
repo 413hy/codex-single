@@ -7,7 +7,8 @@ from pathlib import Path
 import pytest
 
 from analysis_core.config import Settings
-from analysis_core.model import SCREENING_PROFILE, DirectionModel, ModelService, ModelServiceError
+from analysis_core.model import DirectionModel, ModelService, ModelServiceError
+from analysis_core.selection import TV_SELECTION_PROFILE
 from analysis_core.store import Store
 
 
@@ -42,7 +43,7 @@ out.write_text(json.dumps({"symbol":"TESTUSDT","decision":"SHORT","reason":"dire
     )
     store = Store(tmp_path / "db")
     model = DirectionModel(Settings(_env_file=None, codex_bin=binary), store)
-    assert (await model.decide("s", {"symbol": "TESTUSDT"})).decision == "SHORT"
+    assert (await model.decide("s", {"symbol": "TESTUSDT", "tradingview": {}})).decision == "SHORT"
     assert [r["kind"] for r in store.rows("SELECT kind FROM events")] == [
         "MODEL_INPUT",
         "MODEL_OUTPUT",
@@ -61,15 +62,15 @@ async def test_screening_route_remains_terra_and_rejects_direction_prompt(tmp_pa
         "pathlib.Path(sys.argv[sys.argv.index('--output-last-message')+1]).write_text('{}')\n",
     )
     store = Store(tmp_path / "db")
-    runner = ModelService(Settings(_env_file=None, codex_bin=binary), store, SCREENING_PROFILE)
-    assert await runner.request("screen-test", {}, {}, "screening_v3.md") == {}
+    runner = ModelService(Settings(_env_file=None, codex_bin=binary), store, TV_SELECTION_PROFILE)
+    assert await runner.request("screen-test", {}, {}, "tv_selection_v1.md") == {}
     event = json.loads(
-        store.rows("SELECT payload FROM events WHERE kind='SCREENING_MODEL_INPUT'")[0]["payload"]
+        store.rows("SELECT payload FROM events WHERE kind='TV_SELECTION_MODEL_INPUT'")[0]["payload"]
     )
-    assert event["purpose"] == "screening" and event["model"] == "gpt-5.6-terra"
+    assert event["purpose"] == "tv_discovery" and event["model"] == "gpt-5.6-terra"
     with pytest.raises(ValueError, match="profile and prompt"):
         await runner.request("bad", {}, {}, "direction_v12.md")
-    assert len(store.rows("SELECT * FROM events WHERE kind='SCREENING_MODEL_INPUT'")) == 1
+    assert len(store.rows("SELECT * FROM events WHERE kind='TV_SELECTION_MODEL_INPUT'")) == 1
 
 
 @pytest.mark.parametrize(
@@ -89,7 +90,7 @@ async def test_real_child_invalid_output_never_accepted(tmp_path, response):
     )
     model = DirectionModel(Settings(_env_file=None, codex_bin=binary), Store(tmp_path / "db"))
     with pytest.raises(ValueError):
-        await model.decide("s", {"symbol": "TESTUSDT"})
+        await model.decide("s", {"symbol": "TESTUSDT", "tradingview": {}})
 
 
 async def test_real_child_timeout_is_killed_and_not_retried(tmp_path):
@@ -101,7 +102,7 @@ async def test_real_child_timeout_is_killed_and_not_retried(tmp_path):
     settings = Settings(_env_file=None, codex_bin=binary).model_copy(update={"model_timeout": 0.2})
     store = Store(tmp_path / "db")
     with pytest.raises(ModelServiceError, match="超时"):
-        await DirectionModel(settings, store).decide("s", {"symbol": "TESTUSDT"})
+        await DirectionModel(settings, store).decide("s", {"symbol": "TESTUSDT", "tradingview": {}})
     assert not await asyncio.to_thread(lambda: Path("/proc/" + pidfile.read_text()).exists())
     assert len(store.rows("SELECT * FROM events WHERE kind='MODEL_INPUT'")) == 1
 
@@ -113,7 +114,7 @@ async def test_real_child_error_preserves_input_once(tmp_path):
     store = Store(tmp_path / "db")
     model = DirectionModel(Settings(_env_file=None, codex_bin=binary), store)
     with pytest.raises(RuntimeError, match="exit=7"):
-        await model.decide("s", {"symbol": "TESTUSDT"})
+        await model.decide("s", {"symbol": "TESTUSDT", "tradingview": {}})
     records = store.rows("SELECT * FROM events")
     assert [r["kind"] for r in records] == ["MODEL_INPUT", "MODEL_FAILURE"]
     assert json.loads(records[-1]["payload"])["returncode"] == 7
@@ -145,7 +146,7 @@ def test_column_encoding_preserves_every_candle_value_without_mutation():
         "turnover": "0.0048",
         "completed": False,
     }
-    context = {"symbol": "TESTUSDT", "candles": {"1m": [row]}}
+    context = {"symbol": "TESTUSDT", "tradingview": {}, "candles": {"1m": [row]}}
     result = direction_context(context)
     reconstructed = {
         **result["candle_metadata"]["1m"],
@@ -156,7 +157,7 @@ def test_column_encoding_preserves_every_candle_value_without_mutation():
     with pytest.raises(ValueError):
         direction_context({"symbol": "OTHERUSDT", "candles": {"1m": [row]}})
     with pytest.raises(ValueError):
-        direction_context({"symbol": "TESTUSDT", "candles": {"1m": [{**row, "new_field": 1}]}})
+        direction_context({"symbol": "TESTUSDT", "tradingview": {}, "candles": {"1m": [{**row, "new_field": 1}]}})
 
 
 @pytest.mark.parametrize("corruption", ["latest", "order", "completion", "duration", "future", "extra"])
@@ -190,7 +191,7 @@ async def test_invalid_candle_identity_is_rejected_before_model_call(tmp_path, c
         supplied["2h"] = latest
     with pytest.raises(ValueError):
         await model.decide("invalid", {
-            "symbol": "TESTUSDT", "candles": {"1h": rows},
+            "symbol": "TESTUSDT", "tradingview": {}, "candles": {"1h": rows},
             "latest_closed_candles": supplied,
             **({"observed_at": "2026-09-22T01:30:00Z"} if corruption == "future" else {}),
         })
@@ -220,12 +221,12 @@ async def test_real_child_upstream_errors_classified_once_without_fallback(
         f"sys.stderr.write('ERROR: '+{error!r}+'\\n')\nsys.exit(1)\n",
     )
     store = Store(tmp_path / "db")
-    model = ModelService(Settings(_env_file=None, codex_bin=binary), store, SCREENING_PROFILE)
+    model = ModelService(Settings(_env_file=None, codex_bin=binary), store, TV_SELECTION_PROFILE)
     with pytest.raises(ModelServiceError, match=expected):
-        await model.request("screen-test", {}, {}, "screening_v3.md")
+        await model.request("screen-test", {}, {}, "tv_selection_v1.md")
     assert calls.read_text() == "x"
     failure = json.loads(
-        store.rows("SELECT payload FROM events WHERE kind='SCREENING_MODEL_FAILURE'")[0]["payload"]
+        store.rows("SELECT payload FROM events WHERE kind='TV_SELECTION_MODEL_FAILURE'")[0]["payload"]
     )
     assert failure["errors"] == ["ERROR: " + error]
     assert not store.rows("SELECT * FROM orders")
@@ -236,7 +237,7 @@ async def test_real_child_missing_result_is_diagnosable(tmp_path):
     store = Store(tmp_path / "db")
     with pytest.raises(ValueError, match="未生成结果"):
         await DirectionModel(Settings(_env_file=None, codex_bin=binary), store).decide(
-            "missing-result", {"symbol": "TESTUSDT"}
+            "missing-result", {"symbol": "TESTUSDT", "tradingview": {}}
         )
     record = json.loads(
         store.rows("SELECT payload FROM events WHERE kind='MODEL_FAILURE'")[0]["payload"]
@@ -254,7 +255,7 @@ async def test_real_child_nonzero_exit_cannot_use_written_direction(tmp_path):
     store = Store(tmp_path / "db")
     with pytest.raises(ModelServiceError):
         await DirectionModel(Settings(_env_file=None, codex_bin=binary), store).decide(
-            "s", {"symbol": "TESTUSDT"}
+            "s", {"symbol": "TESTUSDT", "tradingview": {}}
         )
     assert not store.rows("SELECT * FROM events WHERE kind='MODEL_OUTPUT'")
 
@@ -268,7 +269,7 @@ async def test_cancellation_kills_child_without_misreporting_service_failure(tmp
     store = Store(tmp_path / "db")
     task = asyncio.create_task(
         DirectionModel(Settings(_env_file=None, codex_bin=binary), store).decide(
-            "cancel", {"symbol": "TESTUSDT"}
+            "cancel", {"symbol": "TESTUSDT", "tradingview": {}}
         )
     )
     for _ in range(100):
@@ -313,10 +314,10 @@ async def test_primary_schema_and_host_validation_require_direction(tmp_path, re
     )
     if response == "SKIP":
         with pytest.raises(ValueError, match="普通首选"):
-            await model.decide("primary", {"symbol": "TESTUSDT", "direction_required": True})
+            await model.decide("primary", {"symbol": "TESTUSDT", "tradingview": {}, "direction_required": True})
     else:
         assert (
-            await model.decide("primary", {"symbol": "TESTUSDT", "direction_required": True})
+            await model.decide("primary", {"symbol": "TESTUSDT", "tradingview": {}, "direction_required": True})
         ).decision == response
     schema = model.request.call_args.args[2]
     assert schema["properties"]["decision"]["enum"] == ["LONG", "SHORT"]
@@ -331,7 +332,7 @@ async def test_extra_hedge_schema_keeps_abstention(tmp_path):
         return_value={"symbol": "TESTUSDT", "decision": "SKIP", "reason": "conflicting structure"}
     )
     assert (
-        await model.decide("extra", {"symbol": "TESTUSDT", "direction_required": False})
+        await model.decide("extra", {"symbol": "TESTUSDT", "tradingview": {}, "direction_required": False})
     ).decision == "SKIP"
     assert "SKIP" in model.request.call_args.args[2]["properties"]["decision"]["enum"]
 
@@ -356,7 +357,7 @@ async def test_cancellation_during_subprocess_creation_reaps_child(tmp_path, mon
     store = Store(tmp_path / "db")
     task = asyncio.create_task(
         DirectionModel(Settings(_env_file=None, codex_bin=binary), store).decide(
-            "spawn-cancel", {"symbol": "TESTUSDT"}
+            "spawn-cancel", {"symbol": "TESTUSDT", "tradingview": {}}
         )
     )
     try:
@@ -389,7 +390,7 @@ async def test_startup_time_counts_toward_timeout_and_reaps_child(tmp_path, monk
     settings = Settings(_env_file=None, codex_bin=binary).model_copy(update={"model_timeout": 0.03})
     store = Store(tmp_path / "db")
     with pytest.raises(ModelServiceError, match="超时"):
-        await DirectionModel(settings, store).decide("startup-timeout", {"symbol": "TESTUSDT"})
+        await DirectionModel(settings, store).decide("startup-timeout", {"symbol": "TESTUSDT", "tradingview": {}})
     assert len(children) == 1
     assert not await asyncio.to_thread(Path(f"/proc/{children[0].pid}").exists)
     event = json.loads(store.rows("SELECT payload FROM events WHERE kind='MODEL_INTERRUPTED'")[0]["payload"])
@@ -411,7 +412,7 @@ async def test_slow_startup_returns_on_timeout_and_reaps_when_child_arrives(tmp_
     settings = Settings(_env_file=None, codex_bin=binary).model_copy(update={"model_timeout": 0.03})
     store = Store(tmp_path / "db")
     with pytest.raises(ModelServiceError, match="超时"):
-        await DirectionModel(settings, store).decide("slow-startup", {"symbol": "TESTUSDT"})
+        await DirectionModel(settings, store).decide("slow-startup", {"symbol": "TESTUSDT", "tradingview": {}})
     event = json.loads(store.rows("SELECT payload FROM events WHERE kind='MODEL_INTERRUPTED'")[0]["payload"])
     assert event["phase"] == "startup" and event["reaped_before_return"] is False
     await asyncio.sleep(0.3)

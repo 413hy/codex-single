@@ -182,12 +182,12 @@ class AnalysisBot:
                 selected = None
                 if latest:
                     result = db.execute(
-                        "SELECT payload FROM events WHERE kind='SCREENING_RESULT' "
+                        "SELECT payload FROM events WHERE kind='FINAL_SELECTION_RESULT' "
                         "AND json_extract(payload, '$.cycle_id')=? ORDER BY created_at DESC LIMIT 1",
                         (latest["cycle_id"],),
                     ).fetchone()
                     if result:
-                        selected = len(json.loads(result[0])["selected"])
+                        selected = len(json.loads(result[0])["result"]["selected"])
                 reply = "\n".join([
                     "🧭 系统状态",
                     f"服务状态: {'已暂停' if paused else '运行中'}",
@@ -197,7 +197,7 @@ class AnalysisBot:
                     f"完成时间: {stamp(latest['completed_at']) if latest and latest['completed_at'] is not None else '尚未完成' if latest else '暂无记录'}",
                     f"本轮候选数: {selected if selected is not None else '暂无筛选结果'}",
                     f"分析状态: {latest['status'] if latest else '暂无记录'}",
-                    "当前模式: Top10 筛选至 1–3 个小长线方向，首选明确 LONG/SHORT；双仓额外分析不占名额。",
+                    "当前模式: TradingView 初选 1—10 个，Bybit 复核最终 1—3 个未来1—2小时方向；双仓额外分析不占名额。",
                 ])
             elif text == "/recent":
                 rows = db.execute("SELECT cycle_id FROM cycles ORDER BY started_at DESC LIMIT 1").fetchall()

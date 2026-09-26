@@ -1,0 +1,170 @@
+{
+  "context": {
+    "round": 2,
+    "previous_review": {
+      "summary": "方案符合“未来1—2小时方向、近一周仅作背景”的目标，但合约身份、证据时效、对冲结果复用和信号消费规则仍需明确，否则可能产生错币、过期或重复信号。",
+      "findings": [
+        {
+          "stage": "TradingView筛选与模型初选",
+          "issue": "TradingView页面没有公开数据API，方案尚未规定如何确认筛选结果、Technicals和衍生品页面指向同一Bybit USDT永续合约；同名现货或其他交易所合约可能混入。",
+          "recommendation": "在初选前用Bybit合约标识逐条核对交易所、标的、计价币和永续类型；无法确认身份的候选直接剔除，并保留页面来源与采集时间。"
+        },
+        {
+          "stage": "模型初选与最终判向",
+          "issue": "方案未规定各证据的时间戳和失效条件。近一周背景、延迟的页面数据或新闻可能被用于未来1—2小时方向判断；TradingView综合评级也可能与组成指标重复计权。",
+          "recommendation": "为每项证据记录来源、事件时间和采集时间，设定阶段性时效门槛；近一周数据仅作背景，综合评级与组成指标按同一组证据处理，Ideas仅作带来源的弱背景。"
+        },
+        {
+          "stage": "Bybit量价与盘口成交采集",
+          "issue": "仅写明采集量价、盘口和成交，未规定与初选合约的身份对应、采样窗口及数据缺失处理；错配或不完整数据会污染最终排序。",
+          "recommendation": "按已核对的合约标识采集并标注时间窗口、完整性和采集时间；身份不符或关键数据缺失时，该币种不进入最终方向发布。"
+        },
+        {
+          "stage": "LOCKED对冲快照复用",
+          "issue": "“20秒内”未说明按哪个时间戳计算，也未要求快照与最终候选的合约、分析目标和方向一致。直接复用可能覆盖刚得出的相反方向，或把SKIP当作可交易信号。",
+          "recommendation": "以快照生成时间校验20秒有效期，并核对合约标识、目标时段、结果状态和证据版本；方向冲突或任一项不符时重新判向，SKIP仅记录而不发布为LONG或SHORT。"
+        },
+        {
+          "stage": "最终选择与双仓补采",
+          "issue": "重合币复用、未重合币允许SKIP后，原先选出的1—3个LONG/SHORT可能已不再代表最终排序；方案未规定如何合并两条路径的结果。",
+          "recommendation": "待复用和补采判向全部完成后，统一做一次去重、冲突检查和相对排序，再确定最终0—3个可发布信号。"
+        },
+        {
+          "stage": "signals.db发布与双系统消费",
+          "issue": "“按币种一次发布”和TTL=600秒不足以定义跨轮次唯一性、过期判定及两个消费者各自的持久去重；重试或重启可能重放旧信号，TTL也不能替代市场证据的时效检查。",
+          "recommendation": "原子发布不可变记录，包含轮次信号ID、合约标识、方向、生成时间、证据时间和到期时间；以合约加轮次约束发布唯一性，两套系统分别持久记录已消费ID，并在读取时校验到期与证据时效。"
+        },
+        {
+          "stage": "交易接口与故障处理",
+          "issue": "方案未定义故障、SKIP和有效方向在只读接口中的区别；下游若把缺失或占位值解释为方向，会产生伪信号。",
+          "recommendation": "接口只向交易系统提供已核验、未过期的LONG或SHORT记录；SKIP、采集失败和模型失败写入审计状态，不生成可消费方向，也不触发换模型或旧信号重放。"
+        }
+      ]
+    },
+    "corrections": [
+      "用户最终普通入选必须1—3个且明确LONG/SHORT，前提是有效数据和模型成功；数据/模型故障失败，不能伪造或补选。双仓是额外支路，不与普通1—3名额重新排序。",
+      "重合仅指双仓币在普通最终1—3名单中，复用同一轮同币的完整TradingView+Bybit精细化方向；初选1—10但未最终入选的双仓仍独立分析。",
+      "20秒新鲜度基于对冲交易监控心跳和同事务的交易所快照，消费者再次核对LOCKED组和generation。",
+      "当前signals.db使用唯一signal_id=hash(cycle_id,symbol)，每个消费者自己持久认领。TTL将由60秒改为600秒，两端消费者同步校验。",
+      "其他币和额外双仓可SKIP，SKIP沿用当前协议存档/发布，消费者只记录SKIP不执行。"
+    ],
+    "question": "请仅评估TradingView官方页面的数据采集优先级与证据约束，包括CEX Screener、同合约Technicals、Ideas、News、Crypto Coins Screener情绪/衍生品。未来1—2小时方向，近一周背景。公开页面，无登录。哪些是主证据，哪些弱背景？哪些页面可能无法核对同合约？给出具体可执行风险。不要再次建议改变用户1—3普通名额或双仓独立性。"
+  },
+  "schema": {
+    "type": "object",
+    "properties": {
+      "summary": {
+        "type": "string"
+      },
+      "findings": {
+        "type": "array",
+        "items": {
+          "type": "object",
+          "properties": {
+            "stage": {
+              "type": "string"
+            },
+            "issue": {
+              "type": "string"
+            },
+            "recommendation": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "stage",
+            "issue",
+            "recommendation"
+          ],
+          "additionalProperties": false
+        }
+      },
+      "data_sources": {
+        "type": "array",
+        "items": {
+          "type": "object",
+          "properties": {
+            "source": {
+              "type": "string"
+            },
+            "role": {
+              "type": "string"
+            },
+            "identity_check": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "source",
+            "role",
+            "identity_check"
+          ],
+          "additionalProperties": false
+        }
+      }
+    },
+    "required": [
+      "summary",
+      "findings",
+      "data_sources"
+    ],
+    "additionalProperties": false
+  },
+  "answer": {
+    "summary": "TradingView CEX Screener可作为候选筛选主证据；同一Bybit USDT永续合约的Technicals可作为短时方向主证据。Crypto Coins Screener的情绪和衍生品字段、Ideas及News只能作为带来源的背景，除非页面明确证明数据对应同一合约且足够新。近一周信息只用于背景，不参与未来1—2小时方向投票。",
+    "findings": [
+      {
+        "stage": "CEX Screener初选",
+        "issue": "筛选行可能对应现货、其他交易所或不同计价币；名称相同不能证明是目标永续合约。",
+        "recommendation": "逐行核对交易所、合约代码、USDT计价和永续类型；无法核对的行不得进入该合约的方向证据，并记录页面地址与采集时间。"
+      },
+      {
+        "stage": "同合约Technicals判向",
+        "issue": "Technicals页面若只显示币种或默认跳转到其他市场，其评级和指标会与初选合约错配；综合评级与组成指标重复计票也会放大同一证据。",
+        "recommendation": "进入判向前核对页面完整合约身份和指标周期；将综合评级及其组成指标视为同一证据组，只计算一次，并记录采集时间。"
+      },
+      {
+        "stage": "短时证据时效检查",
+        "issue": "公开页面的显示值可能延迟，页面采集时间也不能代替数据更新时间；周级走势不能支撑未来1—2小时方向。",
+        "recommendation": "对用于判向的筛选及Technicals数据记录页面可见的数据时间、采集时间和周期；无法确认更新时点或超过预设短时门槛时，停止将其用于方向判断。近一周信息仅附作背景。"
+      },
+      {
+        "stage": "Crypto Coins Screener补充分析",
+        "issue": "币种级情绪及衍生品字段可能汇总多个市场，公开页面未必能核对到同一Bybit USDT永续合约；把它们当作该合约的资金费率、持仓或情绪事实会造成身份错配。",
+        "recommendation": "逐字段检查市场范围、合约标识、统计窗口和更新时间；不能确认同合约及短时有效性的字段只标注为币种级背景，不参与合约方向评分。"
+      },
+      {
+        "stage": "Ideas与News引用",
+        "issue": "Ideas是作者观点，News可能报道整个币种且发布时间晚于事件；两者均不能直接证明目标合约当前方向。",
+        "recommendation": "记录作者或媒体、原文链接、事件时间和发布时间；Ideas仅作为有出处的弱背景，News仅在事件与目标币种相关且仍处于短时影响窗口时用于解释风险，不作为独立方向投票。"
+      }
+    ],
+    "data_sources": [
+      {
+        "source": "TradingView CEX Screener公开页面",
+        "role": "候选筛选主证据；其短时字段须通过时效检查后才可辅助判向。",
+        "identity_check": "核对每行的交易所、完整合约代码、USDT计价和永续类型。"
+      },
+      {
+        "source": "TradingView同合约Technicals公开页面",
+        "role": "未来1—2小时方向的主证据；综合评级与组成指标合并为一组。",
+        "identity_check": "核对页面显示的完整合约、交易所及指标周期与初选结果一致。"
+      },
+      {
+        "source": "TradingView Crypto Coins Screener公开页面",
+        "role": "币种级情绪及衍生品背景；仅在字段能证明同合约且足够新时才可升级为合约辅助证据。",
+        "identity_check": "逐字段核对市场范围、合约标识和统计窗口；仅有币种名称不足以确认同合约。"
+      },
+      {
+        "source": "TradingView Ideas公开页面",
+        "role": "带作者出处的弱观点背景。",
+        "identity_check": "记录作者、发布时间和所讨论的市场；不能将观点当作目标合约的市场事实。"
+      },
+      {
+        "source": "TradingView News公开页面",
+        "role": "带时间和媒体出处的事件背景。",
+        "identity_check": "核对报道币种、事件时间和发布时间；币种相关不等于同一合约数据。"
+      }
+    ]
+  }
+}

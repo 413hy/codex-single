@@ -64,8 +64,8 @@ async def test_evidence_has_all_requested_timeframes():
 
     result = await Markets(Client(), include_orderflow=False).evidence("TESTUSDT", {})
     assert set(result["candles"]) == {"1m", "3m", "5m", "10m", "15m", "30m", "1h", "2h"}
-    assert result["timeframe_roles"]["primary"] == ["15m", "30m", "1h", "2h"]
-    assert result["timeframe_roles"]["secondary"] == ["1m", "3m", "5m", "10m"]
+    assert result["timeframe_roles"]["primary"] == ["15m", "30m", "1h"]
+    assert result["timeframe_roles"]["secondary"] == ["1m", "3m", "5m", "10m", "2h"]
     assert set(result["indicators"]) == set(result["candles"])
     for tf, indicators in result["indicators"].items():
         closed = [c for c in result["candles"][tf] if c["completed"]]
@@ -166,13 +166,14 @@ def test_old_last_unconfirmed_candle_remains_labeled_unconfirmed():
 
 
 @pytest.mark.parametrize("short_tf", ["15m", "30m", "1h", "2h"])
-async def test_one_missing_closed_bar_fails_week_gate(short_tf):
+async def test_insufficient_recent_closed_bars_fail_direction_gate(short_tf):
     class Client:
         async def recent_candles(self, symbol, timeframe, limit):
             minutes = {"1m": 1, "3m": 3, "5m": 5, "15m": 15, "30m": 30, "1h": 60, "2h": 120}[
                 timeframe
             ]
-            count = limit - 1 if timeframe == short_tf else limit
+            minimum = {"15m": 48, "30m": 24, "1h": 12, "2h": 6}
+            count = minimum[timeframe] if timeframe == short_tf else limit
             at = datetime.fromtimestamp(
                 int(datetime.now(UTC).timestamp()) // (minutes * 60) * minutes * 60, UTC
             )
@@ -186,8 +187,25 @@ async def test_one_missing_closed_bar_fails_week_gate(short_tf):
                 for i in range(count)
             )
 
-    with pytest.raises(ValueError, match="SKIP_INSUFFICIENT_WEEK_HISTORY"):
-        await Markets(Client()).evidence("TESTUSDT", {})
+    with pytest.raises(ValueError, match="SKIP_INSUFFICIENT_DIRECTION_HISTORY"):
+        await Markets(Client(), include_orderflow=False).evidence("TESTUSDT", {})
+
+
+async def test_stale_but_continuous_bybit_candles_cannot_be_published():
+    class Client:
+        async def recent_candles(self, symbol, timeframe, limit):
+            minutes = {"1m": 1, "3m": 3, "5m": 5, "15m": 15,
+                       "30m": 30, "1h": 60, "2h": 120}[timeframe]
+            aligned = int(datetime.now(UTC).timestamp()) // (minutes * 60) * minutes * 60
+            end = datetime.fromtimestamp(aligned, UTC) - timedelta(days=1)
+            return tuple(
+                candle(end - timedelta(minutes=minutes * (limit - 1 - index)),
+                       timeframe, minutes)
+                for index in range(limit)
+            )
+
+    with pytest.raises(ValueError, match="SKIP_STALE_BYBIT_DIRECTION_HISTORY"):
+        await Markets(Client(), include_orderflow=False).evidence("TESTUSDT", {})
 
 
 async def test_recent_candles_paginates_without_overlaps():

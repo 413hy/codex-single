@@ -19,7 +19,7 @@ async def test_real_publisher_both_consumers_and_hedge_snapshot(tmp_path):
         ('ordinary', 'LONG', True, time.time()),
         ('skip', 'SKIP', True, time.time()),
         ('extra', 'SHORT', False, time.time()),
-        ('expired', 'LONG', True, time.time()-61),
+        ('expired', 'LONG', True, time.time()-601),
     ]:
         bus.publish(
             sid,

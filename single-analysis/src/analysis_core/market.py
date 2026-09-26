@@ -5,9 +5,10 @@ from decimal import Decimal as D
 from analysis_core.indicators import direction_indicators, price_volume
 from analysis_core.orderflow import collect_orderflow
 from analysis_core.tradingview import TradingViewWeb
-from analysis_core.vendor.models import Candle, ScannerConfig
+from analysis_core.tradingview_discovery import TradingViewDiscovery
+from analysis_core.tradingview_sources import CoinContextSource, NewsPageSource, SourceRegistry
+from analysis_core.vendor.models import Candle
 from analysis_core.vendor.public import BybitPublicClient
-from analysis_core.vendor.scanner import BybitUniverseScanner
 
 
 def verify_candles(rows, minutes, now, minimum):
@@ -47,10 +48,31 @@ class Markets:
         self.client = client or BybitPublicClient(max_attempts=1)
         self.include_orderflow = include_orderflow
         self.tradingview = TradingViewWeb(extra_fields=tradingview_extra_fields) if include_tradingview else None
-        self.scanner = BybitUniverseScanner(self.client, ScannerConfig())
+        self.discovery = TradingViewDiscovery(self.tradingview) if self.tradingview else None
+        self.tv_sources = (
+            SourceRegistry((CoinContextSource(self.tradingview), NewsPageSource()))
+            if self.tradingview else None
+        )
 
-    async def scan(self, exclude):
-        return await self.scanner.scan(exclude=exclude)
+    async def discover(self):
+        if self.discovery is None:
+            raise ValueError("TradingView discovery is required")
+        instruments = await self.client.instruments()
+        tradable = {
+            item.symbol for item in instruments
+            if item.status == "Trading" and item.contract_type == "LinearPerpetual"
+            and item.quote_coin == "USDT" and item.settle_coin == "USDT"
+        }
+        return await self.discovery.collect(tradable)
+
+    async def tradingview_evidence(self, candidate):
+        if self.tradingview is None:
+            raise ValueError("TradingView evidence is required")
+        assert self.tv_sources is not None
+        result = await self.tradingview.collect(
+            candidate["symbol"], market_rankings=candidate.get("market_rankings")
+        )
+        return await self.tv_sources.enrich(candidate["symbol"], result, stage="initial")
 
     async def evidence(self, symbol, candidate):
         now = datetime.now(UTC)
@@ -75,11 +97,13 @@ class Markets:
         for (tf, minutes, _count), rows in zip(specs, batches, strict=True):
             validate_direction_rows(rows, symbol, tf, minutes, now)
             verify_candles(rows, minutes, now, 1)
-            if (
-                tf in {"15m", "30m", "1h", "2h"}
-                and sum(c.completed for c in rows) < 10080 // minutes
-            ):
-                raise ValueError("SKIP_INSUFFICIENT_WEEK_HISTORY: " + tf)
+            if tf in {"15m", "30m", "1h"}:
+                latest = next((c for c in reversed(rows) if c.completed), None)
+                if latest is None or now - latest.close_time > timedelta(minutes=minutes + 2):
+                    raise ValueError("SKIP_STALE_BYBIT_DIRECTION_HISTORY: " + tf)
+            minimum_closed = {"15m": 48, "30m": 24, "1h": 12, "2h": 6}.get(tf)
+            if minimum_closed is not None and sum(c.completed for c in rows) < minimum_closed:
+                raise ValueError("SKIP_INSUFFICIENT_DIRECTION_HISTORY: " + tf)
             visible = list(rows[-145:]) if tf == "5m" else list(rows)
             data[tf] = [c.model_dump(mode="json") for c in visible]
             indicators[tf] = direction_indicators(visible)
@@ -90,18 +114,25 @@ class Markets:
         data["10m"] = [c.model_dump(mode="json") for c in ten_minute[-73:]]
         indicators["10m"] = direction_indicators(ten_minute[-73:])
         orderflow = await collect_orderflow(self.client, symbol) if self.include_orderflow else None
-        reference = await self.tradingview.collect(symbol) if self.tradingview else None
+        reference = candidate.get("tradingview")
+        if reference is None and self.tradingview:
+            reference = await self.tradingview.collect(symbol)
+        if reference is not None and self.tv_sources:
+            reference = await self.tv_sources.enrich(symbol, reference, stage="final")
         return {
             **({"tradingview": reference} if reference is not None else {}),
             "orderflow": orderflow,
-            "history_hours": {tf: 168 if tf in {"15m", "30m", "1h", "2h"} else 12 for tf in data},
+            "history_hours": {
+                tf: round(len(rows) * minutes / 60, 2)
+                for (tf, minutes, _), rows in zip(specs, batches, strict=True)
+            },
             "indicators": indicators,
             "price_volume": {
                 tf: price_volume(list(rows))
                 for (tf, _, _), rows in zip(specs, batches, strict=True)
                 if tf in {"15m", "30m", "1h", "2h"}
             },
-            "indicator_contract": "weekly-volume-v1：15m/30m/1h/2h完整一周为主，1m/3m/5m/10m近12小时辅助。统计仅用已收盘数据；量价统计不是订单流或逐价成交分布。有限窗口指标仅辅助，不能以短线信号替代周内趋势。",
+            "indicator_contract": "direction-1-2h-v1：15m/30m/1h近期已收盘量价为主，2h辅助；近一周结构仅作背景，不要求完整一周。1m/3m/5m/10m用于入场节奏。统计仅用已收盘数据，量价统计不是订单流或逐价成交分布。",
             "unavailable_evidence": [
                 "footprint",
                 "liquidation_heatmap",
@@ -112,9 +143,10 @@ class Markets:
                 "diagonal_stacked_imbalance",
             ],
             "timeframe_roles": {
-                "primary": ["15m", "30m", "1h", "2h"],
-                "core": ["15m", "30m", "1h", "2h"],
-                "secondary": ["1m", "3m", "5m", "10m"],
+                "primary": ["15m", "30m", "1h"],
+                "core": ["15m", "30m", "1h"],
+                "secondary": ["1m", "3m", "5m", "10m", "2h"],
+                "background": ["4h", "1d", "available_7d_structure"],
             },
             "derived_timeframes": {"10m": "UTC对齐的相邻5m K线聚合；未收盘状态保留"},
             "symbol": symbol,

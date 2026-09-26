@@ -19,8 +19,6 @@ from pydantic import BaseModel, ConfigDict, Field
 from analysis_core.config import (
     DIRECTION_MODEL,
     DIRECTION_REASONING,
-    SCREENING_MODEL,
-    SCREENING_REASONING,
 )
 from analysis_core.store import encode
 
@@ -73,13 +71,9 @@ class ModelProfile:
     event_prefix: str
 
 
-SCREENING_PROFILE = ModelProfile(
-    "screening", SCREENING_MODEL, SCREENING_REASONING, frozenset({"screening_v3.md"}),
-    "SCREENING_MODEL",
-)
 DIRECTION_PROFILE = ModelProfile(
     "direction", DIRECTION_MODEL, DIRECTION_REASONING,
-    frozenset({"direction_v11.md", "direction_v14.md"}), "MODEL",
+    frozenset({"direction_v15.md"}), "MODEL",
 )
 
 
@@ -373,13 +367,28 @@ class DirectionModel(ModelService):
         super().__init__(settings, store, DIRECTION_PROFILE)
 
     async def decide(self, signal_id, context):
+        if "tradingview" not in context:
+            raise ValueError("TradingView evidence is required for hedge direction")
         schema = Decision.model_json_schema()
         schema["properties"]["symbol"]["enum"] = [context["symbol"]]
         required = context.get("direction_required") is True
         if required:
             schema["properties"]["decision"]["enum"] = ["LONG", "SHORT"]
-        prompt_name = "direction_v14.md" if "tradingview" in context else "direction_v11.md"
-        raw = await self.request(signal_id, direction_context(context), schema, prompt_name)
+        checked = direction_context(context)
+        if "candles" in checked:
+            # Keep the complete validated snapshot in the host audit event; send
+            # only recent closed bars and summary statistics to the model.
+            from analysis_core.selection import compact_bybit, compact_tradingview
+
+            checked = {
+                "symbol": context["symbol"],
+                "observed_at": context["observed_at"],
+                "direction_required": required,
+                "priority_review": context.get("priority_review"),
+                "tradingview": compact_tradingview(context["tradingview"]),
+                "bybit": compact_bybit(context),
+            }
+        raw = await self.request(signal_id, checked, schema, "direction_v15.md")
         result = Decision.model_validate(raw)
         if result.symbol != context["symbol"]:
             raise ValueError("Model symbol mismatch")

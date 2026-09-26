@@ -24,7 +24,7 @@ class SignalConsumer:
             return [
                 dict(r)
                 for r in db.execute(
-                    "SELECT * FROM publications WHERE expires_at>? ORDER BY id LIMIT 100",
+                    "SELECT * FROM publications WHERE expires_at>? ORDER BY id",
                     (time.time(),),
                 )
             ]
@@ -52,9 +52,12 @@ class SignalConsumer:
             "published_at",
             "expires_at",
         }
+        version = payload.get("version")
+        if version == 2:
+            required |= {"cycle_id", "analysis_started_at"}
         if (
             set(payload) != required
-            or payload["version"] != 1
+            or version not in (1, 2)
             or type(payload["normal_candidate"]) is not bool
         ):
             raise ValueError("信号结构无效")
@@ -66,9 +69,21 @@ class SignalConsumer:
         if (
             published != row["published_at"]
             or expires != row["expires_at"]
-            or expires - published != 60
+            or expires - published != 600
         ):
             raise ValueError("信号时间字段不一致")
+        sid = "feed:" + payload["signal_id"]
+        cycle_id = sid
+        if version == 2:
+            started = payload["analysis_started_at"]
+            cycle_id = payload["cycle_id"]
+            if (
+                not isinstance(cycle_id, str)
+                or not 1 <= len(cycle_id) <= 200
+                or type(started) not in (int, float)
+                or not 0 < float(started) <= published
+            ):
+                raise ValueError("分析轮次字段无效")
         if not published <= now < expires:
             return
         decision = Decision.model_validate(
@@ -81,10 +96,9 @@ class SignalConsumer:
             or type(hedge["generation"]) is not int
         ):
             raise ValueError("对冲信号归属无效")
-        sid = "feed:" + payload["signal_id"]
         # Atomic durable claim: any failure/crash after claim is handled through order
         # intent reconciliation, NEVER by replaying an old direction.
-        if not self.store.signal(sid, sid, decision.symbol, payload):
+        if not self.store.signal(sid, cycle_id, decision.symbol, payload):
             return
         try:
             if decision.decision == "SKIP":

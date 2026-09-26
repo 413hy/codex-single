@@ -47,7 +47,7 @@ class SignalBus:
             hedge=hedge,
             observed_at=observed_at,
             published_at=now,
-            expires_at=now + 60,
+            expires_at=now + 600,
         )
         with self.connect() as db:
             db.execute(
@@ -56,7 +56,7 @@ class SignalBus:
                     signal_id,
                     decision.symbol,
                     now,
-                    now + 60,
+                    now + 600,
                     json.dumps(payload, ensure_ascii=False),
                 ),
             )

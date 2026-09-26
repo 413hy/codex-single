@@ -2,7 +2,6 @@ import json
 import sqlite3
 import time
 from datetime import UTC, datetime
-from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
@@ -10,159 +9,154 @@ import pytest
 from analysis_core.app import AnalysisApp
 from analysis_core.config import Settings
 from analysis_core.model import Decision, ModelServiceError
+from analysis_core.selection import FinalCandidate, TVCandidate
 from analysis_core.signals import HedgeSniffer
 from analysis_core.store import Store
 
 
 class Sniffer:
+    def __init__(self, symbols=None):
+        self.symbols = symbols or {"AUSDT", "HEDGEUSDT"}
+
     def sniff(self):
-        return {"HEDGEUSDT": dict(group_id="group", generation=3, positions=[])}
+        return {
+            symbol: {"group_id": symbol + ":group", "generation": 3, "positions": []}
+            for symbol in self.symbols
+        }
 
 
 @pytest.fixture
 def producer(tmp_path):
     markets = AsyncMock()
-    markets.scan.return_value = SimpleNamespace(
-        candidates=[], failures={}, model_dump=lambda **k: {}
-    )
+    markets.discover.return_value = [
+        {"symbol": symbol, "market_rankings": {"source_symbol": f"BYBIT:{symbol}.P"}}
+        for symbol in ("AUSDT", "BUSDT", "HEDGEUSDT")
+    ]
+
+    async def tv_evidence(candidate):
+        symbol = candidate["symbol"]
+        return {"fetched_at": datetime.now(UTC).isoformat(),
+                "source_provenance": {"verified_source_symbol": f"BYBIT:{symbol}.P"}}
 
     async def evidence(symbol, candidate):
-        return dict(symbol=symbol, observed_at=datetime.now(UTC).isoformat(), selection=candidate)
+        return {
+            "symbol": symbol,
+            "observed_at": datetime.now(UTC).isoformat(),
+            "tradingview": candidate.get("tradingview") or await tv_evidence({"symbol": symbol}),
+        }
 
+    markets.tradingview_evidence.side_effect = tv_evidence
     markets.evidence.side_effect = evidence
+    selection = AsyncMock()
+    selection.choose_tv.return_value = [
+        TVCandidate(symbol=symbol, rank=rank, direction="LONG", confidence="LOW",
+                    reason="TradingView preliminary direction")
+        for rank, symbol in enumerate(("AUSDT", "BUSDT", "HEDGEUSDT"), 1)
+    ]
+    selection.choose_final.return_value = [
+        FinalCandidate(symbol=symbol, rank=rank, direction="LONG", confidence="LOW",
+                       reason="Bybit and TradingView support a cautious direction")
+        for rank, symbol in enumerate(("AUSDT", "BUSDT"), 1)
+    ]
     model = AsyncMock()
-
-    async def decide(sid, context):
-        return Decision(
-            symbol=context["symbol"],
-            decision="LONG" if context.get("direction_required") else "SKIP",
-            reason="relative trend or no direction",
-        )
-
-    model.decide.side_effect = decide
-    screening = AsyncMock()
-    screening.select.return_value = [{"symbol": "HEDGEUSDT"}, {"symbol": "OTHERUSDT"}]
-    app = AnalysisApp(
-        Settings(_env_file=None, runtime_dir=tmp_path),
-        markets=markets,
-        model=model,
-        screening=screening,
-        sniffer=Sniffer(),
+    model.decide.side_effect = lambda sid, context: Decision(
+        symbol=context["symbol"], decision="SKIP", reason="Evidence conflicts"
     )
-    return app
+    return AnalysisApp(
+        Settings(_env_file=None, runtime_dir=tmp_path),
+        markets=markets, model=model, selection=selection, sniffer=Sniffer(),
+    )
 
 
 def publications(app):
     with sqlite3.connect(app.bus.path) as db:
-        return [
-            json.loads(r[0]) for r in db.execute("SELECT payload FROM publications ORDER BY id")
-        ]
+        return [json.loads(r[0]) for r in db.execute("SELECT payload FROM publications ORDER BY id")]
 
 
-async def test_overlap_priority_single_call_skip_no_retry(producer):
+async def test_two_stage_selection_hedge_dedup_and_ten_minute_signals(producer):
     assert await producer.cycle("one")
-    assert producer.model.decide.await_count == 2
-    contexts = [c.args[1] for c in producer.model.decide.call_args_list]
-    assert contexts[0]["symbol"] == "HEDGEUSDT" and "priority_review" in contexts[0]
+    producer.selection.choose_tv.assert_awaited_once()
+    producer.selection.choose_final.assert_awaited_once()
+    assert producer.model.decide.await_count == 1
+    assert [r["symbol"] for r in publications(producer)] == ["AUSDT", "BUSDT", "HEDGEUSDT"]
     rows = publications(producer)
     assert rows[0]["normal_candidate"] is True and rows[0]["hedge"]["generation"] == 3
-    assert all(r["version"] == 2 and r["cycle_id"] == "one" for r in rows)
-    assert all(isinstance(r["analysis_started_at"], float) for r in rows)
-    assert all(r["expires_at"] - r["published_at"] == 60 for r in rows)
+    assert rows[1]["normal_candidate"] is True and rows[1]["hedge"] is None
+    assert rows[2]["normal_candidate"] is False and rows[2]["decision"] == "SKIP"
+    assert all(r["version"] == 2 and r["expires_at"] - r["published_at"] == 600 for r in rows)
+    assert [c.args[0] for c in producer.markets.evidence.call_args_list] == [
+        "AUSDT", "BUSDT", "HEDGEUSDT"
+    ]
+    # The overlap already has a final direction, so no extra hedge model call occurs.
+    assert producer.model.decide.call_args.args[1]["symbol"] == "HEDGEUSDT"
     assert await producer.cycle("one")
+    assert producer.selection.choose_tv.await_count == 1
+
+
+async def test_snapshot_failure_blocks_publication_after_normal_refinement(producer):
+    def stale():
+        raise RuntimeError("stale snapshot")
+
+    producer.sniffer.sniff = stale
+    assert not await producer.cycle("stale")
+    producer.selection.choose_final.assert_awaited_once()
+    assert publications(producer) == []
+    assert producer.store.rows("SELECT status FROM cycles WHERE cycle_id='stale'")[0]["status"] == "PARTIAL_ERROR"
+
+
+async def test_normal_data_failure_still_analyzes_locked_hedge(producer):
+    producer.markets.discover.side_effect = ValueError("TV unavailable")
+    assert not await producer.cycle("tv-error")
     assert producer.model.decide.await_count == 2
+    assert {r["symbol"] for r in publications(producer)} == {"AUSDT", "HEDGEUSDT"}
+    assert all(not r["normal_candidate"] for r in publications(producer))
 
 
-async def test_hedge_extra_outside_three_slots(producer):
-    producer.screening.select.return_value = [{"symbol": s} for s in ["AUSDT", "BUSDT", "CUSDT"]]
-    assert await producer.cycle("one")
-    rows = publications(producer)
-    assert len(rows) == 4 and sum(r["normal_candidate"] for r in rows) == 3
-    assert rows[0]["symbol"] == "HEDGEUSDT" and not rows[0]["normal_candidate"]
-
-
-async def test_screening_failure_still_analyzes_locked_coin(producer):
-    producer.screening.select.side_effect = ValueError("bad screening citations")
-    assert not await producer.cycle("one")
-    assert producer.model.decide.await_count == 1
-    assert publications(producer)[0]["symbol"] == "HEDGEUSDT"
-
-
-async def test_service_outage_stops_all_additional_calls_and_recovers(producer):
-    producer.screening.select.side_effect = ModelServiceError("quota")
-    assert not await producer.cycle("one")
+async def test_model_service_failure_stops_remaining_model_calls(producer):
+    producer.selection.choose_tv.side_effect = ModelServiceError("quota")
+    assert not await producer.cycle("quota")
     producer.model.decide.assert_not_awaited()
-    assert not publications(producer)
-    producer.screening.select.side_effect = None
-    producer.screening.select.return_value = [{"symbol": "NORMALUSDT"}]
-    assert await producer.cycle("two")
-    assert not producer.store.rows(
-        "SELECT * FROM incidents WHERE scope='MODEL_SERVICE' AND status='OPEN'"
+    assert publications(producer) == []
+
+
+async def test_final_model_cannot_publish_unknown_or_missing_primary(producer):
+    producer.selection.choose_final.side_effect = ValueError("outside evidence pool")
+    assert not await producer.cycle("bad-final")
+    assert all(not r["normal_candidate"] for r in publications(producer))
+    assert producer.store.rows("SELECT * FROM incidents WHERE scope='PRIMARY_DIRECTION' AND status='OPEN'")
+
+
+async def test_cancelled_cycle_is_interrupted_and_not_replayed(producer):
+    import asyncio
+
+    producer.selection.choose_final.side_effect = asyncio.CancelledError()
+    with pytest.raises(asyncio.CancelledError):
+        await producer.cycle("cancelled")
+    row = producer.store.rows("SELECT status FROM cycles WHERE cycle_id='cancelled'")[0]
+    assert row["status"] == "INTERRUPTED"
+    await producer.cycle("cancelled")
+    assert producer.selection.choose_final.await_count == 1
+
+
+def test_duplicate_publication_does_not_extend_validity(producer):
+    decision = Decision(symbol="TESTUSDT", decision="LONG", reason="structure")
+    one = producer.bus.publish(
+        "same", decision, cycle_id="cycle", analysis_started_at=90,
+        normal=True, hedge=None, observed_at="now", now=100,
     )
+    two = producer.bus.publish(
+        "same", decision, cycle_id="cycle", analysis_started_at=90,
+        normal=True, hedge=None, observed_at="now", now=200,
+    )
+    assert one == two and two["expires_at"] == 700
 
 
-async def test_old_direction_evidence_can_be_analyzed(producer):
-    async def evidence(symbol, candidate):
-        return dict(symbol=symbol, observed_at="2000-01-01T00:00:00+00:00")
-
-    producer.markets.evidence.side_effect = evidence
-    assert await producer.cycle("one")
-    assert len(publications(producer)) == 2
-    assert producer.model.decide.await_count == 2
-
-
-async def test_nonprimary_missing_week_history_marks_cycle_failed(producer):
-    original = producer.markets.evidence.side_effect
-
-    async def evidence(symbol, candidate):
-        if symbol == "OTHERUSDT":
-            raise ValueError("SKIP_INSUFFICIENT_WEEK_HISTORY: 2h")
-        return await original(symbol, candidate)
-
-    producer.markets.evidence.side_effect = evidence
-    assert not await producer.cycle("missing-week")
-    assert producer.store.rows("SELECT status FROM cycles WHERE cycle_id='missing-week'")[0]["status"] == "PARTIAL_ERROR"
-    assert producer.store.rows("SELECT status FROM signals WHERE symbol='OTHERUSDT'")[0]["status"] == "SKIP_INSUFFICIENT_WEEK_HISTORY"
-    assert producer.store.rows("SELECT scope FROM incidents WHERE scope='DIRECTION:OTHERUSDT' AND status='OPEN'")
-
-
-async def test_direction_evidence_has_no_age_limit_before_or_after_model(producer, monkeypatch):
-    clock = [1000.0]
-    monkeypatch.setattr("time.time", lambda: clock[0])
-
-    async def evidence(symbol, candidate):
-        return dict(symbol=symbol, observed_at=datetime.fromtimestamp(clock[0] - 91, UTC).isoformat())
-
-    producer.markets.evidence.side_effect = evidence
-    assert await producer.cycle("old-before-call")
-    assert producer.model.decide.await_count == 2
-    assert len(publications(producer)) == 2
-
-    async def fresher_evidence(symbol, candidate):
-        return dict(symbol=symbol, observed_at=datetime.fromtimestamp(clock[0] - 89, UTC).isoformat())
-
-    original = producer.model.decide.side_effect
-
-    async def slow_decide(sid, context):
-        result = await original(sid, context)
-        clock[0] += 2
-        return result
-
-    producer.markets.evidence.side_effect = fresher_evidence
-    producer.model.decide.side_effect = slow_decide
-    assert await producer.cycle("old-after-call")
-    assert producer.model.decide.await_count == 4
-    assert len(publications(producer)) == 4
-
-
-async def test_sniffer_failure_does_not_silently_omit_pairs(producer):
-    def failed():
-        raise RuntimeError("stale")
-
-    producer.sniffer.sniff = failed
-    assert not await producer.cycle("one")
-    producer.markets.scan.assert_not_awaited()
-    producer.model.decide.assert_not_awaited()
+async def test_cycle_has_one_notification_and_scheduled_slot_is_not_replayed(producer):
+    assert await producer.cycle("merged")
+    assert len(producer.store.rows("SELECT * FROM outbox WHERE event_key='cycle:merged'")) == 1
+    producer.store.set("next_analysis_at", time.time() - 3600)
+    await producer.cycle()
+    assert producer.selection.choose_tv.await_count == 1
 
 
 @pytest.mark.parametrize("invalid", [None, "unowned", "wrong_symbol"])
@@ -171,42 +165,21 @@ def test_sniffer_reads_only_fresh_owned_locked_pairs(tmp_path, invalid):
     store.execute("DROP INDEX owned_active_slot")
     now = time.time()
     store.set("monitor_heartbeat", now)
-    store.set(
-        "exchange_positions",
-        [
-            dict(symbol="TESTUSDT", side=side, positionIdx=idx, size="1", avgPrice="100")
-            for idx, side in [(1, "Buy"), (2, "Sell")]
-        ],
-    )
-    for tid, side, idx in [("a", "LONG", 1), ("b", "SHORT", 2)]:
-        store.insert_trade(
-            dict(
-                trade_id=tid,
-                symbol="TESTUSDT",
-                side=side,
-                position_idx=idx,
-                status="OPEN",
-                qty="1",
-                entry_price="100",
-                details="{}",
-            )
-        )
-    store.execute(
-        "INSERT INTO hedge_groups VALUES (?,?)",
-        (
-            "g",
-            json.dumps(
-                dict(
-                    group_id="g",
-                    symbol="TESTUSDT",
-                    generation=2,
-                    active="a",
-                    child="b",
-                    phase="LOCKED",
-                )
-            ),
-        ),
-    )
+    store.set("exchange_positions", [
+        {"symbol": "TESTUSDT", "side": side, "positionIdx": idx,
+         "size": "1", "avgPrice": "100"}
+        for idx, side in ((1, "Buy"), (2, "Sell"))
+    ])
+    for tid, side, idx in (("a", "LONG", 1), ("b", "SHORT", 2)):
+        store.insert_trade({
+            "trade_id": tid, "symbol": "TESTUSDT", "side": side,
+            "position_idx": idx, "status": "OPEN", "qty": "1",
+            "entry_price": "100", "details": "{}",
+        })
+    store.execute("INSERT INTO hedge_groups VALUES (?,?)", (
+        "g", json.dumps({"group_id": "g", "symbol": "TESTUSDT", "generation": 2,
+                         "active": "a", "child": "b", "phase": "LOCKED"}),
+    ))
     if invalid == "unowned":
         store.execute("UPDATE trades SET owned=0 WHERE trade_id='a'")
     elif invalid == "wrong_symbol":
@@ -215,102 +188,7 @@ def test_sniffer_reads_only_fresh_owned_locked_pairs(tmp_path, invalid):
     if invalid:
         with pytest.raises(RuntimeError):
             sniffer.sniff(now)
-        return
-    assert sniffer.sniff(now)["TESTUSDT"]["generation"] == 2
-    with pytest.raises(RuntimeError):
-        sniffer.sniff(now + 21)
-
-
-async def test_cancelled_cycle_is_interrupted_and_not_replayed(producer):
-    import asyncio
-
-    producer.model.decide.side_effect = asyncio.CancelledError()
-    with pytest.raises(asyncio.CancelledError):
-        await producer.cycle("cancelled")
-    assert (
-        producer.store.rows("SELECT status FROM cycles WHERE cycle_id='cancelled'")[0]["status"]
-        == "INTERRUPTED"
-    )
-    count = producer.model.decide.await_count
-    await producer.cycle("cancelled")
-    assert producer.model.decide.await_count == count
-
-
-def test_duplicate_publication_does_not_extend_validity(producer):
-    d = Decision(symbol="TESTUSDT", decision="LONG", reason="structure")
-    one = producer.bus.publish(
-        "same", d, cycle_id="cycle", analysis_started_at=90,
-        normal=True, hedge=None, observed_at="now", now=100,
-    )
-    two = producer.bus.publish(
-        "same", d, cycle_id="cycle", analysis_started_at=90,
-        normal=True, hedge=None, observed_at="now", now=200,
-    )
-    assert one == two and two["expires_at"] == 160
-
-
-async def test_primary_overlap_is_one_call_and_extra_skip_is_allowed(producer):
-    producer.screening.select.return_value = [{"symbol": "AUSDT"}, {"symbol": "BUSDT"}]
-    assert await producer.cycle("required")
-    contexts = [c.args[1] for c in producer.model.decide.call_args_list]
-    assert sum(c["direction_required"] for c in contexts) == 1
-    assert next(c for c in contexts if c["direction_required"])["symbol"] == "AUSDT"
-    rows = publications(producer)
-    assert next(r for r in rows if r["symbol"] == "AUSDT")["decision"] == "LONG"
-    assert next(r for r in rows if r["symbol"] == "HEDGEUSDT")["decision"] == "SKIP"
-
-
-async def test_all_skip_is_failure_not_success_and_no_second_call(producer):
-    async def abstain(sid, context):
-        return Decision(symbol=context["symbol"], decision="SKIP", reason="no direction")
-
-    producer.model.decide.side_effect = abstain
-    assert not await producer.cycle("all-skip")
-    assert producer.model.decide.await_count == 2
-    assert not any(p["symbol"] == "HEDGEUSDT" for p in publications(producer))
-    assert producer.store.rows(
-        "SELECT * FROM incidents WHERE scope='PRIMARY_DIRECTION' AND status='OPEN'"
-    )
-
-
-async def test_empty_normal_selection_is_failure_even_if_extra_hedge_analyzed(producer):
-    producer.screening.select.return_value = []
-    assert not await producer.cycle("empty")
-    assert producer.model.decide.await_count == 1
-    assert publications(producer)[0]["normal_candidate"] is False
-
-
-async def test_results_are_published_individually_but_one_cycle_notification(producer):
-    assert await producer.cycle("merged")
-    assert len(publications(producer)) == 2
-    assert not producer.store.rows("SELECT * FROM outbox WHERE event_key LIKE 'analysis:%'")
-    rows = producer.store.rows("SELECT * FROM outbox WHERE event_key='cycle:merged'")
-    assert len(rows) == 1 and "北京时间" in rows[0]["text"]
-    assert "HEDGEUSDT" in rows[0]["text"] and "OTHERUSDT" in rows[0]["text"]
-    await producer.cycle("merged")
-    assert len(producer.store.rows("SELECT * FROM outbox WHERE event_key='cycle:merged'")) == 1
-
-
-async def test_automatic_long_cycle_does_not_immediately_run_again(producer, monkeypatch):
-    clock = [1200.0]
-    monkeypatch.setattr('time.time', lambda: clock[0])
-    original = producer.model.decide.side_effect
-
-    async def slow(sid, context):
-        result = await original(sid, context)
-        clock[0] += 1300
-        context['observed_at'] = datetime.fromtimestamp(clock[0], UTC).isoformat()
-        return result
-
-    producer.model.decide.side_effect = slow
-    # This scheduler-only test refreshes its mocked evidence after simulated work.
-    async def evidence(symbol, candidate):
-        return dict(symbol=symbol, observed_at=datetime.fromtimestamp(clock[0], UTC).isoformat())
-
-    producer.markets.evidence.side_effect = evidence
-    producer.store.set('next_analysis_at', 1200)
-    assert await producer.cycle()
-    calls = producer.model.decide.await_count
-    assert producer.store.state('next_analysis_at') == 4800
-    await producer.cycle()
-    assert producer.model.decide.await_count == calls
+    else:
+        assert sniffer.sniff(now)["TESTUSDT"]["generation"] == 2
+        with pytest.raises(RuntimeError):
+            sniffer.sniff(now + 21)

@@ -14,13 +14,13 @@ from analysis_core.market import Markets
 from analysis_core.model import DirectionModel, ModelServiceError
 from analysis_core.notifications import cycle_keyboard, cycle_notice
 from analysis_core.scheduling import claim_due, reset_schedule
-from analysis_core.screening import Screening
+from analysis_core.selection import SelectionModels, final_decision
 from analysis_core.signals import HedgeSniffer, SignalBus
 from analysis_core.store import Store, encode, identity
 
 
 class AnalysisApp:
-    def __init__(self, settings, *, markets=None, model=None, screening=None, sniffer=None):
+    def __init__(self, settings, *, markets=None, model=None, selection=None, sniffer=None):
         self.settings = settings
         self.store = Store(settings.runtime_dir / "analysis.db")
         self.bus = SignalBus(settings.runtime_dir / "signals.db")
@@ -29,7 +29,7 @@ class AnalysisApp:
             tradingview_extra_fields=settings.tradingview_extra_fields,
         )
         self.model = model or DirectionModel(settings, self.store)
-        self.screening = screening or Screening(settings, self.store)
+        self.selection = selection or SelectionModels(settings, self.store)
         self.sniffer = sniffer or HedgeSniffer(settings.hedge_db)
         self.lock = asyncio.Lock()
 
@@ -56,130 +56,160 @@ class AnalysisApp:
                 return True
             ok = True
             interrupted = False
+            service_failed = False
             try:
-                # Snapshot required before scanning; unavailable snapshot cannot silently
-                # remove pending locked positions from the mandatory direction list.
-                hedged = self.sniffer.sniff()
-                self.store.event("HEDGE_SNIFF", dict(cycle_id=cid, symbols=hedged))
-                self.store.resolve("SNIFFER")
-                selected = []
-                service_failed = False
+                final = []
+                by_symbol = {}
                 try:
-                    scan = await self.markets.scan(set())
-                    self.store.event("SCAN", dict(cycle_id=cid, scan=scan.model_dump(mode="json")))
-                    if scan.failures:
-                        self.incident(
-                            "SCAN_DATA", RuntimeError("部分候选行情采集失败；受影响币跳过")
-                        )
-                    else:
-                        self.store.resolve("SCAN_DATA")
-                    selected = await self.screening.select(cid, scan.candidates)
-                    if not 1 <= len(selected) <= 3 or len({c["symbol"] for c in selected}) != len(
-                        selected
-                    ):
-                        raise ValueError("普通筛选必须返回1—3个不同候选，不能正常返回空名单")
-                    self.store.resolve("SCREENING")
+                    pool = await self.markets.discover()
+                    self.store.event("TV_DISCOVERY", {"cycle_id": cid, "pool": pool})
+                    tv_bundles = []
+                    for candidate in pool:
+                        try:
+                            reference = await self.markets.tradingview_evidence(candidate)
+                            self.store.event("TV_SYMBOL_EVIDENCE", {
+                                "cycle_id": cid, "symbol": candidate["symbol"],
+                                "evidence": reference,
+                            })
+                            tv_bundles.append({
+                                "symbol": candidate["symbol"],
+                                "discovery": candidate,
+                                "tradingview": reference,
+                            })
+                        except Exception as error:
+                            ok = False
+                            self.store.event("TV_EVIDENCE_FAILURE", {
+                                "cycle_id": cid, "symbol": candidate["symbol"],
+                                "error": type(error).__name__ + ": " + str(error)[:300],
+                            })
+                    initial = await self.selection.choose_tv(cid, tv_bundles)
+                    tv_by_symbol = {item["symbol"]: item for item in tv_bundles}
+                    refinement = []
+                    for item in initial:
+                        bundle = tv_by_symbol[item.symbol]
+                        try:
+                            evidence = await self.markets.evidence(item.symbol, {
+                                "symbol": item.symbol, "tradingview": bundle["tradingview"],
+                                "tv_initial": item.model_dump(),
+                            })
+                            self.store.event("BYBIT_SYMBOL_EVIDENCE", {
+                                "cycle_id": cid, "symbol": item.symbol,
+                                "evidence": evidence,
+                            })
+                            refinement.append({
+                                "symbol": item.symbol, "tv_initial": item.model_dump(),
+                                "tradingview": evidence["tradingview"], "bybit": evidence,
+                            })
+                        except Exception as error:
+                            ok = False
+                            self.store.event("BYBIT_REFINEMENT_FAILURE", {
+                                "cycle_id": cid, "symbol": item.symbol,
+                                "error": type(error).__name__ + ": " + str(error)[:300],
+                            })
+                    final = await self.selection.choose_final(cid, refinement)
+                    by_symbol = {item["symbol"]: item for item in refinement}
+                    self.store.resolve("NORMAL_SELECTION")
                 except ModelServiceError as error:
                     self.incident("MODEL_SERVICE", error)
                     service_failed = True
                     ok = False
                 except Exception as error:
-                    self.incident("SCREENING", error)
-                    selected = []
+                    self.incident("NORMAL_SELECTION", error)
                     ok = False
-                normal = {c["symbol"]: c for c in selected}
-                primary = selected[0]["symbol"] if selected else None
-                primary_published = False
-                # Extra hedge names do not count against the normal 0-3 selection slots.
-                names = sorted(hedged) + [s for s in normal if s not in hedged]
-                for symbol in names:
-                    if service_failed:
-                        break
+
+                # Read the exchange-confirmed hedge snapshot after normal refinement,
+                # before publication, so overlapping signals carry the group identity.
+                try:
+                    hedged = self.sniffer.sniff()
+                    self.store.event("HEDGE_SNIFF", {"cycle_id": cid, "symbols": hedged})
+                    self.store.resolve("SNIFFER")
+                except Exception as error:
+                    self.incident("SNIFFER", error)
+                    ok = False
+                    return False
+
+                published = set()
+                for item in final:
+                    symbol = item.symbol
                     sid = identity(cid, symbol)
-                    candidate = dict(
-                        normal.get(symbol, {"symbol": symbol}), priority_hedge=symbol in hedged
-                    )
+                    context = by_symbol[symbol]["bybit"]
+                    candidate = {
+                        "symbol": symbol, "selection_rank": item.rank,
+                        "direction_required": item.rank == 1,
+                        "priority_hedge": symbol in hedged,
+                        "tv_initial": by_symbol[symbol]["tv_initial"],
+                        "observed_at": context["observed_at"],
+                    }
                     if not self.store.signal(sid, cid, symbol, candidate):
                         continue
                     try:
-                        context = await self.markets.evidence(symbol, candidate)
-                        context["direction_required"] = symbol == primary
-                        if symbol in normal:
-                            context["trend_ranking"] = {
-                                k: normal[symbol][k]
-                                for k in (
-                                    "selection_rank",
-                                    "screening_direction",
-                                    "relative_confidence",
-                                    "ranking_rationale",
-                                )
-                                if k in normal[symbol]
-                            }
-                        if symbol in hedged:
-                            context["priority_review"] = (
-                                "该币已有双向仓位，需要重点判向；同轮只分析一次。"
-                                "若同时为普通首选，遵守direction_required；额外双仓证据不足可SKIP。"
-                            )
-                            # No trading quantities or entry PnL biases are supplied to the model.
-                        self.store.execute(
-                            "UPDATE signals SET evidence=? WHERE signal_id=?",
-                            (encode(context), sid),
-                        )
-                        age = time.time() - datetime.fromisoformat(
-                            context["observed_at"]
-                        ).timestamp()
-                        if age < -5:
-                            raise ValueError("方向分析行情时间在未来，禁止调用模型")
-                        decision = await self.model.decide(sid, context)
-                        if symbol == primary and decision.decision == "SKIP":
-                            raise ValueError(
-                                "普通首选未给出明确方向，本轮分析失败，不重试或伪造方向"
-                            )
+                        decision = final_decision(item)
                         payload = self.bus.publish(
-                            sid,
-                            decision,
-                            cycle_id=cid,
-                            analysis_started_at=now,
-                            normal=symbol in normal,
-                            hedge=(
-                                {k: hedged[symbol][k] for k in ("group_id", "generation")}
-                                if symbol in hedged
-                                else None
-                            ),
+                            sid, decision, cycle_id=cid, analysis_started_at=now,
+                            normal=True,
+                            hedge=({k: hedged[symbol][k] for k in ("group_id", "generation")}
+                                   if symbol in hedged else None),
                             observed_at=context["observed_at"],
                         )
                         self.store.signal_result(sid, "PUBLISHED", decision.decision, payload)
-                        if symbol == primary:
-                            primary_published = True
+                        self.store.resolve("DIRECTION:" + symbol)
+                        published.add(symbol)
+                    except Exception as error:
+                        self.store.signal_result(sid, "ERROR")
+                        self.incident("DIRECTION:" + symbol, error)
+                        ok = False
+
+                if final and final[0].symbol in published:
+                    self.store.resolve("PRIMARY_DIRECTION")
+                else:
+                    self.incident("PRIMARY_DIRECTION", RuntimeError(
+                        "普通首选未能发布明确方向；等待下一轮新行情"
+                    ))
+                    ok = False
+
+                for symbol in sorted(set(hedged) - {item.symbol for item in final}):
+                    if service_failed:
+                        break
+                    sid = identity(cid, symbol)
+                    if not self.store.signal(sid, cid, symbol, {
+                        "symbol": symbol, "priority_hedge": True,
+                    }):
+                        continue
+                    try:
+                        # An initial TradingView candidate may already have full
+                        # refinement evidence even when absent from the final 1—3.
+                        context = (
+                            by_symbol[symbol]["bybit"] if symbol in by_symbol
+                            else await self.markets.evidence(symbol, {"symbol": symbol})
+                        )
+                        self.store.event("HEDGE_SYMBOL_EVIDENCE", {
+                            "cycle_id": cid, "symbol": symbol, "evidence": context,
+                        })
+                        context["direction_required"] = False
+                        context["priority_review"] = "LOCKED双仓需判向；证据冲突可SKIP。"
+                        self.store.execute("UPDATE signals SET evidence=? WHERE signal_id=?",
+                                           (encode(context), sid))
+                        age = time.time() - datetime.fromisoformat(context["observed_at"]).timestamp()
+                        if age < -5:
+                            raise ValueError("方向分析行情时间在未来")
+                        decision = await self.model.decide(sid, context)
+                        payload = self.bus.publish(
+                            sid, decision, cycle_id=cid, analysis_started_at=now,
+                            normal=False,
+                            hedge={k: hedged[symbol][k] for k in ("group_id", "generation")},
+                            observed_at=context["observed_at"],
+                        )
+                        self.store.signal_result(sid, "PUBLISHED", decision.decision, payload)
                         self.store.resolve("DIRECTION:" + symbol)
                     except ModelServiceError as error:
                         self.store.signal_result(sid, "ERROR_MODEL_SERVICE")
                         self.incident("MODEL_SERVICE", error)
                         service_failed = True
                         ok = False
-                    except ValueError as error:
-                        if str(error).startswith("SKIP_INSUFFICIENT_WEEK_HISTORY"):
-                            self.store.signal_result(sid, "SKIP_INSUFFICIENT_WEEK_HISTORY")
-                            self.incident("DIRECTION:" + symbol, error)
-                            ok = False
-                        else:
-                            self.store.signal_result(sid, "ERROR")
-                            self.incident("DIRECTION:" + symbol, error)
-                            ok = False
                     except Exception as error:
                         self.store.signal_result(sid, "ERROR")
                         self.incident("DIRECTION:" + symbol, error)
                         ok = False
-                if primary is not None and not primary_published:
-                    self.incident(
-                        "PRIMARY_DIRECTION",
-                        RuntimeError(
-                            "普通首选未能发布有效多空方向；检查行情与模型错误，等待下一轮"
-                        ),
-                    )
-                    ok = False
-                elif primary_published:
-                    self.store.resolve("PRIMARY_DIRECTION")
                 if ok:
                     self.store.resolve("MODEL_SERVICE")
                 return ok

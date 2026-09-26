@@ -14,7 +14,7 @@ class Settings(BaseSettings):
     telegram_token: SecretStr = SecretStr("")
     telegram_chat_id: int = 0
     telegram_user_id: int = 0
-    tradingview_enabled: bool = False
+    tradingview_enabled: bool = True
     tradingview_extra_fields: str = ""
     codex_bin: str = "/root/.local/bin/codex"
     runtime_dir: Path = Path("runtime")

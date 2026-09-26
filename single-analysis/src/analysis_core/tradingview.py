@@ -347,10 +347,10 @@ class TradingViewWeb:
                 raise TradingViewError("TradingView screener pagination stalled")
         return normalize_rankings(pages, symbol, time.time()), requests
 
-    async def collect(self, symbol: str) -> dict:
-        return await self._collect(symbol)
+    async def collect(self, symbol: str, *, market_rankings: dict | None = None) -> dict:
+        return await self._collect(symbol, market_rankings=market_rankings)
 
-    async def _collect(self, symbol: str) -> dict:
+    async def _collect(self, symbol: str, *, market_rankings: dict | None = None) -> dict:
         if not re.fullmatch(r"[A-Z0-9]{1,24}USDT", symbol):
             raise TradingViewError("Invalid TradingView symbol")
         page_url = f"https://www.tradingview.com/symbols/{symbol}.P/technicals/?exchange=BYBIT"
@@ -447,7 +447,13 @@ class TradingViewWeb:
             result["community_ideas"] = []
             result["community_ideas_unavailable"] = type(error).__name__
         try:
-            result["market_rankings"], result["provenance"]["ranking_requests"] = await self._rankings(symbol)
+            if market_rankings is None:
+                result["market_rankings"], result["provenance"]["ranking_requests"] = await self._rankings(symbol)
+            elif market_rankings.get("source_symbol") != f"BYBIT:{symbol}.P" or not market_rankings.get("target_present"):
+                raise TradingViewError("TradingView discovery ranking identity mismatch")
+            else:
+                result["market_rankings"] = market_rankings
+                result["provenance"]["ranking_requests"] = []
             result["source_provenance"]["ranking_page_url"] = "https://www.tradingview.com/crypto-screener/"
             result["source_provenance"]["ranking_response_sha256"] = [
                 item["response_sha256"] for item in result["provenance"]["ranking_requests"]

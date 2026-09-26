@@ -10,10 +10,13 @@ from longtime.service import App
 from longtime.store import Store
 
 
-def publication(path, *, normal=True, hedge=None, decision="LONG", age=0, sid="one"):
+def publication(
+    path, *, normal=True, hedge=None, decision="LONG", age=0, sid="one", cycle=None,
+    version=2,
+):
     now = time.time() - age
     payload = dict(
-        version=1,
+        version=version,
         signal_id=sid,
         symbol="TESTUSDT",
         decision=decision,
@@ -22,15 +25,17 @@ def publication(path, *, normal=True, hedge=None, decision="LONG", age=0, sid="o
         hedge=hedge,
         observed_at="2026-09-15T10:00:00+00:00",
         published_at=now,
-        expires_at=now + 60,
+        expires_at=now + 600,
     )
+    if version == 2:
+        payload.update(cycle_id=cycle or "cycle:" + sid, analysis_started_at=now - 10)
     with sqlite3.connect(path) as db:
         db.execute(
             "CREATE TABLE IF NOT EXISTS publications(id INTEGER PRIMARY KEY,signal_id TEXT,symbol TEXT,published_at REAL,expires_at REAL,payload TEXT)"
         )
         db.execute(
             "INSERT INTO publications(signal_id,symbol,published_at,expires_at,payload) VALUES (?,?,?,?,?)",
-            (sid, "TESTUSDT", now, now + 60, json.dumps(payload)),
+            (sid, "TESTUSDT", now, now + 600, json.dumps(payload)),
         )
 
 
@@ -65,10 +70,17 @@ async def test_two_traders_process_same_signal_independently_once(consumer):
     restarted.executor.enter.assert_not_awaited()
 
 
+async def test_more_than_one_hundred_live_signals_are_all_seen(consumer):
+    for index in range(101):
+        publication(consumer.settings.signal_db, sid=f"many:{index}", decision="SKIP")
+    await consumer.consumer.tick()
+    assert len(consumer.store.rows("SELECT * FROM signals")) == 101
+
+
 @pytest.mark.parametrize(
     "age,decision,normal,paused",
     [
-        (61, "LONG", True, False),
+        (601, "LONG", True, False),
         (0, "SKIP", True, False),
         (0, "LONG", False, False),
         (0, "LONG", True, True),
@@ -100,7 +112,7 @@ async def test_deadline_passed_to_executor(consumer):
     publication(consumer.settings.signal_db)
     await consumer.consumer.tick()
     deadline = consumer.executor.enter.call_args.kwargs["deadline"]
-    assert 59 < deadline - time.time() <= 60
+    assert 599 < deadline - time.time() <= 600
 
 
 async def test_no_analysis_methods_or_frequency_controls(consumer):
@@ -166,29 +178,28 @@ async def test_subscription_drives_real_hedge_executor_through_redecision(tmp_pa
     g = app.executor.hedge.get(g["group_id"])
     assert g["phase"] == "LOCKED"
     app.store.set("entries_paused", True)
-    reachability = app.markets.reachability
-    app.markets.reachability = AsyncMock(return_value=[])
-    publication(
-        settings.signal_db,
-        normal=False,
-        hedge={"group_id": g["group_id"], "generation": g["generation"]},
-        sid="unreachable-review",
-    )
-    count = len(ex.submissions)
-    await app.consumer.tick()
-    rejected = app.store.rows("SELECT * FROM signals WHERE signal_id='feed:unreachable-review'")[0]
-    assert rejected["status"] == "SKIP_TP_UNREACHABLE" and rejected["side"] == "SKIP"
-    assert len(ex.submissions) == count
-    app.markets.reachability = reachability
+    app.markets.reachability = AsyncMock(side_effect=AssertionError("history must not be requested"))
     publication(
         settings.signal_db,
         normal=False,
         hedge={"group_id": g["group_id"], "generation": g["generation"]},
         sid="review",
     )
+    count = len(ex.submissions)
     await app.consumer.tick()
+    applied = app.store.rows("SELECT * FROM signals WHERE signal_id='feed:review'")[0]
+    assert applied["status"] == "HEDGE_DIRECTION_APPLIED" and applied["side"] == "LONG"
+    assert len(ex.submissions) == count + 3
     g = app.executor.hedge.get(g["group_id"])
     assert g["phase"] == "SINGLE" and g["generation"] == 1
+    publication(
+        settings.signal_db,
+        normal=False,
+        hedge={"group_id": g["group_id"], "generation": 0},
+        sid="stale-review",
+    )
+    await app.consumer.tick()
+    assert app.store.rows("SELECT status FROM signals WHERE signal_id='feed:stale-review'")[0]["status"] == "SKIP_NOT_NORMAL_CANDIDATE"
     count = len(ex.submissions)
     await app.consumer.tick()
     assert len(ex.submissions) == count
@@ -196,12 +207,23 @@ async def test_subscription_drives_real_hedge_executor_through_redecision(tmp_pa
 
 
 async def test_new_round_same_symbol_is_not_deduplicated(consumer):
-    publication(consumer.settings.signal_db, sid="round1")
+    publication(consumer.settings.signal_db, sid="round1", cycle="cycle-1")
     await consumer.consumer.tick()
-    publication(consumer.settings.signal_db, sid="round2")
+    publication(consumer.settings.signal_db, sid="round2", cycle="cycle-2")
     await consumer.consumer.tick()
     assert consumer.executor.enter.await_count == 2
     assert len(consumer.store.rows("SELECT * FROM signals")) == 2
+
+
+async def test_cycle_identity_groups_signals_and_v1_remains_compatible(consumer):
+    publication(consumer.settings.signal_db, sid="first", cycle="shared")
+    publication(consumer.settings.signal_db, sid="legacy", version=1)
+    await consumer.consumer.tick()
+    rows = consumer.store.rows("SELECT signal_id,cycle_id FROM signals ORDER BY created_at")
+    assert rows == [
+        {"signal_id": "feed:first", "cycle_id": "shared"},
+        {"signal_id": "feed:legacy", "cycle_id": "feed:legacy"},
+    ]
 
 
 async def test_shutdown_records_interruption_without_replaying_claim(consumer):

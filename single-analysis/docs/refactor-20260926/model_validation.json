@@ -1,0 +1,81 @@
+{
+  "symbols": [
+    "BTCUSDT",
+    "ETHUSDT"
+  ],
+  "published": false,
+  "initial": [
+    {
+      "symbol": "BTCUSDT",
+      "rank": 1,
+      "direction": "SHORT",
+      "confidence": "LOW",
+      "reason": "15m至2h的均线结构整体偏空：价格低于15m EMA50、30m/1h关键均线及2h EMA20，且30m/1h/2h的+DI低于-DI。反证是MACD在30m、1h、2h仍高于信号线、短线RSI回升，且所有快照未确认收盘、报价新鲜度未核验。"
+    },
+    {
+      "symbol": "ETHUSDT",
+      "rank": 2,
+      "direction": "LONG",
+      "confidence": "LOW",
+      "reason": "15m、30m、1h、2h的均线评级均偏多，2h价格略高于EMA20/EMA50，2h MACD高于信号线，RSI小幅回升。反证是15m与30m的-DI仍高于+DI、ADX普遍偏低，且价格在15m至1h多条EMA50下方；所有快照未确认收盘、报价新鲜度未核验。"
+    }
+  ],
+  "final": [
+    {
+      "symbol": "BTCUSDT",
+      "rank": 1,
+      "direction": "SHORT",
+      "confidence": "LOW",
+      "reason": "Bybit截至05:00 UTC的已收盘1小时K线收于83948.2，低于EMA20的84000.86；最近一根已收盘2小时K线也低于EMA20，短线结构偏弱。04:30—05:00的30分钟K线虽从83793.2反弹，但最后一根15分钟K线成交量仅为此前20根均量的约0.18倍，反弹力度有限。05:01附近的主动成交样本在最近60秒卖出量高于买入量，邻近卖盘挂量也较大，但样本和三次盘口快照都不足以确认持续卖压。主要反证是30分钟及1小时MACD柱值为正、最近300秒成交样本偏主动买入，且价格已从低点回升，因此仅给低置信度。"
+    }
+  ],
+  "hedge_validation": {
+    "symbol": "BTCUSDT",
+    "decision": "SHORT",
+    "reason": "未来约1—2小时偏向下行：已收盘1小时K线自02:00后高点逐步降低，最新收盘价83948.2仍低于1小时EMA20的84000.9。最近30分钟虽从83793.2反弹，但最后一根15分钟K线仅微涨且成交量从前一根的163.284降至35.501，反弹力度不足。盘口样本在83956.4及其上方显示较大卖盘，近60秒主动成交也偏卖；反证是近5分钟样本买方占优，且30分钟动能有所修复。盘口仅取样约2秒，逐笔窗口覆盖不完整，方向判断需保留谨慎。"
+  },
+  "model_events": [
+    {
+      "kind": "TV_SELECTION_MODEL_INPUT",
+      "model": "gpt-5.6-terra",
+      "input_sha256": "fe80eddbc3af9130dda9070842da2ccb3ed24275e7290c9f55ca6412baa3262d",
+      "prompt_sha256": "aeb52d73804e527d14fe5236fbb8132fc00d91fb18b80903315ff2744e774a9c",
+      "elapsed_seconds": null
+    },
+    {
+      "kind": "TV_SELECTION_MODEL_OUTPUT",
+      "model": "gpt-5.6-terra",
+      "input_sha256": "fe80eddbc3af9130dda9070842da2ccb3ed24275e7290c9f55ca6412baa3262d",
+      "prompt_sha256": null,
+      "elapsed_seconds": 11.045
+    },
+    {
+      "kind": "FINAL_SELECTION_MODEL_INPUT",
+      "model": "gpt-6-sol",
+      "input_sha256": "26f85613afe2878938f28eafcc32b74ab7d9f53896daa18587e99ad0bb2ff2a7",
+      "prompt_sha256": "e28c343849d3c4d6fe961416d7542bfcf52eecddff524da04b435adf787381ab",
+      "elapsed_seconds": null
+    },
+    {
+      "kind": "FINAL_SELECTION_MODEL_OUTPUT",
+      "model": "gpt-6-sol",
+      "input_sha256": "26f85613afe2878938f28eafcc32b74ab7d9f53896daa18587e99ad0bb2ff2a7",
+      "prompt_sha256": null,
+      "elapsed_seconds": 22.781
+    },
+    {
+      "kind": "MODEL_INPUT",
+      "model": "gpt-6-sol",
+      "input_sha256": "36551f1ee9c7cbce6ef4437917fa76f6a92f18cc0bca208beaec1045e5bb99c5",
+      "prompt_sha256": "6fb5ce1e5362a38547160b39ccc08a98706cc641a64391860dabd2e189fcaf79",
+      "elapsed_seconds": null
+    },
+    {
+      "kind": "MODEL_OUTPUT",
+      "model": "gpt-6-sol",
+      "input_sha256": "36551f1ee9c7cbce6ef4437917fa76f6a92f18cc0bca208beaec1045e5bb99c5",
+      "prompt_sha256": null,
+      "elapsed_seconds": 13.921
+    }
+  ]
+}

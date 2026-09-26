@@ -1,0 +1,21 @@
+{
+  "findings": [
+    {
+      "severity": "HIGH",
+      "file": "src/analysis_core/market.py",
+      "issue": "过期的 Bybit K 线可被当作当前行情用于最终判向。",
+      "evidence": "verify_candles 只检查最后一根 K 线不在未来、区间连续和数量；evidence 随后将 observed_at 设为采集完成时刻。提供一组连续但结束于昨日的 K 线即可通过这些检查，并生成有效期 600 秒的新信号。",
+      "fix": "对判向所需周期检查最新已收盘 K 线的时间，并以实际行情时间标记证据；过期时停止发布。"
+    },
+    {
+      "severity": "MEDIUM",
+      "file": "/root/auto-trader-longtime/src/longtime/signal_consumer.py；/root/auto-trader-longtime-02/src/longtime/signal_consumer.py",
+      "issue": "两个消费者都可能漏掉仍有效的新信号。",
+      "evidence": "pending 每次只按 id 读取最早的 100 条未过期记录，不排除本消费者已认领的记录。若同时有 101 条有效记录且前 100 条持续有效，第 101 条在过期前不会被读取。",
+      "fix": "在查询中排除本消费者已认领的信号，或按游标继续分页读取所有有效记录。"
+    }
+  ],
+  "risks": [
+    "片段未包含 TradingView 行情新鲜度校验、模型提示词及两个消费者的存储配置，需分别验证其实际约束与独立认领。"
+  ]
+}
